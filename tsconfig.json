@@ -1,22 +1,16 @@
 {
   "compilerOptions": {
-    "target": "es2015",
+    "target": "ES2022",
     "module": "commonjs",
-    "downlevelIteration": true,
+    "esModuleInterop": true,
     "declaration": true,
     "outDir": "./lib",
     "strict": true,
     "moduleResolution": "node",
-    "lib": [
-      "es2019"
-    ]
+    "forceConsistentCasingInFileNames": true,
+    "skipLibCheck": true,
+    "lib": ["ES2022"]
   },
-  "include": [
-    "src/**/*",
-  ],
-  "exclude": [
-    "node_modules",
-    "**/tests/*"
-  ],
-  "allowJs": true,
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "src/tests/**"]
 }

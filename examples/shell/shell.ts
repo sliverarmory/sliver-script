@@ -32,17 +32,17 @@ const SLIVER_CONFIG_FILE = process.env['SLIVER_CONFIG_FILE'] || DEFAULT_CONFIG_P
     }
     console.log(sessions);
     if (0 < sessions.length) {
-        const interact = await client.interactSession(sessions[0].ID)
+        const interact = client.interactSession(sessions[0].ID)
         const shell = await interact.shell('/bin/bash', true)
-        shell.stdout.subscribe(data => {
+        shell.stdout$.subscribe(data => {
             process.stdout.write(data)
         }, (err) => {
             console.error(err)
         }, () => {
             console.log('tunnel closed')
         });
-        shell.stdin.next(Buffer.from('ls\n'))
-        shell.stdin.next(Buffer.from('exit\n'))
+        shell.write('ls\n')
+        shell.write('exit\n')
         setTimeout(() => { process.exit(0) }, 1000)
     } else {
         console.log('No sessions')

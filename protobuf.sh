@@ -1,104 +1,48 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
-#   Sliver Implant Framework
-#   Copyright (C) 2019  Bishop Fox
-#   This program is free software: you can redistribute it and/or modify
-#   it under the terms of the GNU General Public License as published by
-#   the Free Software Foundation, either version 3 of the License, or
-#   (at your option) any later version.
-#   This program is distributed in the hope that it will be useful,
-#   but WITHOUT ANY WARRANTY; without even the implied warranty of
-#   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-#   GNU General Public License for more details.
-#   You should have received a copy of the GNU General Public License
-#   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+set -euo pipefail
 
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Path to this plugin
-OUT_DIR="./src/pb"
-TS_OUT_DIR="./src/pb"
+DEFAULT_IN_DIR="${ROOT_DIR}/sliver/protobuf"
+# If a full Sliver checkout exists next to this repo, prefer it (it is easier to keep up to date)
+# while still allowing explicit overrides via SLIVER_PROTO_ROOT.
+if [[ -d "${ROOT_DIR}/../sliver/protobuf" ]]; then
+  DEFAULT_IN_DIR="${ROOT_DIR}/../sliver/protobuf"
+fi
+IN_DIR="${SLIVER_PROTO_ROOT:-${DEFAULT_IN_DIR}}"
+OUT_DIR="${ROOT_DIR}/src/pb"
 
-IN_DIR="./sliver/protobuf"
+TS_PROTO_PLUGIN="${ROOT_DIR}/node_modules/.bin/protoc-gen-ts_proto"
 
-PROTOC="node_modules/.bin/grpc_tools_node_protoc"
-PROTOC_GEN_TS="node_modules/.bin/protoc-gen-ts"
+if [[ ! -d "${IN_DIR}" ]]; then
+  echo "Missing protobuf input directory: ${IN_DIR}"
+  echo "Set SLIVER_PROTO_ROOT to override the default."
+  exit 1
+fi
 
-# By default the _pb.js files are broken, we need to insert this line of code to create the namespaces
-# before any of hte _pb.js code can be used. Why are they broken by default? Fuck you that's why.
-INIT_NAMESPACE="if (proto === undefined) { var proto = {commonpb: {}, clientpb: {}, sliverpb: {}}; }"
+if [[ ! -x "${TS_PROTO_PLUGIN}" ]]; then
+  echo "Missing ${TS_PROTO_PLUGIN}"
+  echo "Run: npm install"
+  exit 1
+fi
 
+rm -rf "${OUT_DIR}"
+mkdir -p "${OUT_DIR}"
 
-mkdir -p "$OUT_DIR"
-mkdir -p "$TS_OUT_DIR"
+# We compile against the Sliver protobufs checked into ./sliver (submodule).
+# Do not write anything into ./sliver; it is treated as read-only input.
+PROTO_FILES=(
+  "commonpb/common.proto"
+  "clientpb/client.proto"
+  "sliverpb/sliver.proto"
+  "rpcpb/services.proto"
+  "dnspb/dns.proto"
+)
 
-
-$PROTOC \
-    -I ./sliver/protobuf/ \
-    --plugin="protoc-gen-ts=${PROTOC_GEN_TS}" \
-    --js_out="import_style=commonjs,binary:${OUT_DIR}" \
-    --ts_out="${OUT_DIR}" \
-    sliver/protobuf/commonpb/common.proto
-
-$PROTOC \
-    -I ./sliver/protobuf/ \
-    --plugin="protoc-gen-ts=${PROTOC_GEN_TS}" \
-    --js_out="import_style=commonjs,binary:${OUT_DIR}" \
-    --ts_out="${OUT_DIR}" \
-    sliver/protobuf/sliverpb/sliver.proto
-
-$PROTOC \
-    -I ./sliver/protobuf/ \
-    --plugin="protoc-gen-ts=${PROTOC_GEN_TS}" \
-    --js_out="import_style=commonjs,binary:${OUT_DIR}" \
-    --ts_out="${OUT_DIR}" \
-    sliver/protobuf/clientpb/client.proto
-
-
-$PROTOC \
-    -I=$IN_DIR \
-    --plugin=protoc-gen-ts=$PROTOC_GEN_TS \
-    --js_out=import_style=commonjs:$OUT_DIR \
-    --grpc_out=:$OUT_DIR \
-    --ts_out=service=grpc-node:$TS_OUT_DIR \
-    $IN_DIR/rpcpb/services.proto
-
-sed -i "" -e \
-    "s/require('grpc')/require('@grpc\/grpc-js')/g" \
-    "$OUT_DIR/rpcpb/"*
-
-sed -i "" -e \
-    "s/from \"grpc\"/from \"@grpc\/grpc-js\"/g" \
-    "$TS_OUT_DIR/rpcpb/"*
-
-
-# *** clientpb ***
-# - Init namespace
-# - Remove eval()'s
-sed -i "" -e \
-    "s/Function('return this')()/(function(){return this;})()/g" \
-    "$TS_OUT_DIR/clientpb/"*
-sed -i "" -e \
-    "s/\/\/\ \@ts-nocheck/\/\/\ \@ts-nocheck\n$INIT_NAMESPACE\n/g" \
-    "$TS_OUT_DIR/clientpb/"*
-
-
-# *** commonpb ***
-# - Init namespace
-# - Remove eval()'s
-sed -i "" -e \
-    "s/Function('return this')()/(function(){return this;})()/g" \
-    "$TS_OUT_DIR/commonpb/"*
-sed -i "" -e \
-    "s/\/\/\ \@ts-nocheck/\/\/\ \@ts-nocheck\n$INIT_NAMESPACE\n/g" \
-    "$TS_OUT_DIR/commonpb/"*
-
-
-# *** sliverpb ***
-# - Init namespace
-# - Remove eval()'s
-sed -i "" -e \
-    "s/Function('return this')()/(function(){return this;})()/g" \
-    "$TS_OUT_DIR/sliverpb/"*
-sed -i "" -e \
-    "s/\/\/\ \@ts-nocheck/\/\/\ \@ts-nocheck\n$INIT_NAMESPACE\n/g" \
-    "$TS_OUT_DIR/sliverpb/"*
+protoc \
+  -I "${IN_DIR}" \
+  --plugin="protoc-gen-ts_proto=${TS_PROTO_PLUGIN}" \
+  --ts_proto_out="${OUT_DIR}" \
+  --ts_proto_opt="env=node,esModuleInterop=true,forceLong=string,useExactTypes=false,useOptionals=messages,outputServices=nice-grpc,outputServices=generic-definitions" \
+  "${PROTO_FILES[@]}"
