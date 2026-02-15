@@ -38,7 +38,7 @@
     "@improbable-eng/grpc-web": "^0.15.0",
     "@types/google-protobuf": "^3.15.5",
     "google-protobuf": "^3.19.4",
-    "protobufjs": "^6.11.2",
+    "protobufjs": "^8.0.0",
     "protoc-gen-ts": "^0.8.2",
     "rxjs": "^7.5.6"
   }
