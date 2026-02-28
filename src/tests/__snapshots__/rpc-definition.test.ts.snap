@@ -305,6 +305,12 @@ exports[`RPC definition includes all methods (snapshot) 1`] = `
       "responseStream": false,
     },
     {
+      "key": "generateSpoofMetadata",
+      "name": "GenerateSpoofMetadata",
+      "requestStream": false,
+      "responseStream": false,
+    },
+    {
       "key": "generateStage",
       "name": "GenerateStage",
       "requestStream": false,

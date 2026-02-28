@@ -17,6 +17,7 @@ import type {
   Beacons,
   Jobs,
   Beacon,
+  GenerateSpoofMetadataReq,
   ImplantConfig,
   ImplantProfile,
   Loot,
@@ -447,8 +448,8 @@ export class SliverClient {
 
     const creds = createSliverRpcCredentials(this.config);
     this.channel = createChannel(this.rpcHost(), creds, {
-      "grpc.max_send_message_length": 2 * GiB,
-      "grpc.max_receive_message_length": 2 * GiB,
+      "grpc.max_send_message_length": (2 * GiB) -1,
+      "grpc.max_receive_message_length": (2 * GiB) -1,
     });
 
     this.rpcClient = createClient(SliverRPCDefinition, this.channel);
@@ -613,6 +614,12 @@ export class SliverClient {
   async generate(config: ImplantConfig, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
     const res = await withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.generate({ Config: config }, { signal }));
     return res.File;
+  }
+
+  generateSpoofMetadata(req: GenerateSpoofMetadataReq, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      await this.rpc.generateSpoofMetadata(req, { signal });
+    });
   }
 
   async regenerate(implantName: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {

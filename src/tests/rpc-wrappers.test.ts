@@ -2,7 +2,18 @@ import { Subject } from "rxjs";
 
 import { SliverClient, InteractiveBeacon } from "../client";
 import type { SliverClientConfig } from "../config";
-import { BeaconTask, type Event, ListenerJob, Operators, Sessions, Session, KillJob, Loot, WebContent } from "../pb/clientpb/client";
+import {
+  BeaconTask,
+  type Event,
+  type GenerateSpoofMetadataReq,
+  ListenerJob,
+  Operators,
+  Sessions,
+  Session,
+  KillJob,
+  Loot,
+  WebContent,
+} from "../pb/clientpb/client";
 import { Empty } from "../pb/commonpb/common";
 import { Ls } from "../pb/sliverpb/sliver";
 
@@ -107,6 +118,25 @@ test("SliverClient.websiteUpdateContent() forwards to rpc.websiteUpdateContent()
   await client.websiteUpdateContent("w", { "/index.html": wc }, 5);
   expect(websiteUpdateContent).toHaveBeenCalledWith(
     { Name: "w", Contents: { "/index.html": wc } },
+    expect.objectContaining({ signal: expect.any(AbortSignal) }),
+  );
+});
+
+test("SliverClient.generateSpoofMetadata() forwards to rpc.generateSpoofMetadata()", async () => {
+  const generateSpoofMetadata = jest.fn(async () => Empty.create({}));
+
+  const client = new SliverClient(dummyConfig());
+  (client as any).rpcClient = { generateSpoofMetadata };
+
+  const req: GenerateSpoofMetadataReq = {
+    ImplantBuildID: "build-1",
+    ImplantName: "implant-1",
+    ResourceID: "42",
+  };
+
+  await client.generateSpoofMetadata(req, 5);
+  expect(generateSpoofMetadata).toHaveBeenCalledWith(
+    req,
     expect.objectContaining({ signal: expect.any(AbortSignal) }),
   );
 });
