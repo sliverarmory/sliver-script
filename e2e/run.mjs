@@ -356,6 +356,14 @@ async function main() {
   if (!Number.isInteger(lport) || lport <= 0 || lport > 65535) {
     throw new Error(`Invalid SLIVER_E2E_LPORT value: ${process.env.SLIVER_E2E_LPORT}`);
   }
+  const mtlsBindHost = process.env.SLIVER_E2E_MTLS_BIND_HOST || daemonHost;
+  const mtlsHost = process.env.SLIVER_E2E_MTLS_HOST || operatorHost;
+  const mtlsPort = process.env.SLIVER_E2E_MTLS_PORT
+    ? Number.parseInt(process.env.SLIVER_E2E_MTLS_PORT, 10)
+    : await allocateFreePort(mtlsBindHost);
+  if (!Number.isInteger(mtlsPort) || mtlsPort <= 0 || mtlsPort > 65535) {
+    throw new Error(`Invalid SLIVER_E2E_MTLS_PORT value: ${process.env.SLIVER_E2E_MTLS_PORT}`);
+  }
 
   const operatorName = process.env.SLIVER_E2E_OPERATOR || "e2e";
 
@@ -385,6 +393,8 @@ async function main() {
     log(`Using isolated test root: ${testRoot}`);
     log(`Using daemon listener: ${daemonHost}:${lport}`);
     log(`Using operator config endpoint: ${operatorHost}:${lport}`);
+    log(`Using mTLS listener bind: ${mtlsBindHost}:${mtlsPort}`);
+    log(`Using implant mTLS endpoint: ${mtlsHost}:${mtlsPort}`);
 
     await ensureSliverServerBuilt(sharedEnv);
 
@@ -456,6 +466,9 @@ async function main() {
       ...sharedEnv,
       SLIVER_E2E: "1",
       SLIVER_CONFIG_FILE: operatorConfigPath,
+      SLIVER_E2E_MTLS_BIND_HOST: mtlsBindHost,
+      SLIVER_E2E_MTLS_HOST: mtlsHost,
+      SLIVER_E2E_MTLS_PORT: String(mtlsPort),
     };
     if (process.env.SLIVER_WAIT_TASKS) {
       testEnv.SLIVER_WAIT_TASKS = process.env.SLIVER_WAIT_TASKS;
