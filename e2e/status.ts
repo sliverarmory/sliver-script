@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 
-type SliverScriptModule = typeof import("../..");
+type SliverScriptModule = typeof import("..");
 
 function findRepoRoot(startDir: string): string | undefined {
   let dir = path.resolve(startDir);

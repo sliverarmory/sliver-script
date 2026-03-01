@@ -9,12 +9,13 @@
   },
   "scripts": {
     "build": "rm -rf ./lib && tsc -p tsconfig.json",
-    "build:examples": "npm run build && rm -rf ./examples/dist && tsc -p tsconfig.examples.json",
+    "build:examples": "npm run build && rm -rf ./e2e/dist && tsc -p tsconfig.examples.json",
     "pb": "./protobuf.sh",
     "docs": "typedoc --out ./docs/ ./src",
     "test": "jest --config jestconfig.json",
-    "test:e2e": "SLIVER_E2E=1 jest --config jestconfig.json",
-    "example:e2e": "npm run build:examples && node examples/dist/e2e/status.js"
+    "test:e2e": "node e2e/run.mjs",
+    "test:e2e:jest": "SLIVER_E2E=1 jest --config jestconfig.json",
+    "example:e2e": "npm run build:examples && node e2e/dist/status.js"
   },
   "prepublishOnly": "npm test && npm run build",
   "files": [

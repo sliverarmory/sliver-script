@@ -2,10 +2,9 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "declaration": false,
-    "outDir": "./examples/dist",
-    "rootDir": "./examples"
+    "outDir": "./e2e/dist",
+    "rootDir": "./e2e"
   },
-  "include": ["examples/e2e/**/*.ts"],
-  "exclude": ["node_modules", "examples/dist"]
+  "include": ["e2e/**/*.ts"],
+  "exclude": ["node_modules", "e2e/dist"]
 }
-
