@@ -2,12 +2,13 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
-import { mkdtemp, rm, writeFile, chmod } from "node:fs/promises";
-import { randomInt } from "node:crypto";
+import { mkdtemp, mkdir, readFile, rm, writeFile, chmod } from "node:fs/promises";
+import { createHash, randomBytes, randomInt } from "node:crypto";
 
 type SliverScriptModule = typeof import("..");
 type SliverClientInstance = InstanceType<SliverScriptModule["SliverClient"]>;
 type SessionInfo = Awaited<ReturnType<SliverClientInstance["sessions"]>>[number];
+type InteractiveSessionInstance = ReturnType<SliverClientInstance["interactSession"]>;
 
 function findRepoRoot(startDir: string): string | undefined {
   let dir = path.resolve(startDir);
@@ -41,7 +42,6 @@ function loadLocalSliverScript(repoRoot: string): SliverScriptModule {
 
 const REPO_ROOT = guessRepoRoot();
 const CONFIG_PATH = process.env.SLIVER_CONFIG_FILE ?? path.join(REPO_ROOT, "localhost.cfg");
-const WAIT_TASKS = process.env.SLIVER_WAIT_TASKS === "1";
 const SESSION_TIMEOUT_SECONDS = 180;
 const DEFAULT_HTTP_C2_PROFILE = "default";
 
@@ -155,6 +155,10 @@ function printInfoSummary(session: SessionInfo): void {
   });
 }
 
+function md5Hex(data: Buffer): string {
+  return createHash("md5").update(data).digest("hex");
+}
+
 async function main() {
   if (!fs.existsSync(CONFIG_PATH)) {
     console.error(`Missing config file: ${CONFIG_PATH}`);
@@ -178,6 +182,8 @@ async function main() {
   let implantPath: string | undefined;
   let implantProc: ChildProcess | undefined;
   let implantOutput: ReturnType<typeof collectOutput> | undefined;
+  let interactiveSession: InteractiveSessionInstance | undefined;
+  let remoteTransferDir: string | undefined;
   let mtlsJobId: number | undefined;
 
   await client.connect();
@@ -252,7 +258,7 @@ async function main() {
     );
     console.log("session created", { id: session.ID, pid: session.PID, transport: session.Transport });
 
-    const interactiveSession = client.interactSession(session.ID);
+    interactiveSession = client.interactSession(session.ID);
     const nonce = randomInt(1, 2_000_000_000);
     const ping = await interactiveSession.ping(nonce, 60);
     assert(ping.Nonce === nonce, `Session ping nonce mismatch: expected ${nonce}, got ${ping.Nonce}`);
@@ -302,6 +308,60 @@ async function main() {
       netstatEntries,
     });
 
+    const transferSourceDir = path.join(tempDir, "transfer-source");
+    const transferDownloadedDir = path.join(tempDir, "transfer-downloaded");
+    await Promise.all([
+      mkdir(transferSourceDir, { recursive: true }),
+      mkdir(transferDownloadedDir, { recursive: true }),
+    ]);
+
+    remoteTransferDir = path.join(pwd.Path, `.sliver-e2e-transfer-${Date.now()}-${randomInt(10_000, 99_999)}`);
+    await interactiveSession.mkdir(remoteTransferDir, 60);
+
+    const transferSpecs = [
+      { name: "tiny.bin", size: 127 },
+      { name: "small.bin", size: 4099 },
+      { name: "medium.bin", size: 131072 },
+      { name: "large.bin", size: 1048576 },
+    ];
+
+    for (const spec of transferSpecs) {
+      const sourcePath = path.join(transferSourceDir, spec.name);
+      const downloadedPath = path.join(transferDownloadedDir, spec.name);
+      const remotePath = path.join(remoteTransferDir, spec.name);
+      const sourceData = randomBytes(spec.size);
+      await writeFile(sourcePath, sourceData);
+
+      const sourceFileData = await readFile(sourcePath);
+      const sourceMd5 = md5Hex(sourceFileData);
+      await interactiveSession.upload(remotePath, sourceFileData, 120);
+
+      const downloadedData = await interactiveSession.download(remotePath, 120);
+      const downloadedMd5 = md5Hex(downloadedData);
+      assert(
+        downloadedMd5 === sourceMd5,
+        `md5 mismatch for ${spec.name}: source=${sourceMd5}, downloaded=${downloadedMd5}`,
+      );
+      assert(
+        downloadedData.equals(sourceFileData),
+        `byte mismatch for ${spec.name}: sourceLength=${sourceFileData.length}, downloadedLength=${downloadedData.length}`,
+      );
+
+      await writeFile(downloadedPath, downloadedData);
+      const downloadedFileData = await readFile(downloadedPath);
+      const downloadedFileMd5 = md5Hex(downloadedFileData);
+      assert(
+        downloadedFileMd5 === sourceMd5,
+        `saved downloaded file md5 mismatch for ${spec.name}: source=${sourceMd5}, saved=${downloadedFileMd5}`,
+      );
+
+      console.log("file transfer verified", {
+        file: spec.name,
+        size: spec.size,
+        md5: sourceMd5,
+      });
+    }
+
     const info = await waitForSession(client, 30, (candidate) => candidate.ID === session.ID);
     assert(info.ID === session.ID, "Session info did not return expected session id");
     assert(info.OS.toLowerCase() === goos, `Session info OS mismatch: expected ${goos}, got ${info.OS}`);
@@ -310,22 +370,14 @@ async function main() {
     assert(info.ActiveC2.toLowerCase().includes("mtls://"), `Expected mtls c2, got ${info.ActiveC2}`);
     assert(info.PID === implantPid, `Session PID mismatch: expected ${implantPid}, got ${info.PID}`);
     printInfoSummary(info);
-
-    if (beacons.length > 0) {
-      const beacon = client.interactBeacon(beacons[0].ID);
-      const task = await beacon.lsTask(".");
-      console.log("beacon ls queued", task.id);
-
-      if (WAIT_TASKS) {
-        try {
-          const ls = await task.wait(60);
-          console.log("beacon ls result", { path: ls.Path, count: ls.Files.length });
-        } catch (err) {
-          console.error("beacon ls wait failed", err);
-        }
+  } finally {
+    if (interactiveSession && remoteTransferDir) {
+      try {
+        await interactiveSession.rm(remoteTransferDir, true, true, 60);
+      } catch (err) {
+        console.error(`failed to remove remote transfer dir ${remoteTransferDir}`, err);
       }
     }
-  } finally {
     if (mtlsJobId !== undefined) {
       try {
         await client.killJob(mtlsJobId, 30);
