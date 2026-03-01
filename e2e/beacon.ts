@@ -48,6 +48,10 @@ const DEFAULT_HTTP_C2_PROFILE = "default";
 const BEACON_INTERVAL_SECONDS = 20;
 const BEACON_INTERVAL_NS = String(BEACON_INTERVAL_SECONDS * 1_000_000_000);
 const BEACON_TIMEOUT_SECONDS = 240;
+const BEACON_OVERALL_TIMEOUT_SECONDS = 25 * 60;
+const BEACON_TASK_POLL_RPC_TIMEOUT_SECONDS = 20;
+const BEACON_TASK_CONTENT_RPC_TIMEOUT_SECONDS = 45;
+const BEACON_DOWNLOAD_RPC_TIMEOUT_SECONDS = 45;
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
@@ -85,6 +89,25 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+async function withRpcTimeout<T>(
+  timeoutSeconds: number,
+  label: string,
+  action: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
+  try {
+    return await action(controller.signal);
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error(`${label} timed out after ${timeoutSeconds}s`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function waitForBeacon(
   client: SliverClientInstance,
   timeoutSeconds: number,
@@ -110,7 +133,20 @@ async function waitForBeaconTaskComplete(
 ): Promise<void> {
   const deadline = Date.now() + timeoutSeconds * 1000;
   while (Date.now() < deadline) {
-    const tasks = await client.rpc.getBeaconTasks({ ID: beaconID });
+    let tasks;
+    try {
+      tasks = await withRpcTimeout(
+        BEACON_TASK_POLL_RPC_TIMEOUT_SECONDS,
+        `getBeaconTasks(${beaconID})`,
+        (signal) => client.rpc.getBeaconTasks({ ID: beaconID }, { signal }),
+      );
+    } catch (err) {
+      if (Date.now() >= deadline) {
+        throw err;
+      }
+      await sleep(1000);
+      continue;
+    }
     const task = tasks.Tasks.find((candidate) => candidate.ID === taskID);
     if (!task) {
       await sleep(1000);
@@ -147,7 +183,11 @@ async function decodeBeaconTaskResponse<T extends { Response?: { Err: string } }
 ): Promise<T> {
   const taskID = getQueuedTaskID(queued, label);
   await waitForBeaconTaskComplete(client, beaconID, taskID, timeoutSeconds);
-  const content = await client.rpc.getBeaconTaskContent({ ID: taskID });
+  const content = await withRpcTimeout(
+    BEACON_TASK_CONTENT_RPC_TIMEOUT_SECONDS,
+    `getBeaconTaskContent(${taskID})`,
+    (signal) => client.rpc.getBeaconTaskContent({ ID: taskID }, { signal }),
+  );
   assert(content.Response.length > 0, `${label} task returned no response bytes`);
   const decoded = decoder(content.Response);
   const err = decoded.Response?.Err?.trim();
@@ -229,6 +269,11 @@ function printBeaconInfoSummary(beacon: BeaconInfo): void {
 }
 
 async function main() {
+  const overallTimer = setTimeout(() => {
+    console.error(`Beacon e2e exceeded ${BEACON_OVERALL_TIMEOUT_SECONDS}s overall timeout`);
+    process.exit(1);
+  }, BEACON_OVERALL_TIMEOUT_SECONDS * 1000);
+
   if (!fs.existsSync(CONFIG_PATH)) {
     console.error(`Missing config file: ${CONFIG_PATH}`);
     process.exit(2);
@@ -472,15 +517,23 @@ async function main() {
         240,
       );
 
-      const downloadQueued = await client.rpc.download({
-        Path: remotePath,
-        Request: {
-          Async: true,
-          Timeout: "180",
-          BeaconID: beacon.ID,
-          SessionID: "",
-        },
-      });
+      const downloadQueued = await withRpcTimeout(
+        BEACON_DOWNLOAD_RPC_TIMEOUT_SECONDS,
+        `download queue ${spec.name}`,
+        (signal) =>
+          client.rpc.download(
+            {
+              Path: remotePath,
+              Request: {
+                Async: true,
+                Timeout: "180",
+                BeaconID: beacon.ID,
+                SessionID: "",
+              },
+            },
+            { signal },
+          ),
+      );
       const download = await decodeBeaconTaskResponse(
         client,
         beacon.ID,
@@ -524,6 +577,7 @@ async function main() {
     assert(info.PID === implantPid, `Beacon PID mismatch: expected ${implantPid}, got ${info.PID}`);
     printBeaconInfoSummary(info);
   } finally {
+    clearTimeout(overallTimer);
     if (interactiveBeacon && remoteTransferDir && beaconID) {
       try {
         const rmQueued = await interactiveBeacon.rm(remoteTransferDir, true, true, 120);
