@@ -257,6 +257,51 @@ async function main() {
     const ping = await interactiveSession.ping(nonce, 60);
     assert(ping.Nonce === nonce, `Session ping nonce mismatch: expected ${nonce}, got ${ping.Nonce}`);
 
+    const pwd = await interactiveSession.pwd(60);
+    assert(pwd.Path.trim().length > 0, "pwd returned an empty path");
+
+    const ls = await interactiveSession.ls(".", 60);
+    assert(ls.Exists, `ls reported missing path: ${ls.Path}`);
+    assert(ls.Files.length > 0, `ls returned no files for path: ${ls.Path}`);
+
+    const ps = await interactiveSession.ps(false, 60);
+    assert(ps.Processes.length > 0, "ps returned no processes");
+    const selfProcess = ps.Processes.find((proc) => proc.Pid === implantPid);
+    assert(selfProcess !== undefined, `ps output missing implant process pid ${implantPid}`);
+
+    const ifconfig = await interactiveSession.ifconfig(60);
+    assert(ifconfig.NetInterfaces.length > 0, "ifconfig returned no network interfaces");
+
+    const lsFromPwd = await interactiveSession.ls(pwd.Path, 60);
+    assert(lsFromPwd.Exists, `ls on pwd path reported missing path: ${lsFromPwd.Path}`);
+
+    let netstatEntries: number | undefined;
+    try {
+      const netstat = await interactiveSession.netstat(15);
+      assert(Array.isArray(netstat.Entries), "netstat entries were not returned as an array");
+      if (netstat.Entries.length > 0) {
+        assert(netstat.Entries[0].Protocol.trim().length > 0, "netstat entry missing protocol");
+      }
+      netstatEntries = netstat.Entries.length;
+    } catch (err) {
+      console.warn("netstat check skipped", err);
+    }
+
+    console.log("session command checks", {
+      pwd: pwd.Path,
+      lsPath: ls.Path,
+      lsCount: ls.Files.length,
+      lsFromPwdPath: lsFromPwd.Path,
+      lsFromPwdCount: lsFromPwd.Files.length,
+      psCount: ps.Processes.length,
+      selfProcess: {
+        pid: selfProcess.Pid,
+        executable: selfProcess.Executable,
+      },
+      ifaces: ifconfig.NetInterfaces.map((iface) => iface.Name),
+      netstatEntries,
+    });
+
     const info = await waitForSession(client, 30, (candidate) => candidate.ID === session.ID);
     assert(info.ID === session.ID, "Session info did not return expected session id");
     assert(info.OS.toLowerCase() === goos, `Session info OS mismatch: expected ${goos}, got ${info.OS}`);
