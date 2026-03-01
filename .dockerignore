@@ -1,0 +1,8 @@
+node_modules
+lib
+e2e/dist
+e2e/.cache
+sliver/sliver-client
+sliver/sliver-client_*
+sliver/sliver-server
+sliver/sliver-server_*
