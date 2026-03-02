@@ -10,6 +10,20 @@ type SliverClientInstance = InstanceType<SliverScriptModule["SliverClient"]>;
 type SessionInfo = Awaited<ReturnType<SliverClientInstance["sessions"]>>[number];
 type InteractiveSessionInstance = ReturnType<SliverClientInstance["interactSession"]>;
 
+type SessionTransportName = "mtls" | "http" | "wg";
+
+interface SessionTransportSpec {
+  name: SessionTransportName;
+  c2URL: string;
+  expectedTransportToken: string;
+  expectedActiveC2Token: string;
+  bindHost: string;
+  host: string;
+  port: number;
+  wgNPort?: number;
+  wgKeyPort?: number;
+}
+
 function findRepoRoot(startDir: string): string | undefined {
   let dir = path.resolve(startDir);
   for (let i = 0; i < 10; i++) {
@@ -49,6 +63,12 @@ function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
     throw new Error(message);
   }
+}
+
+function parsePort(rawValue: string, name: string): number {
+  const parsed = Number.parseInt(rawValue, 10);
+  assert(Number.isInteger(parsed) && parsed > 0 && parsed <= 65535, `Invalid ${name}: ${rawValue}`);
+  return parsed;
 }
 
 function nodePlatformToGoOS(platform: NodeJS.Platform): string {
@@ -159,80 +179,105 @@ function md5Hex(data: Buffer): string {
   return createHash("md5").update(data).digest("hex");
 }
 
-async function main() {
-  if (!fs.existsSync(CONFIG_PATH)) {
-    console.error(`Missing config file: ${CONFIG_PATH}`);
-    process.exit(2);
+function sha256Hex(data: Buffer): string {
+  return createHash("sha256").update(data).digest("hex");
+}
+
+function createSessionImplantConfig(
+  sliver: SliverScriptModule,
+  goos: string,
+  goarch: string,
+  transport: SessionTransportSpec,
+) {
+  return sliver.clientpb.ImplantConfig.create({
+    GOOS: goos,
+    GOARCH: goarch,
+    C2: [{ URL: transport.c2URL }],
+    HTTPC2ConfigName: DEFAULT_HTTP_C2_PROFILE,
+    Debug: false,
+    ObfuscateSymbols: false,
+    IsBeacon: false,
+    IncludeMTLS: transport.name === "mtls",
+    IncludeHTTP: transport.name === "http",
+    IncludeWG: transport.name === "wg",
+    WGKeyExchangePort: transport.wgKeyPort ?? 0,
+    WGTcpCommsPort: transport.wgNPort ?? 0,
+    Format: sliver.clientpb.OutputFormat.EXECUTABLE,
+    IsSharedLib: false,
+    IsService: false,
+    IsShellcode: false,
+  });
+}
+
+async function startSessionTransportListener(
+  client: SliverClientInstance,
+  transport: SessionTransportSpec,
+): Promise<number> {
+  if (transport.name === "mtls") {
+    const listener = await client.startMTLSListener(transport.bindHost, transport.port, 60);
+    return listener.JobID;
   }
 
-  const sliver = loadLocalSliverScript(REPO_ROOT);
-  const config = await sliver.ParseConfigFile(CONFIG_PATH);
-  const client = new sliver.SliverClient(config);
-  const goos = nodePlatformToGoOS(process.platform);
-  const goarch = nodeArchToGoArch(process.arch);
-  const mtlsHost = process.env.SLIVER_E2E_MTLS_HOST ?? "localhost";
-  const mtlsBindHost = process.env.SLIVER_E2E_MTLS_BIND_HOST ?? "127.0.0.1";
-  const mtlsPort = Number.parseInt(process.env.SLIVER_E2E_MTLS_PORT ?? String(config.lport), 10);
+  if (transport.name === "http") {
+    const listener = await client.startHTTPListener(transport.host, transport.bindHost, transport.port, "", false, 60);
+    return listener.JobID;
+  }
 
-  assert(Number.isInteger(mtlsPort) && mtlsPort > 0 && mtlsPort <= 65535, `Invalid mtls port: ${mtlsPort}`);
-  const c2URL = `mtls://${mtlsHost}:${mtlsPort}`;
-  const existingSessionIds = new Set<string>();
+  assert(transport.wgNPort !== undefined, "wg nport is required");
+  assert(transport.wgKeyPort !== undefined, "wg keyport is required");
+  const listener = await client.startWGListener(
+    transport.bindHost,
+    transport.port,
+    "100.64.0.1",
+    transport.wgNPort,
+    transport.wgKeyPort,
+    60,
+  );
+  return listener.JobID;
+}
 
+async function runSessionTransportChecks(
+  sliver: SliverScriptModule,
+  client: SliverClientInstance,
+  transport: SessionTransportSpec,
+  goos: string,
+  goarch: string,
+  existingSessionIds: Set<string>,
+): Promise<void> {
   let tempDir: string | undefined;
   let implantPath: string | undefined;
   let implantProc: ChildProcess | undefined;
   let implantOutput: ReturnType<typeof collectOutput> | undefined;
   let interactiveSession: InteractiveSessionInstance | undefined;
   let remoteTransferDir: string | undefined;
-  let mtlsJobId: number | undefined;
+  let listenerJobId: number | undefined;
 
-  await client.connect();
   try {
-    const version = await client.getVersion();
-    console.log("version", `${version.Major}.${version.Minor}.${version.Patch}`, version.Commit);
-
-    const operators = await client.operators();
-    console.log("operators", operators.map((o) => o.Name));
-
-    const sessions = await client.sessions();
-    console.log("sessions", sessions.length);
-    for (const session of sessions) {
-      existingSessionIds.add(session.ID);
-    }
-
-    const beacons = await client.beacons();
-    console.log("beacons", beacons.length);
-
-    const mtlsListener = await client.startMTLSListener(mtlsBindHost, mtlsPort, 60);
-    mtlsJobId = mtlsListener.JobID;
-    console.log("mtls listener started", {
-      bindHost: mtlsBindHost,
-      host: mtlsHost,
-      port: mtlsPort,
-      jobId: mtlsJobId,
+    listenerJobId = await startSessionTransportListener(client, transport);
+    console.log("listener started", {
+      transport: transport.name,
+      bindHost: transport.bindHost,
+      host: transport.host,
+      port: transport.port,
+      jobId: listenerJobId,
+      wgNPort: transport.wgNPort,
+      wgKeyPort: transport.wgKeyPort,
     });
 
-    const implantName = `e2e-session-${goos}-${goarch}-${Date.now()}`;
-    console.log("generate implant", { implantName, goos, goarch, c2URL });
-    const implantConfig = sliver.clientpb.ImplantConfig.create({
-      GOOS: goos,
-      GOARCH: goarch,
-      C2: [{ URL: c2URL }],
-      HTTPC2ConfigName: DEFAULT_HTTP_C2_PROFILE,
-      Debug: false,
-      ObfuscateSymbols: false,
-      IsBeacon: false,
-      IncludeMTLS: true,
-      Format: sliver.clientpb.OutputFormat.EXECUTABLE,
-      IsSharedLib: false,
-      IsService: false,
-      IsShellcode: false,
+    const implantName = `e2e-session-${transport.name}-${goos}-${goarch}-${Date.now()}`;
+    console.log("generate implant", {
+      transport: transport.name,
+      implantName,
+      goos,
+      goarch,
+      c2URL: transport.c2URL,
     });
-    const generated = await client.generate(implantConfig, 300);
+
+    const generated = await client.generate(createSessionImplantConfig(sliver, goos, goarch, transport), 300);
     assert(generated !== undefined, "Generate returned no file");
     assert(generated.Data.length > 0, "Generated implant file is empty");
 
-    tempDir = await mkdtemp(path.join(os.tmpdir(), "sliver-script-implant-"));
+    tempDir = await mkdtemp(path.join(os.tmpdir(), `sliver-script-implant-${transport.name}-`));
     const generatedName = generated.Name.trim() || implantName;
     const filename = path.basename(generatedName);
     implantPath = path.join(tempDir, filename);
@@ -246,7 +291,7 @@ async function main() {
     implantOutput = collectOutput(spawnedImplant);
     const implantPid = spawnedImplant.pid;
     assert(implantPid !== undefined, "Failed to start implant process");
-    console.log("implant started", { path: implantPath, pid: implantPid });
+    console.log("implant started", { transport: transport.name, path: implantPath, pid: implantPid });
 
     const session = await waitForSession(
       client,
@@ -254,14 +299,64 @@ async function main() {
       (candidate) =>
         !existingSessionIds.has(candidate.ID) &&
         candidate.OS.toLowerCase() === goos &&
-        candidate.Arch.toLowerCase() === goarch,
+        candidate.Arch.toLowerCase() === goarch &&
+        candidate.Transport.toLowerCase().includes(transport.expectedTransportToken),
     );
-    console.log("session created", { id: session.ID, pid: session.PID, transport: session.Transport });
+    existingSessionIds.add(session.ID);
+    console.log("session created", {
+      transport: transport.name,
+      id: session.ID,
+      pid: session.PID,
+      sessionTransport: session.Transport,
+      activeC2: session.ActiveC2,
+    });
 
     interactiveSession = client.interactSession(session.ID);
     const nonce = randomInt(1, 2_000_000_000);
     const ping = await interactiveSession.ping(nonce, 60);
     assert(ping.Nonce === nonce, `Session ping nonce mismatch: expected ${nonce}, got ${ping.Nonce}`);
+
+    const executeNoEnvToken = `EXEC_NOENV_${transport.name}_${Date.now()}_${randomInt(10_000, 99_999)}`;
+    const executeNoEnv = await interactiveSession.execute(
+      "/bin/sh",
+      ["-c", `printf '%s' '${executeNoEnvToken}'`],
+      true,
+      60,
+    );
+    assert(executeNoEnv.Status === 0, `execute(no env) non-zero status: ${executeNoEnv.Status}`);
+    const executeNoEnvStdout = executeNoEnv.Stdout.toString("utf8");
+    assert(
+      executeNoEnvStdout === executeNoEnvToken,
+      `execute(no env) stdout mismatch: expected '${executeNoEnvToken}', got '${executeNoEnvStdout}'`,
+    );
+
+    const executeEnvValue = `EXEC_ENV_${transport.name}_${Date.now()}_${randomInt(10_000, 99_999)}`;
+    const executeWithEnv = await client.rpc.execute({
+      Path: "/bin/sh",
+      Args: ["-c", 'printf "%s" "$E2E_EXEC_ENV"'],
+      Output: true,
+      EnvInheritance: false,
+      Env: {
+        E2E_EXEC_ENV: executeEnvValue,
+      },
+      Request: {
+        Async: false,
+        Timeout: "120",
+        BeaconID: "",
+        SessionID: session.ID,
+      },
+    });
+    assert(executeWithEnv.Status === 0, `execute(with env) non-zero status: ${executeWithEnv.Status}`);
+    const executeWithEnvStdout = executeWithEnv.Stdout.toString("utf8");
+    assert(
+      executeWithEnvStdout === executeEnvValue,
+      `execute(with env) stdout mismatch: expected '${executeEnvValue}', got '${executeWithEnvStdout}'`,
+    );
+    console.log("execute rpc checks", {
+      transport: transport.name,
+      noEnvToken: executeNoEnvStdout,
+      envToken: executeWithEnvStdout,
+    });
 
     const pwd = await interactiveSession.pwd(60);
     assert(pwd.Path.trim().length > 0, "pwd returned an empty path");
@@ -294,6 +389,7 @@ async function main() {
     }
 
     console.log("session command checks", {
+      transport: transport.name,
       pwd: pwd.Path,
       lsPath: ls.Path,
       lsCount: ls.Files.length,
@@ -315,7 +411,10 @@ async function main() {
       mkdir(transferDownloadedDir, { recursive: true }),
     ]);
 
-    remoteTransferDir = path.join(pwd.Path, `.sliver-e2e-transfer-${Date.now()}-${randomInt(10_000, 99_999)}`);
+    remoteTransferDir = path.join(
+      pwd.Path,
+      `.sliver-e2e-${transport.name}-transfer-${Date.now()}-${randomInt(10_000, 99_999)}`,
+    );
     await interactiveSession.mkdir(remoteTransferDir, 60);
 
     const transferSpecs = [
@@ -356,6 +455,7 @@ async function main() {
       );
 
       console.log("file transfer verified", {
+        transport: transport.name,
         file: spec.name,
         size: spec.size,
         md5: sourceMd5,
@@ -366,8 +466,14 @@ async function main() {
     assert(info.ID === session.ID, "Session info did not return expected session id");
     assert(info.OS.toLowerCase() === goos, `Session info OS mismatch: expected ${goos}, got ${info.OS}`);
     assert(info.Arch.toLowerCase() === goarch, `Session info arch mismatch: expected ${goarch}, got ${info.Arch}`);
-    assert(info.Transport.toLowerCase().includes("mtls"), `Expected mtls transport, got ${info.Transport}`);
-    assert(info.ActiveC2.toLowerCase().includes("mtls://"), `Expected mtls c2, got ${info.ActiveC2}`);
+    assert(
+      info.Transport.toLowerCase().includes(transport.expectedTransportToken),
+      `Expected ${transport.name} transport, got ${info.Transport}`,
+    );
+    assert(
+      info.ActiveC2.toLowerCase().includes(transport.expectedActiveC2Token),
+      `Expected ${transport.expectedActiveC2Token} c2, got ${info.ActiveC2}`,
+    );
     assert(info.PID === implantPid, `Session PID mismatch: expected ${implantPid}, got ${info.PID}`);
     printInfoSummary(info);
   } finally {
@@ -378,11 +484,11 @@ async function main() {
         console.error(`failed to remove remote transfer dir ${remoteTransferDir}`, err);
       }
     }
-    if (mtlsJobId !== undefined) {
+    if (listenerJobId !== undefined) {
       try {
-        await client.killJob(mtlsJobId, 30);
+        await client.killJob(listenerJobId, 30);
       } catch (err) {
-        console.error(`failed to stop mtls listener job ${mtlsJobId}`, err);
+        console.error(`failed to stop listener job ${listenerJobId}`, err);
       }
     }
     if (implantProc) {
@@ -400,6 +506,174 @@ async function main() {
     }
     if (tempDir) {
       await rm(tempDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+    }
+  }
+}
+
+async function main() {
+  if (!fs.existsSync(CONFIG_PATH)) {
+    console.error(`Missing config file: ${CONFIG_PATH}`);
+    process.exit(2);
+  }
+
+  const sliver = loadLocalSliverScript(REPO_ROOT);
+  const config = await sliver.ParseConfigFile(CONFIG_PATH);
+  const client = new sliver.SliverClient(config);
+  const goos = nodePlatformToGoOS(process.platform);
+  const goarch = nodeArchToGoArch(process.arch);
+
+  const mtlsHost = process.env.SLIVER_E2E_MTLS_HOST ?? "localhost";
+  const mtlsBindHost = process.env.SLIVER_E2E_MTLS_BIND_HOST ?? "127.0.0.1";
+  const mtlsPort = parsePort(process.env.SLIVER_E2E_MTLS_PORT ?? String(config.lport), "SLIVER_E2E_MTLS_PORT");
+
+  const httpHost = process.env.SLIVER_E2E_HTTP_HOST ?? "localhost";
+  const httpBindHost = process.env.SLIVER_E2E_HTTP_BIND_HOST ?? "127.0.0.1";
+  const httpPort = parsePort(process.env.SLIVER_E2E_HTTP_PORT ?? String(mtlsPort + 1), "SLIVER_E2E_HTTP_PORT");
+
+  const wgHost = process.env.SLIVER_E2E_WG_HOST ?? "localhost";
+  const wgBindHost = process.env.SLIVER_E2E_WG_BIND_HOST ?? "127.0.0.1";
+  const wgPort = parsePort(process.env.SLIVER_E2E_WG_PORT ?? String(httpPort + 1), "SLIVER_E2E_WG_PORT");
+  const wgNPort = parsePort(process.env.SLIVER_E2E_WG_NPORT ?? String(wgPort + 1), "SLIVER_E2E_WG_NPORT");
+  const wgKeyPort = parsePort(process.env.SLIVER_E2E_WG_KEYPORT ?? String(wgPort + 2), "SLIVER_E2E_WG_KEYPORT");
+
+  const uniquePorts = new Set<number>([mtlsPort, httpPort, wgPort, wgNPort, wgKeyPort]);
+  assert(uniquePorts.size === 5, "Transport listener ports must be unique");
+
+  const transportSpecs: SessionTransportSpec[] = [
+    {
+      name: "mtls",
+      c2URL: `mtls://${mtlsHost}:${mtlsPort}`,
+      expectedTransportToken: "mtls",
+      expectedActiveC2Token: "mtls://",
+      bindHost: mtlsBindHost,
+      host: mtlsHost,
+      port: mtlsPort,
+    },
+    {
+      name: "http",
+      c2URL: `http://${httpHost}:${httpPort}`,
+      expectedTransportToken: "http",
+      expectedActiveC2Token: "http://",
+      bindHost: httpBindHost,
+      host: httpHost,
+      port: httpPort,
+    },
+    {
+      name: "wg",
+      c2URL: `wg://${wgHost}:${wgPort}`,
+      expectedTransportToken: "wg",
+      expectedActiveC2Token: "wg://",
+      bindHost: wgBindHost,
+      host: wgHost,
+      port: wgPort,
+      wgNPort,
+      wgKeyPort,
+    },
+  ];
+
+  const existingSessionIds = new Set<string>();
+  let websiteName: string | undefined;
+
+  await client.connect();
+  try {
+    const version = await client.getVersion();
+    console.log("version", `${version.Major}.${version.Minor}.${version.Patch}`, version.Commit);
+
+    const operators = await client.operators();
+    console.log("operators", operators.map((o) => o.Name));
+
+    const sessions = await client.sessions();
+    console.log("sessions", sessions.length);
+    for (const session of sessions) {
+      existingSessionIds.add(session.ID);
+    }
+
+    const beacons = await client.beacons();
+    console.log("beacons", beacons.length);
+
+    websiteName = `e2e-site-${Date.now()}-${randomInt(10_000, 99_999)}`;
+    const websiteIndexPath = "/index.html";
+    const websiteScriptPath = "/assets/app.js";
+    const websiteIndexContent = Buffer.from(`<html><body>e2e-${websiteName}</body></html>`, "utf8");
+    const websiteScriptContent = Buffer.from(`console.log("e2e-${websiteName}")`, "utf8");
+
+    const websiteAdded = await client.websiteAddContent(
+      websiteName,
+      {
+        [websiteIndexPath]: sliver.clientpb.WebContent.create({
+          Path: websiteIndexPath,
+          ContentType: "text/html; charset=utf-8",
+          Content: websiteIndexContent,
+        }),
+        [websiteScriptPath]: sliver.clientpb.WebContent.create({
+          Path: websiteScriptPath,
+          ContentType: "application/javascript",
+          Content: websiteScriptContent,
+        }),
+      },
+      60,
+    );
+    assert(websiteAdded.Name === websiteName, `Unexpected website add response name: ${websiteAdded.Name}`);
+    const addedIndex = websiteAdded.Contents[websiteIndexPath];
+    assert(addedIndex !== undefined, `Website add response missing ${websiteIndexPath}`);
+    assert(addedIndex.Content.equals(websiteIndexContent), `Website content mismatch for ${websiteIndexPath}`);
+    assert(addedIndex.Sha256 === sha256Hex(websiteIndexContent), `Website sha256 mismatch for ${websiteIndexPath}`);
+    const addedScript = websiteAdded.Contents[websiteScriptPath];
+    assert(addedScript !== undefined, `Website add response missing ${websiteScriptPath}`);
+    assert(addedScript.Content.equals(websiteScriptContent), `Website content mismatch for ${websiteScriptPath}`);
+    assert(addedScript.Sha256 === sha256Hex(websiteScriptContent), `Website sha256 mismatch for ${websiteScriptPath}`);
+
+    const allWebsites = await client.websites(60);
+    assert(
+      allWebsites.some((site) => site.Name === websiteName),
+      `Websites list did not include created site ${websiteName}`,
+    );
+
+    const websiteFetched = await client.website(websiteName, 60);
+    assert(websiteFetched.Name === websiteName, `Unexpected website fetch response name: ${websiteFetched.Name}`);
+    assert(websiteFetched.Contents[websiteIndexPath] !== undefined, `Website fetch missing ${websiteIndexPath}`);
+    assert(websiteFetched.Contents[websiteScriptPath] !== undefined, `Website fetch missing ${websiteScriptPath}`);
+
+    const updatedContentType = "text/plain; charset=utf-8";
+    const websiteUpdated = await client.websiteUpdateContent(
+      websiteName,
+      {
+        [websiteIndexPath]: sliver.clientpb.WebContent.create({
+          Path: websiteIndexPath,
+          ContentType: updatedContentType,
+        }),
+      },
+      60,
+    );
+    assert(
+      websiteUpdated.Contents[websiteIndexPath]?.ContentType === updatedContentType,
+      `Website update content-type mismatch for ${websiteIndexPath}`,
+    );
+
+    const websiteAfterRemove = await client.websiteRemoveContent(websiteName, [websiteScriptPath], 60);
+    assert(
+      websiteAfterRemove.Contents[websiteScriptPath] === undefined,
+      `Website remove content failed for ${websiteScriptPath}`,
+    );
+    assert(
+      websiteAfterRemove.Contents[websiteIndexPath] !== undefined,
+      `Website remove content unexpectedly removed ${websiteIndexPath}`,
+    );
+    console.log("website rpc checks", {
+      websiteName,
+      paths: Object.keys(websiteAfterRemove.Contents).sort(),
+    });
+
+    for (const transport of transportSpecs) {
+      await runSessionTransportChecks(sliver, client, transport, goos, goarch, existingSessionIds);
+    }
+  } finally {
+    if (websiteName) {
+      try {
+        await client.websiteRemove(websiteName, 60);
+      } catch (err) {
+        console.error(`failed to remove website ${websiteName}`, err);
+      }
     }
     await client.disconnect();
   }

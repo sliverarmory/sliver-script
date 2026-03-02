@@ -241,6 +241,16 @@ async function allocateFreePort(host) {
   });
 }
 
+async function allocateUniquePort(host, usedPorts) {
+  for (let attempt = 0; attempt < 25; attempt++) {
+    const port = await allocateFreePort(host);
+    if (!usedPorts.has(port)) {
+      return port;
+    }
+  }
+  throw new Error(`Failed to allocate a unique free port on ${host}`);
+}
+
 function onceProcessExit(child) {
   return new Promise((resolve) => {
     child.once("exit", resolve);
@@ -350,20 +360,48 @@ async function main() {
     );
   }
 
+  const usedPorts = new Set();
+  const parsePort = (name, rawValue) => {
+    const port = Number.parseInt(rawValue, 10);
+    if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+      throw new Error(`Invalid ${name} value: ${rawValue}`);
+    }
+    return port;
+  };
+  const resolvePort = async (name, rawValue, host) => {
+    const port = rawValue ? parsePort(name, rawValue) : await allocateUniquePort(host, usedPorts);
+    if (usedPorts.has(port)) {
+      throw new Error(`${name} port collision: ${port}`);
+    }
+    usedPorts.add(port);
+    return port;
+  };
+
   const lport = process.env.SLIVER_E2E_LPORT
-    ? Number.parseInt(process.env.SLIVER_E2E_LPORT, 10)
-    : await allocateFreePort(daemonHost);
+    ? parsePort("SLIVER_E2E_LPORT", process.env.SLIVER_E2E_LPORT)
+    : await allocateUniquePort(daemonHost, usedPorts);
   if (!Number.isInteger(lport) || lport <= 0 || lport > 65535) {
     throw new Error(`Invalid SLIVER_E2E_LPORT value: ${process.env.SLIVER_E2E_LPORT}`);
   }
+  if (usedPorts.has(lport)) {
+    throw new Error(`SLIVER_E2E_LPORT port collision: ${lport}`);
+  }
+  usedPorts.add(lport);
   const mtlsBindHost = process.env.SLIVER_E2E_MTLS_BIND_HOST || daemonHost;
   const mtlsHost = process.env.SLIVER_E2E_MTLS_HOST || operatorHost;
-  const mtlsPort = process.env.SLIVER_E2E_MTLS_PORT
-    ? Number.parseInt(process.env.SLIVER_E2E_MTLS_PORT, 10)
-    : await allocateFreePort(mtlsBindHost);
+  const mtlsPort = await resolvePort("SLIVER_E2E_MTLS_PORT", process.env.SLIVER_E2E_MTLS_PORT, mtlsBindHost);
   if (!Number.isInteger(mtlsPort) || mtlsPort <= 0 || mtlsPort > 65535) {
     throw new Error(`Invalid SLIVER_E2E_MTLS_PORT value: ${process.env.SLIVER_E2E_MTLS_PORT}`);
   }
+  const httpBindHost = process.env.SLIVER_E2E_HTTP_BIND_HOST || daemonHost;
+  const httpHost = process.env.SLIVER_E2E_HTTP_HOST || operatorHost;
+  const httpPort = await resolvePort("SLIVER_E2E_HTTP_PORT", process.env.SLIVER_E2E_HTTP_PORT, httpBindHost);
+
+  const wgBindHost = process.env.SLIVER_E2E_WG_BIND_HOST || daemonHost;
+  const wgHost = process.env.SLIVER_E2E_WG_HOST || operatorHost;
+  const wgPort = await resolvePort("SLIVER_E2E_WG_PORT", process.env.SLIVER_E2E_WG_PORT, wgBindHost);
+  const wgNPort = await resolvePort("SLIVER_E2E_WG_NPORT", process.env.SLIVER_E2E_WG_NPORT, wgBindHost);
+  const wgKeyPort = await resolvePort("SLIVER_E2E_WG_KEYPORT", process.env.SLIVER_E2E_WG_KEYPORT, wgBindHost);
 
   const operatorName = process.env.SLIVER_E2E_OPERATOR || "e2e";
 
@@ -395,6 +433,10 @@ async function main() {
     log(`Using operator config endpoint: ${operatorHost}:${lport}`);
     log(`Using mTLS listener bind: ${mtlsBindHost}:${mtlsPort}`);
     log(`Using implant mTLS endpoint: ${mtlsHost}:${mtlsPort}`);
+    log(`Using HTTP listener bind: ${httpBindHost}:${httpPort}`);
+    log(`Using implant HTTP endpoint: ${httpHost}:${httpPort}`);
+    log(`Using WireGuard listener bind: ${wgBindHost}:${wgPort}`);
+    log(`Using implant WireGuard endpoint: ${wgHost}:${wgPort} (nport=${wgNPort}, keyport=${wgKeyPort})`);
 
     await ensureSliverServerBuilt(sharedEnv);
 
@@ -469,6 +511,14 @@ async function main() {
       SLIVER_E2E_MTLS_BIND_HOST: mtlsBindHost,
       SLIVER_E2E_MTLS_HOST: mtlsHost,
       SLIVER_E2E_MTLS_PORT: String(mtlsPort),
+      SLIVER_E2E_HTTP_BIND_HOST: httpBindHost,
+      SLIVER_E2E_HTTP_HOST: httpHost,
+      SLIVER_E2E_HTTP_PORT: String(httpPort),
+      SLIVER_E2E_WG_BIND_HOST: wgBindHost,
+      SLIVER_E2E_WG_HOST: wgHost,
+      SLIVER_E2E_WG_PORT: String(wgPort),
+      SLIVER_E2E_WG_NPORT: String(wgNPort),
+      SLIVER_E2E_WG_KEYPORT: String(wgKeyPort),
     };
     if (process.env.SLIVER_WAIT_TASKS) {
       testEnv.SLIVER_WAIT_TASKS = process.env.SLIVER_WAIT_TASKS;
