@@ -40,8 +40,11 @@
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.11.0",
-    "@grpc/grpc-js": "^1.13.4",
+    "@grpc/grpc-js": "^1.14.3",
     "nice-grpc": "^2.1.12",
     "rxjs": "^7.8.2"
+  },
+  "overrides": {
+    "protobufjs": "^7.2.5"
   }
 }

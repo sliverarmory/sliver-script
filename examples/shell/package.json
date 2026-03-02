@@ -10,5 +10,9 @@
   "license": "ISC",
   "dependencies": {
     "sliver-script": "^1.2.5"
+  },
+  "overrides": {
+    "@grpc/grpc-js": "^1.14.3",
+    "protobufjs": "^7.2.5"
   }
 }
