@@ -351,7 +351,7 @@ async function main() {
     ].map((dirPath) => mkdir(dirPath, { recursive: true })),
   );
 
-  const daemonHost = process.env.SLIVER_E2E_DAEMON_HOST || "127.0.0.1";
+  const daemonHost = process.env.SLIVER_E2E_DAEMON_HOST || "localhost";
   const requestedOperatorHost = process.env.SLIVER_E2E_LHOST || "localhost";
   const operatorHost = isIpLiteral(requestedOperatorHost) ? "localhost" : requestedOperatorHost;
   if (requestedOperatorHost !== operatorHost) {
@@ -402,6 +402,11 @@ async function main() {
   const wgPort = await resolvePort("SLIVER_E2E_WG_PORT", process.env.SLIVER_E2E_WG_PORT, wgBindHost);
   const wgNPort = await resolvePort("SLIVER_E2E_WG_NPORT", process.env.SLIVER_E2E_WG_NPORT, wgBindHost);
   const wgKeyPort = await resolvePort("SLIVER_E2E_WG_KEYPORT", process.env.SLIVER_E2E_WG_KEYPORT, wgBindHost);
+  const beaconIntervalSecondsRaw = process.env.SLIVER_E2E_BEACON_INTERVAL_SECONDS || "5";
+  const beaconIntervalSeconds = Number.parseInt(beaconIntervalSecondsRaw, 10);
+  if (!Number.isInteger(beaconIntervalSeconds) || beaconIntervalSeconds <= 0 || beaconIntervalSeconds > 300) {
+    throw new Error(`Invalid SLIVER_E2E_BEACON_INTERVAL_SECONDS value: ${beaconIntervalSecondsRaw}`);
+  }
 
   const operatorName = process.env.SLIVER_E2E_OPERATOR || "e2e";
 
@@ -437,6 +442,7 @@ async function main() {
     log(`Using implant HTTP endpoint: ${httpHost}:${httpPort}`);
     log(`Using WireGuard listener bind: ${wgBindHost}:${wgPort}`);
     log(`Using implant WireGuard endpoint: ${wgHost}:${wgPort} (nport=${wgNPort}, keyport=${wgKeyPort})`);
+    log(`Using beacon interval: ${beaconIntervalSeconds}s`);
 
     await ensureSliverServerBuilt(sharedEnv);
 
@@ -519,6 +525,7 @@ async function main() {
       SLIVER_E2E_WG_PORT: String(wgPort),
       SLIVER_E2E_WG_NPORT: String(wgNPort),
       SLIVER_E2E_WG_KEYPORT: String(wgKeyPort),
+      SLIVER_E2E_BEACON_INTERVAL_SECONDS: String(beaconIntervalSeconds),
     };
     if (process.env.SLIVER_WAIT_TASKS) {
       testEnv.SLIVER_WAIT_TASKS = process.env.SLIVER_WAIT_TASKS;
