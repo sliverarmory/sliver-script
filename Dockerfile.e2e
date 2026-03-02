@@ -1,0 +1,27 @@
+FROM node:25-bookworm
+
+ARG GO_VERSION=1.25.7
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    git \
+    make \
+    unzip \
+    xz-utils \
+  && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" \
+  | tar -C /usr/local -xzf -
+
+ENV PATH="/usr/local/go/bin:${PATH}"
+
+WORKDIR /workspace
+
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY . .
+
+CMD ["npm", "run", "test:e2e"]

@@ -2,18 +2,43 @@ name: Build Check
 
 on:
   push:
-    branches: [master]
+    branches: [master, v2]
   pull_request:
-    branches: [master]
+    branches: [master, v2]
 
 jobs:
   build-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      - uses: actions/checkout@v4
         with:
-          node-version: 16
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
 
-      - run: npm install
+      - run: npm ci
       - run: npm run build
+
+  e2e-tests:
+    name: e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 1.25.x
+      - run: npm ci
+      - run: npm run test:e2e

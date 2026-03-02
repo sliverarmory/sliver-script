@@ -1,1053 +1,787 @@
-import * as zlib from 'zlib';
+import { gunzip as gunzipCb, gzip as gzipCb } from "node:zlib";
+import { promisify } from "node:util";
 
-import * as grpc from '@grpc/grpc-js';
-import { Subject, Observable, Observer, Subscription } from 'rxjs';
-import { filter } from 'rxjs/operators';
+import { createChannel, createClient, type Channel } from "nice-grpc";
+import { Subject, filter, map, type Observable } from "rxjs";
 
-import { commonpb } from './pb/commonpb/common';
-import { sliverpb } from './pb/sliverpb/sliver';
-import { clientpb } from './pb/clientpb/client';
-import { rpcpb } from './pb/rpcpb/services';
-import { Events } from './events';
-import { SliverClientConfig } from './config';
+import type { SliverClientConfig } from "./config";
+import { createSliverRpcCredentials } from "./internal/credentials";
+import { withTimeoutSignal } from "./internal/timeout";
+import { TunnelManager } from "./internal/tunnelManager";
+import { BeaconTask } from "./pb/clientpb/client";
+import type {
+  Event,
+  Operators,
+  Sessions,
+  Version,
+  Beacons,
+  Jobs,
+  Beacon,
+  GenerateSpoofMetadataReq,
+  ImplantConfig,
+  ImplantProfile,
+  Loot,
+  WebContent,
+} from "./pb/clientpb/client";
+import type { Request as CommonRequest } from "./pb/commonpb/common";
+import { SliverRPCDefinition } from "./pb/rpcpb/services";
+import type { SliverRPCClient } from "./pb/rpcpb/services";
+import { Ls } from "./pb/sliverpb/sliver";
 
+const gzip = promisify(gzipCb);
+const gunzip = promisify(gunzipCb);
 
-const TIMEOUT = 30; // Default timeout in seconds
-const Kb = 1024;
-const Mb = 1024 * Kb;
-const Gb = 1024 * Mb;
+const DEFAULT_TIMEOUT_SECONDS = 30;
+const KiB = 1024;
+const MiB = 1024 * KiB;
+const GiB = 1024 * MiB;
 
-export async function gzip(data: Buffer): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    zlib.gzip(data, (err, result) => {
-      err ? reject(err) : resolve(result);
-    });
-  });
-}
-
-export async function gunzip(data: Buffer): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    zlib.gunzip(data, (err, result) => {
-      err ? reject(err) : resolve(result);
-    });
-  });
-}
-
-// Exported/simplified tunnel interfaces
 export interface Tunnel {
-  stdout: Observable<Buffer>
-  stdin: Observer<Buffer>
+  readonly id: string;
+  readonly stdout$: Observable<Buffer>;
+  write(data: Buffer | string): void;
+  close(): Promise<void>;
 }
 
-// BaseCommands - Base command implementations shared between sessions and beacon
 class BaseCommands {
+  constructor(protected readonly rpc: SliverRPCClient) {}
 
-  protected _rpc: rpcpb.SliverRPCClient;
-
-  constructor(rpc: rpcpb.SliverRPCClient) {
-    this._rpc = rpc;
+  protected request(timeoutSeconds: number): CommonRequest {
+    return { Async: false, Timeout: `${timeoutSeconds}`, BeaconID: "", SessionID: "" };
   }
 
-  // request - should be overloaded by sub classes
-  protected request(timeout: number): commonpb.Request { return new commonpb.Request(); }
-
-  protected deadline(timeout = TIMEOUT) {
-    return {
-      'deadline': Date.now() + ((timeout + 1) * 1000)
-    }
+  protected async unary<T>(timeoutSeconds: number, fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    return withTimeoutSignal(timeoutSeconds, fn);
   }
 
-  protected toUint8Array(buf: Buffer): Uint8Array {
-    const arrayBuf = new ArrayBuffer(buf.length);
-    const uint8Array = new Uint8Array(arrayBuf);
-    for (let index = 0; index < buf.length; ++index) {
-      uint8Array[index] = buf[index];
-    }
-    return uint8Array;
+  ping(nonce: number, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.ping({ Nonce: nonce, Request: this.request(timeoutSeconds) }, { signal }),
+    );
   }
 
-  ping(nonce: number, timeout = TIMEOUT): Promise<sliverpb.Ping | undefined> {
-    return new Promise((resolve, reject) => {
-      const ping = new sliverpb.Ping();
-      ping.Request = this.request(timeout);
-      ping.Nonce = nonce;
-      this._rpc.Ping(ping, this.deadline(timeout), (err, pong) => {
-        err ? reject(err) : resolve(pong);
-      });
+  ps(fullInfo = false, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.ps({ FullInfo: fullInfo, Request: this.request(timeoutSeconds) }, { signal }),
+    );
+  }
+
+  ls(path = ".", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.ls({ Path: path, Request: this.request(timeoutSeconds) }, { signal }),
+    );
+  }
+
+  download(path: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Buffer> {
+    return this.unary(timeoutSeconds, async (signal) => {
+      const download = await this.rpc.download({ Path: path, Request: this.request(timeoutSeconds) }, { signal });
+      if (download.Encoder === "gzip") {
+        return await gunzip(download.Data);
+      }
+      if (download.Encoder !== "") {
+        throw new Error(`Unsupported encoder: ${download.Encoder}`);
+      }
+      return download.Data;
     });
   }
 
-  ps(timeout = TIMEOUT): Promise<commonpb.Process[] | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.PsReq();
-      req.Request = this.request(timeout);
-      this._rpc.Ps(req, this.deadline(timeout), (err, ps) => {
-        err ? reject(err) : resolve(ps?.Processes);
-      });
+  upload(path: string, data: Buffer, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, async (signal) => {
+      const payload = await gzip(data);
+      return this.rpc.upload(
+        { Path: path, Encoder: "gzip", Data: payload, Request: this.request(timeoutSeconds) },
+        { signal },
+      );
     });
   }
 
-  terminate(pid: number, timeout = TIMEOUT): Promise<sliverpb.Terminate | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.TerminateReq();
-      req.Pid = pid;
-      req.Request = this.request(timeout);
-      this._rpc.Terminate(req, this.deadline(timeout), (err, terminate) => {
-        err ? reject(err) : resolve(terminate);
-      });
-    });
+  terminate(pid: number, force = false, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.terminate({ Pid: pid, Force: force, Request: this.request(timeoutSeconds) }, { signal }),
+    );
   }
 
-  ifconfig(timeout = TIMEOUT): Promise<sliverpb.Ifconfig | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.IfconfigReq();
-      req.Request = this.request(timeout);
-      this._rpc.Ifconfig(req, this.deadline(timeout), (err, ifconfig) => {
-        err ? reject(err) : resolve(ifconfig);
-      });
-    });
+  ifconfig(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.ifconfig({ Request: this.request(timeoutSeconds) }, { signal }),
+    );
   }
 
-  netstat(timeout = TIMEOUT): Promise<sliverpb.Netstat | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.NetstatReq();
-      req.Request = this.request(timeout);
-      this._rpc.Netstat(req, this.deadline(timeout), (err, netstat) => {
-        err ? reject(err) : resolve(netstat);
-      });
-    });
+  netstat(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.netstat({ Request: this.request(timeoutSeconds) }, { signal }),
+    );
   }
 
-  ls(path = '.', timeout = TIMEOUT): Promise<sliverpb.Ls | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.LsReq();
-      req.Path = path;
-      req.Request = this.request(timeout);
-      this._rpc.Ls(req, this.deadline(timeout), (err, ls) => {
-        err ? reject(err) : resolve(ls);
-      });
-    });
+  cd(path: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) => this.rpc.cd({ Path: path, Request: this.request(timeoutSeconds) }, { signal }));
   }
 
-  cd(path: string, timeout = TIMEOUT): Promise<sliverpb.Pwd | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.CdReq();
-      req.Path = path;
-      req.Request = this.request(timeout);
-      this._rpc.Cd(req, this.deadline(timeout), (err, pwd) => {
-        err ? reject(err) : resolve(pwd);
-      });
-    });
+  pwd(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) => this.rpc.pwd({ Request: this.request(timeoutSeconds) }, { signal }));
   }
 
-  pwd(timeout = TIMEOUT): Promise<sliverpb.Pwd | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.PwdReq();
-      req.Request = this.request(timeout);
-      this._rpc.Pwd(req, this.deadline(timeout), (err, pwd) => {
-        err ? reject(err) : resolve(pwd);
-      });
-    });
+  rm(path: string, recursive = false, force = false, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.rm({ Path: path, Recursive: recursive, Force: force, Request: this.request(timeoutSeconds) }, { signal }),
+    );
   }
 
-  rm(path: string, timeout = TIMEOUT): Promise<sliverpb.Rm | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.RmReq();
-      req.Path = path;
-      req.Request = this.request(timeout);
-      this._rpc.Rm(req, this.deadline(timeout), (err, rm) => {
-        err ? reject(err) : resolve(rm);
-      });
-    });
+  mkdir(path: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.mkdir({ Path: path, Request: this.request(timeoutSeconds) }, { signal }),
+    );
   }
 
-  mkdir(path: string, timeout = TIMEOUT): Promise<sliverpb.Mkdir | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.MkdirReq();
-      req.Path = path;
-      req.Request = this.request(timeout);
-      this._rpc.Mkdir(req, this.deadline(timeout), (err, mkdir) => {
-        err ? reject(err) : resolve(mkdir);
-      });
-    });
+  processDump(pid: number, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.processDump({ Pid: pid, Request: this.request(timeoutSeconds) }, { signal }),
+    );
   }
 
-  download(path: string, timeout = TIMEOUT): Promise<Buffer> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.DownloadReq();
-      req.Path = path;
-      req.Request = this.request(timeout);
-      this._rpc.Download(req, this.deadline(timeout), async (err, download) => {
-        if (err || download === undefined) {
-          return reject(err ? err : 'Null response');
-        }
-        let data = Buffer.from(download.Data);
-        if (download.Encoder === 'gzip') {
-          data = await gunzip(data);
-        } else if (download.Encoder !== '') {
-          return reject(`Unsupported encoder ${download.Encoder}`);
-        }
-        resolve(data);
-      });
-    });
+  runAs(userName: string, processName: string, args: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.runAs(
+        { Username: userName, ProcessName: processName, Args: args, Request: this.request(timeoutSeconds) },
+        { signal },
+      ),
+    );
   }
 
-  upload(path: string, data: Buffer, timeout = TIMEOUT): Promise<sliverpb.Upload | undefined> {
-    return new Promise(async (resolve, reject) => {
-      const req = new sliverpb.UploadReq();
-      req.Path = path;
-      req.Encoder = 'gzip';
-      const payload = await gzip(data)
-      req.Data = this.toUint8Array(payload);
-      req.Request = this.request(timeout);
-      this._rpc.Upload(req, this.deadline(timeout), (err, upload) => {
-        err ? reject(err) : resolve(upload);
-      });
-    });
+  impersonate(userName: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.impersonate({ Username: userName, Request: this.request(timeoutSeconds) }, { signal }),
+    );
   }
 
-  processDump(pid: number, timeout = TIMEOUT): Promise<sliverpb.ProcessDump | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.ProcessDumpReq();
-      req.Pid = pid;
-      req.Request = this.request(timeout);
-      this._rpc.ProcessDump(req, this.deadline(timeout), (err, procdump) => {
-        err ? reject(err) : resolve(procdump);
-      });
-    });
+  revToSelf(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) => this.rpc.revToSelf({ Request: this.request(timeoutSeconds) }, { signal }));
   }
 
-  runAs(userName: string, processName: string, args: string, timeout = TIMEOUT): Promise<sliverpb.RunAs | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.RunAsReq();
-      req.Username = userName;
-      req.ProcessName = processName;
-      req.Args = args;
-      req.Request = this.request(timeout);
-      this._rpc.RunAs(req, this.deadline(timeout), (err, runAs) => {
-        err ? reject(err) : resolve(runAs);
-      });
-    });
+  getSystem(hostingProcess: string, config: ImplantConfig, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.getSystem(
+        { HostingProcess: hostingProcess, Config: config, Request: this.request(timeoutSeconds) },
+        { signal },
+      ),
+    );
   }
 
-  impersonate(userName: string, timeout = TIMEOUT): Promise<sliverpb.Impersonate | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.ImpersonateReq();
-      req.Username = userName;
-      req.Request = this.request(timeout);
-      this._rpc.Impersonate(req, this.deadline(timeout), (err, impersonate) => {
-        err ? reject(err) : resolve(impersonate);
-      });
-    });
+  /**
+   * Execute arbitrary shellcode (aka "task" in Sliver terminology).
+   *
+   * Note: For beacon interactions this will queue an async task; use the
+   * returned Response.TaskID to fetch results.
+   */
+  task(
+    pid: number,
+    shellcode: Buffer,
+    encoder = "",
+    rwxPages = false,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.task(
+        {
+          Pid: pid,
+          Data: shellcode,
+          Encoder: encoder,
+          RWXPages: rwxPages,
+          Request: this.request(timeoutSeconds),
+        },
+        { signal },
+      ),
+    );
   }
 
-  revToSelf(timeout = TIMEOUT): Promise<sliverpb.RevToSelf | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.RevToSelfReq();
-      req.Request = this.request(timeout);
-      this._rpc.RevToSelf(req, this.deadline(timeout), (err, revToSelf) => {
-        err ? reject(err) : resolve(revToSelf);
-      });
-    });
+  msf(
+    payload: string,
+    lhost: string,
+    lport: number,
+    encoder = "",
+    iterations = 0,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.msf(
+        { Payload: payload, LHost: lhost, LPort: lport, Encoder: encoder, Iterations: iterations, Request: this.request(timeoutSeconds) },
+        { signal },
+      ),
+    );
   }
 
-  getSystem(hostingProcess: string, config: clientpb.ImplantConfig, timeout = TIMEOUT): Promise<sliverpb.GetSystem | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new clientpb.GetSystemReq();
-      req.HostingProcess = hostingProcess;
-      req.Config = config;
-      req.Request = this.request(timeout);
-      this._rpc.GetSystem(req, this.deadline(timeout), (err, getSystem) => {
-        err ? reject(err) : resolve(getSystem);
-      });
-    });
+  msfRemote(
+    pid: number,
+    payload: string,
+    lhost: string,
+    lport: number,
+    encoder = "",
+    iterations = 0,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.msfRemote(
+        { PID: pid, Payload: payload, LHost: lhost, LPort: lport, Encoder: encoder, Iterations: iterations, Request: this.request(timeoutSeconds) },
+        { signal },
+      ),
+    );
   }
 
-  // 'shellcode' aka "task"
-  executeShellcode(pid: number, shellcode: Buffer, encoder: string, rwx: boolean, timeout = TIMEOUT): Promise<sliverpb.Task | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.TaskReq();
-      req.Encoder = encoder;
-      req.RWXPages = rwx;
-      req.Pid = pid;
-      req.Data = shellcode;
-      req.Request = this.request(timeout);
-      this._rpc.Task(req, this.deadline(timeout), (err, task) => {
-        err ? reject(err) : resolve(task);
-      });
-    });
+  executeAssembly(assembly: Buffer, args: string[] = [], process = "", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.executeAssembly(
+        { Assembly: assembly, Arguments: args, Process: process, Request: this.request(timeoutSeconds) },
+        { signal },
+      ),
+    );
   }
 
-  msf(payload: string, lhost: string, lport: number, encoder: string, iterations: number, timeout = TIMEOUT): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const req = new clientpb.MSFReq();
-      req.Payload = payload;
-      req.LHost = lhost;
-      req.LPort = lport;
-      req.Encoder = encoder;
-      req.Iterations = iterations;
-      req.Request = this.request(timeout);
-      this._rpc.Msf(req, this.deadline(timeout), (err) => {
-        err ? reject(err) : resolve();
-      });
-    });
+  migrate(pid: number, config: ImplantConfig, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.migrate({ Pid: pid, Config: config, Request: this.request(timeoutSeconds) }, { signal }),
+    );
   }
 
-  msfRemote(pid: number, payload: string, lhost: string, lport: number, encoder: string, iterations: number, timeout = TIMEOUT): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const req = new clientpb.MSFRemoteReq();
-      req.PID = pid;
-      req.Payload = payload;
-      req.LHost = lhost;
-      req.LPort = lport;
-      req.Encoder = encoder;
-      req.Iterations = iterations;
-      req.Request = this.request(timeout);
-      this._rpc.Msf(req, (err) => {
-        err ? reject(err) : resolve();
-      });
-    });
+  execute(exe: string, args: string[] = [], output = true, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.execute({ Path: exe, Args: args, Output: output, Request: this.request(timeoutSeconds) }, { signal }),
+    );
   }
 
-  executeAssembly(assembly: Buffer, args: string, process: string, timeout = TIMEOUT): Promise<sliverpb.ExecuteAssembly | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.ExecuteAssemblyReq();
-      req.Assembly = assembly;
-      req.Arguments = args;
-      req.Process = process;
-      req.Request = this.request(timeout);
-      this._rpc.ExecuteAssembly(req, this.deadline(timeout), (err, executeAssembly) => {
-        err ? reject(err) : resolve(executeAssembly);
-      });
-    });
+  sideload(
+    data: Buffer,
+    processName: string,
+    args: string[] = [],
+    entryPoint: string,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.sideload(
+        { Data: data, ProcessName: processName, Args: args, EntryPoint: entryPoint, Request: this.request(timeoutSeconds) },
+        { signal },
+      ),
+    );
   }
 
-  migrate(pid: number, config: clientpb.ImplantConfig, timeout = TIMEOUT): Promise<sliverpb.Migrate | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new clientpb.MigrateReq();
-      req.Pid = pid;
-      req.Config = config;
-      req.Request = this.request(timeout);
-      this._rpc.Migrate(req, this.deadline(timeout), (err, migration) => {
-        err ? reject(err) : resolve(migration);
-      });
-    });
+  spawnDll(
+    data: Buffer,
+    entrypoint: string,
+    processName: string,
+    args: string[] = [],
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.spawnDll(
+        { Data: data, EntryPoint: entrypoint, ProcessName: processName, Args: args, Request: this.request(timeoutSeconds) },
+        { signal },
+      ),
+    );
   }
 
-  execute(exe: string, args: string[], output: boolean, timeout = TIMEOUT): Promise<sliverpb.Execute | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.ExecuteReq();
-      req.Path = exe;
-      req.Args = args;
-      req.Output = output;
-      req.Request = this.request(timeout);
-      this._rpc.Execute(req, this.deadline(timeout), (err, exec) => {
-        err ? reject(err) : resolve(exec);
-      });
-    });
+  screenshot(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return this.unary(timeoutSeconds, (signal) =>
+      this.rpc.screenshot({ Request: this.request(timeoutSeconds) }, { signal }),
+    );
   }
-
-  sideload(data: Buffer, processName: string, args: string, entryPoint: string, timeout = TIMEOUT): Promise<sliverpb.Sideload | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.SideloadReq();
-      req.Data = data;
-      req.ProcessName = processName;
-      req.Args = args;
-      req.EntryPoint = entryPoint;
-      req.Request = this.request(timeout);
-      this._rpc.Sideload(req, this.deadline(timeout), (err, exec) => {
-        err ? reject(err) : resolve(exec);
-      });
-    });
-  }
-
-  spawnDLL(data: Buffer, entrypoint: string, processName: string, args: string, timeout = TIMEOUT): Promise<sliverpb.SpawnDll | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.InvokeSpawnDllReq();
-      req.Data = data;
-      req.ProcessName = processName;
-      req.Args = args;
-      req.EntryPoint = entrypoint;
-      req.Request = this.request(timeout);
-      this._rpc.SpawnDll(req, this.deadline(timeout), (err, dll) => {
-        err ? reject(err) : resolve(dll);
-      });
-    });
-  }
-
-  screenshot(timeout = TIMEOUT): Promise<sliverpb.Screenshot | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new sliverpb.ScreenshotReq();
-      req.Request = this.request(timeout);
-      this._rpc.Screenshot(req, this.deadline(timeout), (err, screenshot) => {
-        err ? reject(err) : resolve(screenshot);
-      });
-    });
-  }
-
 }
 
 export class InteractiveBeacon extends BaseCommands {
-
-  private _beaconID: string;
-  private _taskresult$: Observable<clientpb.Event>;
-  private _pendingTasks: Map<string, Subscription> = new Map<string, Subscription>();
-
-  constructor(rpc: rpcpb.SliverRPCClient, taskresult$: Observable<clientpb.Event>, beaconID: string) {
+  constructor(
+    rpc: SliverRPCClient,
+    private readonly taskResult$: Observable<Event>,
+    private readonly beaconId: string,
+  ) {
     super(rpc);
-    this._beaconID = beaconID;
-    this._taskresult$ = taskresult$;
   }
 
-  protected request(timeout: number): commonpb.Request {
-    const req = new commonpb.Request();
-    req.BeaconID = this._beaconID;
-    req.Timeout = timeout;
-    req.Async = true;
-    return req;
+  protected request(timeoutSeconds: number): CommonRequest {
+    return {
+      Async: true,
+      Timeout: `${timeoutSeconds}`,
+      BeaconID: this.beaconId,
+      SessionID: "",
+    };
   }
 
-  async ls(path?: string, timeout?: number): Promise<sliverpb.Ls | undefined> {
-    const lsTask = await super.ls();
-    if (!lsTask || lsTask.Response.Err !== undefined) {
-      console.error(`lsTask.Response.Err: ${lsTask?.Response?.Err}`);
-      return Promise.reject(lsTask?.Response?.Err);
+  async lsTask(path = ".", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    const lsTask = await super.ls(path, timeoutSeconds);
+    if (lsTask.Response?.Err) {
+      throw new Error(lsTask.Response.Err);
     }
-    return new Promise(async (resolve, reject) => {
-      const taskSubscription = this._taskresult$.subscribe(async (event: clientpb.Event) => {
-        let beaconTask = clientpb.BeaconTask.deserializeBinary(event.Data);
-        if (beaconTask.ID === lsTask?.Response?.TaskID) {
-          this._pendingTasks.get(beaconTask.ID)?.unsubscribe();
-          this._pendingTasks.delete(beaconTask.ID);
-          const taskReq = new clientpb.BeaconTask({ ID: beaconTask.ID });
-          this._rpc.GetBeaconTaskContent(taskReq, async (err, taskContent) => {
-            if (err || !taskContent) {
-              reject(err);
-            } else {
-              const ls = sliverpb.Ls.deserializeBinary(taskContent.Response);
-              resolve(ls);
-            }
-          });
-        }
-      });
-      this._pendingTasks.set(lsTask.Response.TaskID, taskSubscription);
-    });
+    const taskId = lsTask.Response?.TaskID;
+    if (!taskId) {
+      throw new Error("Missing beacon task id");
+    }
+    return {
+      id: taskId,
+      wait: async (waitTimeoutSeconds = timeoutSeconds) => {
+        const beaconTask = await waitForBeaconTask(this.taskResult$, taskId, waitTimeoutSeconds);
+        const taskContent = await this.unary(waitTimeoutSeconds, (signal) =>
+          this.rpc.getBeaconTaskContent({ ID: beaconTask.ID }, { signal }),
+        );
+        return Ls.decode(taskContent.Response);
+      },
+    };
+  }
+
+  async ls(path = ".", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    const task = await this.lsTask(path, timeoutSeconds);
+    return task.wait(timeoutSeconds);
   }
 }
 
 export class InteractiveSession extends BaseCommands {
-
-  private _sessionID: string;
-  private _tunnelStream: grpc.ClientDuplexStream<sliverpb.TunnelData, sliverpb.TunnelData>;
-
-  constructor(rpc: rpcpb.SliverRPCClient,
-    tunnelStream: grpc.ClientDuplexStream<sliverpb.TunnelData, sliverpb.TunnelData>,
-    sessionId: string) {
+  constructor(
+    rpc: SliverRPCClient,
+    private readonly tunnels: TunnelManager,
+    private readonly sessionId: string,
+  ) {
     super(rpc);
-    this._tunnelStream = tunnelStream;
-    this._sessionID = sessionId;
   }
 
-  protected request(timeout: number): commonpb.Request {
-    const req = new commonpb.Request();
-    req.SessionID = this._sessionID;
-    req.Timeout = timeout;
-    return req;
+  protected request(timeoutSeconds: number): CommonRequest {
+    return {
+      Async: false,
+      Timeout: `${timeoutSeconds}`,
+      BeaconID: "",
+      SessionID: this.sessionId,
+    };
   }
 
-  shell(path: string, pty: boolean, timeout = TIMEOUT): Promise<Tunnel> {
-    return new Promise((resolve, reject) => {
+  async shell(path: string, pty = true, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Tunnel> {
+    const tunnel = await this.unary(timeoutSeconds, (signal) =>
+      this.rpc.createTunnel({ SessionID: this.sessionId }, { signal }),
+    );
+    if (!tunnel?.TunnelID) {
+      throw new Error("Failed to create tunnel");
+    }
+    const tunnelId = tunnel.TunnelID;
 
-      const tunnel = new sliverpb.Tunnel();
-      tunnel.SessionID = this._sessionID;
+    // Subscribe first so we don't miss early data.
+    const stdout$ = this.tunnels.subscribe(tunnelId).pipe(
+      filter((msg) => msg.TunnelID === tunnelId),
+      filter((msg) => msg.Data.length > 0),
+      map((msg) => msg.Data),
+    );
 
-      this._rpc.CreateTunnel(tunnel, (err, rpcTunnel) => {
-        if (err || rpcTunnel === undefined) {
-          return reject(err);
-        }
-        const tunnelId = rpcTunnel.TunnelID;
-        const tunnelData = new sliverpb.TunnelData();
-        tunnelData.SessionID = this._sessionID;
-        tunnelData.TunnelID = tunnelId;
+    // Bind tunnel to the tunnel stream.
+    this.tunnels.send({ TunnelID: tunnelId, SessionID: this.sessionId });
 
-        this._tunnelStream.write(tunnelData, () => {
-          const req = new sliverpb.ShellReq();
-          req.TunnelID = tunnelId;
-          req.Path = path;
-          req.EnablePTY = pty;
-          req.Request = this.request(timeout);
-          this._rpc.Shell(req, (err, shell) => {
-            if (err || shell === undefined) {
-              return reject(err);
-            }
-            const stdout = new Observable<Buffer>(producer => {
-              this._tunnelStream.on('data', (tunnelData: sliverpb.TunnelData) => {
-                console.log(tunnelData);
-                if (tunnelData.TunnelID !== tunnelId) {
-                  return; // Data is from another tunnel
-                }
-                const isClosed = tunnelData.Closed;
-                if (isClosed) {
-                  const drain = Buffer.from(tunnelData.Data);
-                  if (drain.length) {
-                    producer.next(drain);
-                  }
-                  producer.complete();
-                } else {
-                  producer.next(Buffer.from(tunnelData.Data));
-                }
-              });
-            });
+    // Ask the implant to open a shell on the bound tunnel.
+    await this.unary(timeoutSeconds, (signal) =>
+      this.rpc.shell(
+        {
+          Path: path,
+          EnablePTY: pty,
+          TunnelID: tunnelId,
+          Request: this.request(timeoutSeconds),
+        },
+        { signal },
+      ),
+    );
 
-            const stdin: Observer<Buffer> = {
-              next: (raw: Buffer) => {
-                const data = new sliverpb.TunnelData();
-                data.TunnelID = tunnelId;
-                data.SessionID = this._sessionID;
-                data.Data = this.toUint8Array(raw);
-                this._tunnelStream.write(data);
-              },
-              complete: () => {
-                this._rpc.closeTunnel(rpcTunnel, () => { });
-              },
-              error: () => {
-                this._rpc.closeTunnel(rpcTunnel, () => { });
-              },
-            };
-            resolve({ stdin: stdin, stdout: stdout });
-          });
-        }); // Bind tunnel
-      });
-    });
+    return {
+      id: tunnelId,
+      stdout$,
+      write: (data: Buffer | string) => {
+        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+        this.tunnels.send({ TunnelID: tunnelId, SessionID: this.sessionId, Data: buf });
+      },
+      close: async () => {
+        await this.unary(DEFAULT_TIMEOUT_SECONDS, (signal) =>
+          this.rpc.closeTunnel({ TunnelID: tunnelId, SessionID: this.sessionId }, { signal }),
+        );
+      },
+    };
   }
-
 }
 
-
 export class SliverClient {
+  static readonly EVENT_BEACON_REGISTERED = "beacon-registered";
+  static readonly EVENT_BEACON_TASKRESULT = "beacon-taskresult";
 
-  readonly BEACON_REGISTERED = 'beacon-registered';
-  readonly BEACON_TASKRESULT = 'beacon-taskresult';
+  private readonly empty = {};
+  private rpcClient: SliverRPCClient | null = null;
+  private channel: Channel | null = null;
 
-  private _config: SliverClientConfig;
-  private _rpc: rpcpb.SliverRPCClient | null = null;
-  private empty = new commonpb.Empty();
+  private eventsAbort: AbortController | null = null;
+  private tunnels: TunnelManager | null = null;
 
-  private lootEventTypes: string[] = [Events.LootAddedEvent, Events.LootRemovedEvent];
-  private _events: grpc.ClientReadableStream<commonpb.Empty> | null = null;
-  event$ = new Subject<clientpb.Event>();
+  private readonly eventSubject = new Subject<Event>();
+  readonly event$ = this.eventSubject.asObservable();
 
-  session$ = this.event$.pipe(filter(event => event.Session !== undefined));
-  job$ = this.event$.pipe(filter(event => event.Job !== undefined));
-  client$ = this.event$.pipe(filter(event => event.Client !== undefined));
-  beacon$ = this.event$.pipe(filter(event => event.EventType === this.BEACON_REGISTERED));
-  taskresult$ = this.event$.pipe(filter(event => event.EventType === this.BEACON_TASKRESULT));
+  readonly session$ = this.event$.pipe(filter((event): event is Event & { Session: NonNullable<Event["Session"]> } =>
+    event.Session !== undefined
+  ));
+  readonly job$ = this.event$.pipe(filter((event): event is Event & { Job: NonNullable<Event["Job"]> } =>
+    event.Job !== undefined
+  ));
+  readonly client$ = this.event$.pipe(filter((event): event is Event & { Client: NonNullable<Event["Client"]> } =>
+    event.Client !== undefined
+  ));
 
-  // Filter anything that doesn't match one of the loot event types
-  loot$ = this.event$.pipe(filter(event => this.lootEventTypes.some(lootEventType => {
-    lootEventType === event.EventType
-  })));
+  readonly beacon$ = this.event$.pipe(filter((event) => event.EventType === SliverClient.EVENT_BEACON_REGISTERED));
+  readonly taskResult$ = this.event$.pipe(filter((event) => event.EventType === SliverClient.EVENT_BEACON_TASKRESULT));
 
-  private _tunnelStream: grpc.ClientDuplexStream<sliverpb.TunnelData, sliverpb.TunnelData> | null = null;
-
-  constructor(config: SliverClientConfig) {
-    this._config = config;
-  }
+  constructor(readonly config: SliverClientConfig) {}
 
   rpcHost(): string {
-    return `${this._config.lhost}:${this._config.lport}`;
+    return `${this.config.lhost}:${this.config.lport}`;
   }
 
-  rpcCredentials(): grpc.ChannelCredentials {
-    const ca = Buffer.from(this._config.ca_certificate);
-    const privateKey = Buffer.from(this._config.private_key);
-    const certificate = Buffer.from(this._config.certificate);
-
-    return grpc.credentials.combineChannelCredentials(
-      grpc.credentials.createSsl(ca, privateKey, certificate, {
-        checkServerIdentity: () => undefined,
-      }),
-      grpc.credentials.createFromMetadataGenerator((args, cb) => {
-        const meta = new grpc.Metadata();
-        meta.set('Authorization', `Bearer ${this._config.token}`);
-        cb(null, meta);
-      }),
-    );
-  }
-
-  get config(): SliverClientConfig {
-    return this._config;
-  }
-
-  get rpc(): rpcpb.SliverRPCClient {
-    if (this._rpc === null) {
-      throw new Error('SliverRPCClient not connected');
+  get rpc(): SliverRPCClient {
+    if (!this.rpcClient) {
+      throw new Error("SliverClient is not connected");
     }
-    return this._rpc;
-  }
-
-  get tunnelStream(): grpc.ClientDuplexStream<sliverpb.TunnelData, sliverpb.TunnelData> {
-    if (this._tunnelStream === null) {
-      throw new Error('SliverRPCClient not connected');
-    }
-    return this._tunnelStream;
+    return this.rpcClient;
   }
 
   get isConnected(): boolean {
-    return this._rpc !== null;
+    return this.rpcClient !== null;
   }
 
-  connect(): Promise<SliverClient> {
-    return new Promise((resolve, reject) => {
+  async connect(): Promise<this> {
+    if (this.rpcClient) return this;
 
-      const rpc = new rpcpb.SliverRPCClient(this.rpcHost(), this.rpcCredentials(), {
-        'grpc.max_send_message_length': 2 * Gb,
-        'grpc.max_receive_message_length': 2 * Gb,
-      });
-      rpc.GetVersion(this.empty, (err) => {
-        if (err) {
-          return reject(err);
-        }
+    this.eventsAbort = new AbortController();
+    this.tunnels = new TunnelManager();
 
-        // RPC Client
-        this._rpc = rpc;
-
-        // Events streams
-        this._events = this.rpc.Events(this.empty);
-        this._events?.on('data', event => { this.event$.next(event) });
-        this._events?.on('error', err => { this.event$.error(err) });
-        this._events?.on('end', () => { this.event$.complete() });
-
-        // Tunnel streams
-        this._tunnelStream = rpc.TunnelData();
-        if (this._tunnelStream === undefined) {
-          return reject('Failed to open tunnel data stream');
-        }
-        resolve(this);
-      });
+    const creds = createSliverRpcCredentials(this.config);
+    this.channel = createChannel(this.rpcHost(), creds, {
+      "grpc.max_send_message_length": (2 * GiB) -1,
+      "grpc.max_receive_message_length": (2 * GiB) -1,
     });
+
+    this.rpcClient = createClient(SliverRPCDefinition, this.channel);
+
+    // Ensure auth and connectivity are working before we start streams.
+    await this.getVersion();
+
+    this.tunnels.start(this.rpcClient);
+    this.startEventsStream();
+    return this;
   }
 
   async disconnect(): Promise<void> {
-    if (this._events !== null) {
-      this._events.on('error', () => { });
-      this._events.cancel();
+    this.eventsAbort?.abort();
+    this.eventsAbort = null;
+
+    await this.tunnels?.stop();
+    this.tunnels = null;
+
+    this.rpcClient = null;
+    this.channel?.close();
+    this.channel = null;
+  }
+
+  private startEventsStream(): void {
+    const rpc = this.rpcClient;
+    const abort = this.eventsAbort;
+    if (!rpc || !abort) return;
+
+    (async () => {
+      try {
+        const stream = rpc.events(this.empty, { signal: abort.signal });
+        for await (const event of stream) {
+          this.eventSubject.next(event);
+        }
+      } catch (err) {
+        // Abort is expected on disconnect; don't surface as an error.
+        if (abort.signal.aborted) {
+          return;
+        }
+        this.eventSubject.error(err);
+      }
+    })();
+  }
+
+  // --- Convenience APIs (typed, promise-based) ---
+
+  getVersion(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Version> {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.getVersion(this.empty, { signal }));
+  }
+
+  getOperators(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Operators> {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.getOperators(this.empty, { signal }));
+  }
+
+  getSessions(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Sessions> {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.getSessions(this.empty, { signal }));
+  }
+
+  getBeacons(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Beacons> {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.getBeacons(this.empty, { signal }));
+  }
+
+  getJobs(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Jobs> {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.getJobs(this.empty, { signal }));
+  }
+
+  killJob(jobId: number, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.killJob({ ID: jobId }, { signal }));
+  }
+
+  restartJobs(jobIds: number[], timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      await this.rpc.restartJobs({ JobIDs: jobIds }, { signal });
+    });
+  }
+
+  startMTLSListener(host: string, port: number, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.startMTLSListener({ Host: host, Port: port }, { signal }));
+  }
+
+  startWGListener(
+    host: string,
+    port: number,
+    tunIP: string,
+    nPort: number,
+    keyPort: number,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.startWGListener({ Host: host, Port: port, TunIP: tunIP, NPort: nPort, KeyPort: keyPort }, { signal }),
+    );
+  }
+
+  startDNSListener(
+    domains: string[],
+    canaries: boolean,
+    host: string,
+    port: number,
+    enforceOTP = false,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.startDNSListener(
+        { Domains: domains, Canaries: canaries, Host: host, Port: port, EnforceOTP: enforceOTP },
+        { signal },
+      ),
+    );
+  }
+
+  startHTTPListener(
+    domain: string,
+    host: string,
+    port: number,
+    website = "",
+    enforceOTP = false,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.startHTTPListener(
+        { Domain: domain, Host: host, Port: port, Secure: false, Website: website, EnforceOTP: enforceOTP },
+        { signal },
+      ),
+    );
+  }
+
+  startHTTPSListener(
+    domain: string,
+    host: string,
+    port: number,
+    website = "",
+    acme = false,
+    cert?: Buffer,
+    key?: Buffer,
+    enforceOTP = false,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.startHTTPSListener(
+        {
+          Domain: domain,
+          Host: host,
+          Port: port,
+          Secure: true,
+          Website: website,
+          ACME: acme,
+          Cert: cert ?? Buffer.alloc(0),
+          Key: key ?? Buffer.alloc(0),
+          EnforceOTP: enforceOTP,
+        },
+        { signal },
+      ),
+    );
+  }
+
+  startTCPStagerListener(host: string, port: number, data: Buffer, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.startTCPStagerListener({ Protocol: 0, Host: host, Port: port, Data: data }, { signal }),
+    );
+  }
+
+  async generate(config: ImplantConfig, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    const res = await withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.generate({ Config: config }, { signal }));
+    return res.File;
+  }
+
+  generateSpoofMetadata(req: GenerateSpoofMetadataReq, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      await this.rpc.generateSpoofMetadata(req, { signal });
+    });
+  }
+
+  async regenerate(implantName: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    const res = await withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.regenerate({ ImplantName: implantName }, { signal }),
+    );
+    return res.File;
+  }
+
+  implantBuilds(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.implantBuilds(this.empty, { signal }));
+  }
+
+  deleteImplantBuild(name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      await this.rpc.deleteImplantBuild({ Name: name }, { signal });
+    });
+  }
+
+  canaries(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.canaries(this.empty, { signal }));
+  }
+
+  implantProfiles(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.implantProfiles(this.empty, { signal }));
+  }
+
+  saveImplantProfile(profile: ImplantProfile, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.saveImplantProfile(profile, { signal }));
+  }
+
+  deleteImplantProfile(name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      await this.rpc.deleteImplantProfile({ Name: name }, { signal });
+    });
+  }
+
+  lootAll(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      const res = await this.rpc.lootAll(this.empty, { signal });
+      return res.Loot;
+    });
+  }
+
+  lootAdd(loot: Loot, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.lootAdd(loot, { signal }));
+  }
+
+  lootUpdate(loot: Loot, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.lootUpdate(loot, { signal }));
+  }
+
+  lootRemove(lootId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      await this.rpc.lootRm({ ID: lootId }, { signal });
+    });
+  }
+
+  lootContent(lootId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.lootContent({ ID: lootId }, { signal }));
+  }
+
+  websites(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      const res = await this.rpc.websites(this.empty, { signal });
+      return res.Websites;
+    });
+  }
+
+  website(name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.website({ Name: name }, { signal }));
+  }
+
+  websiteRemove(name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      await this.rpc.websiteRemove({ Name: name }, { signal });
+    });
+  }
+
+  websiteAddContent(name: string, contents: Record<string, WebContent>, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.websiteAddContent({ Name: name, Contents: contents }, { signal }),
+    );
+  }
+
+  websiteUpdateContent(name: string, contents: Record<string, WebContent>, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.websiteUpdateContent({ Name: name, Contents: contents }, { signal }),
+    );
+  }
+
+  websiteRemoveContent(name: string, paths: string[], timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.websiteRemoveContent({ Name: name, Paths: paths }, { signal }),
+    );
+  }
+
+  // --- High-level helpers (ergonomic wrappers) ---
+
+  async operators(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    const res = await this.getOperators(timeoutSeconds);
+    return res.Operators;
+  }
+
+  async sessions(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    const res = await this.getSessions(timeoutSeconds);
+    return res.Sessions;
+  }
+
+  async beacons(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    const res = await this.getBeacons(timeoutSeconds);
+    return res.Beacons;
+  }
+
+  async jobs(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    const res = await this.getJobs(timeoutSeconds);
+    return res.Active;
+  }
+
+  interactSession(sessionId: string): InteractiveSession {
+    if (!this.tunnels) {
+      throw new Error("SliverClient is not connected");
     }
-    if (this._tunnelStream !== null) {
-      this._tunnelStream.on('error', () => { });
-      this._tunnelStream.cancel();
-    }
-    this.rpc.close();
-    this._rpc = null;
+    return new InteractiveSession(this.rpc, this.tunnels, sessionId);
   }
 
-  private deadline(timeout: number) {
-    return {
-      'deadline': Date.now() + (timeout * 1000)
-    }
+  interactBeacon(beaconId: string): InteractiveBeacon {
+    return new InteractiveBeacon(this.rpc, this.taskResult$, beaconId);
   }
 
-  // ---- Version ----
-
-  getVersion(timeout = TIMEOUT): Promise<clientpb.Version | undefined> {
-    return new Promise((resolve, reject) => {
-      this.rpc.GetVersion(this.empty, this.deadline(timeout), (err, version) => {
-        err ? reject(err) : resolve(version);
-      });
-    })
+  async rmBeacon(beaconId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+    await withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.rmBeacon({ ID: beaconId } as Beacon, { signal }));
   }
+}
 
-  // ---- Operators ----
+async function waitForBeaconTask(taskResult$: Observable<Event>, taskId: string, timeoutSeconds: number) {
+  return new Promise<BeaconTask>((resolve, reject) => {
+    const timeoutMs = Math.floor(timeoutSeconds * 1000);
+    const timer = setTimeout(() => {
+      sub.unsubscribe();
+      reject(new Error(`Timeout waiting for beacon task result: ${taskId}`));
+    }, timeoutMs);
 
-  getOperators(timeout = TIMEOUT): Promise<clientpb.Operator[] | undefined> {
-    return new Promise((resolve, reject) => {
-      this.rpc.GetOperators(this.empty, this.deadline(timeout), (err, operators) => {
-        err ? reject(err) : resolve(operators?.Operators);
-      });
+    const sub = taskResult$.subscribe({
+      next: (event) => {
+        try {
+          const task = BeaconTask.decode(event.Data);
+          if (task.ID !== taskId) return;
+          clearTimeout(timer);
+          sub.unsubscribe();
+          resolve(task);
+        } catch (err) {
+          clearTimeout(timer);
+          sub.unsubscribe();
+          reject(err);
+        }
+      },
+      error: (err) => {
+        clearTimeout(timer);
+        sub.unsubscribe();
+        reject(err);
+      },
     });
-  }
-
-  // ---- Sessions ----
-
-  sessions(timeout = TIMEOUT): Promise<clientpb.Session[] | undefined> {
-    return new Promise((resolve, reject) => {
-      this.rpc.GetSessions(this.empty, this.deadline(timeout), (err, sessions) => {
-        err ? reject(err) : resolve(sessions?.Sessions);
-      });
-    });
-  }
-
-  async interactSession(sessionID: string, timeout = TIMEOUT): Promise<InteractiveSession> {
-    return new InteractiveSession(this.rpc, this.tunnelStream, sessionID);
-  }
-
-  beacons(timeout = TIMEOUT): Promise<clientpb.Beacon[] | undefined> {
-    return new Promise((resolve, reject) => {
-      this.rpc.GetBeacons(this.empty, this.deadline(timeout), (err, beacons) => {
-        err ? reject(err) : resolve(beacons?.Beacons);
-      });
-    });
-  }
-
-  async interactBeacon(beaconID: string, timeout = TIMEOUT): Promise<InteractiveBeacon> {
-    return new InteractiveBeacon(this.rpc, this.taskresult$, beaconID);
-  }
-
-  // ---- Jobs ----
-
-  jobs(timeout = TIMEOUT): Promise<clientpb.Job[] | undefined> {
-    return new Promise((resolve, reject) => {
-      this.rpc.GetJobs(this.empty, this.deadline(timeout), (err, jobs) => {
-        err ? reject(err) : resolve(jobs?.Active);
-      });
-    });
-  }
-
-  killJob(jobId: number, timeout = TIMEOUT): Promise<clientpb.KillJob | undefined> {
-    return new Promise((resolve, reject) => {
-      const killJob = new clientpb.KillJobReq();
-      killJob.ID = jobId;
-      this.rpc.KillJob(killJob, this.deadline(timeout), (err, killed) => {
-        err ? reject(err) : resolve(killed);
-      });
-    });
-  }
-
-  // ---- Listeners ----
-
-  startMTLSListener(host: string, port: number, persistent = false, timeout = TIMEOUT): Promise<clientpb.MTLSListener | undefined> {
-    return new Promise((resolve, reject) => {
-      const mtls = new clientpb.MTLSListenerReq();
-      mtls.Host = host;
-      mtls.Port = port;
-      mtls.Persistent = persistent;
-      this.rpc.StartMTLSListener(mtls, this.deadline(timeout), (err, listener) => {
-        err ? reject(err) : resolve(listener);
-      });
-    });
-  }
-
-  startDNSListener(domains: string[], canaries: boolean, host: string, port: number, persistent = false, timeout = TIMEOUT): Promise<clientpb.DNSListener | undefined> {
-    return new Promise((resolve, reject) => {
-      const dns = new clientpb.DNSListenerReq();
-      dns.Domains = domains;
-      dns.Canaries = canaries;
-      dns.Host = host;
-      dns.Port = port;
-      dns.Persistent = persistent;
-      this.rpc.StartDNSListener(dns, this.deadline(timeout), (err, listener) => {
-        err ? reject(err) : resolve(listener);
-      });
-    });
-  }
-
-  startHTTPListener(domain: string, host: string, port: number, website = '', persistent = false, timeout = TIMEOUT): Promise<clientpb.HTTPListener | undefined> {
-    return new Promise((resolve, reject) => {
-      const http = new clientpb.HTTPListenerReq();
-      http.Domain = domain;
-      http.Host = host;
-      http.Port = port;
-      http.Secure = false;
-      http.Website = website;
-      http.Persistent = persistent;
-      this.rpc.StartHTTPListener(http, this.deadline(timeout), (err, listener) => {
-        err ? reject(err) : resolve(listener);
-      });
-    });
-  }
-
-  startHTTPSListener(domain: string, host: string, port: number, acme = false, website = '',
-    cert?: Buffer, key?: Buffer, persistent = false, timeout = TIMEOUT): Promise<clientpb.HTTPListener | undefined> {
-    return new Promise((resolve, reject) => {
-      const https = new clientpb.HTTPListenerReq();
-      https.Domain = domain;
-      https.Host = host;
-      https.Port = port;
-      https.Secure = true;
-      cert ? https.Cert = cert : null;
-      key ? https.Key = key : null;
-      https.ACME = acme;
-      https.Website = website;
-      https.Persistent = persistent;
-      this.rpc.StartHTTPSListener(https, this.deadline(timeout), (err, listener) => {
-        err ? reject(err) : resolve(listener);
-      });
-    });
-  }
-
-  startWGListener(port: number, nPort: number, keyPort: number, persistent = false, timeout = TIMEOUT): Promise<clientpb.WGListener | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new clientpb.WGListenerReq();
-      req.Port = port;
-      req.NPort = nPort;
-      req.KeyPort = keyPort;
-      req.Persistent = persistent;
-      this.rpc.StartWGListener(req, this.deadline(timeout), (err, wgListener) => {
-        err ? reject(err) : resolve(wgListener);
-      });
-    });
-  }
-
-  startTCPStagerListener(host: string, port: number, data: Buffer, timeout = TIMEOUT): Promise<clientpb.StagerListener | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new clientpb.StagerListenerReq();
-      req.Protocol = clientpb.StageProtocol.TCP;
-      req.Host = host;
-      req.Port = port;
-      req.Data = data;
-      this.rpc.StartTCPStagerListener(req, (err, tcpListener) => {
-        err ? reject(err) : resolve(tcpListener);
-      });
-    });
-  }
-
-  startHTTPStagerListener(host: string, port: number, data: Buffer, timeout = TIMEOUT): Promise<clientpb.StagerListener | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new clientpb.StagerListenerReq();
-      req.Protocol = clientpb.StageProtocol.HTTP;
-      req.Host = host;
-      req.Port = port;
-      req.Data = data;
-      this.rpc.StartHTTPStagerListener(req, this.deadline(timeout), (err, httpListener) => {
-        err ? reject(err) : resolve(httpListener);
-      });
-    });
-  }
-
-  startHTTPSStagerListener(host: string, port: number, data: Buffer, timeout = TIMEOUT): Promise<clientpb.StagerListener | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new clientpb.StagerListenerReq();
-      req.Protocol = clientpb.StageProtocol.HTTPS;
-      req.Host = host;
-      req.Port = port;
-      req.Data = data;
-      this.rpc.StartHTTPStagerListener(req, this.deadline(timeout), (err, httpsListener) => {
-        err ? reject(err) : resolve(httpsListener);
-      });
-    });
-  }
-
-  // ---- Implants ----
-
-  generate(config: clientpb.ImplantConfig, timeout = TIMEOUT): Promise<commonpb.File | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new clientpb.GenerateReq();
-      req.Config = config;
-      this.rpc.Generate(req, this.deadline(timeout), (err, generated) => {
-        err ? reject(err) : resolve(generated?.File);
-      });
-    });
-  }
-
-  compilerInfo(timeout = TIMEOUT): Promise<clientpb.Compiler | undefined> {
-    return new Promise((resolve, reject) => {
-      this.rpc.GetCompiler(new commonpb.Empty(), this.deadline(timeout), (err, info) => {
-        err ? reject(err) : resolve(info);
-      });
-    });
-  }
-
-  regenerate(name: string, timeout = TIMEOUT): Promise<commonpb.File | undefined> {
-    return new Promise((resolve, reject) => {
-      const req = new clientpb.RegenerateReq();
-      req.ImplantName = name;
-      this.rpc.Regenerate(req, this.deadline(timeout), (err, generated) => {
-        err ? reject(err) : resolve(generated?.File);
-      });
-    });
-  }
-
-  implantBuilds(timeout = TIMEOUT): Promise<clientpb.ImplantBuilds | undefined> {
-    return new Promise((resolve, reject) => {
-      this.rpc.ImplantBuilds(this.empty, this.deadline(timeout), (err, builds) => {
-        err ? reject(err) : resolve(builds);
-      });
-    });
-  }
-
-  deleteImplantBuild(name: string, timeout = TIMEOUT): Promise<void> {
-    const delReq = new clientpb.DeleteReq();
-    delReq.Name = name;
-    return new Promise((resolve, reject) => {
-      this.rpc.DeleteImplantBuild(delReq, this.deadline(timeout), (err) => {
-        err ? reject(err) : resolve();
-      });
-    });
-  }
-
-  canaries(timeout = TIMEOUT): Promise<clientpb.DNSCanary[] | undefined> {
-    return new Promise((resolve, reject) => {
-      this.rpc.Canaries(this.empty, this.deadline(timeout), (err, canaries) => {
-        err ? reject(err) : resolve(canaries?.Canaries);
-      });
-    });
-  }
-
-  implantProfiles(timeout = TIMEOUT): Promise<clientpb.ImplantProfile[] | undefined> {
-    return new Promise((resolve, reject) => {
-      this.rpc.ImplantProfiles(this.empty, this.deadline(timeout), (err, profiles) => {
-        err ? reject(err) : resolve(profiles?.Profiles);
-      });
-    });
-  }
-
-  saveImplantProfile(profile: clientpb.ImplantProfile, timeout = TIMEOUT): Promise<clientpb.ImplantProfile | undefined> {
-    return new Promise((resolve, reject) => {
-      this.rpc.SaveImplantProfile(profile, this.deadline(timeout), (err, profile) => {
-        err ? reject(err) : resolve(profile);
-      });
-    });
-  }
-
-  deleteImplantProfile(name: string, timeout = TIMEOUT): Promise<void> {
-    const delReq = new clientpb.DeleteReq();
-    delReq.Name = name;
-    return new Promise((resolve, reject) => {
-      this.rpc.DeleteImplantProfile(delReq, this.deadline(timeout), (err) => {
-        err ? reject(err) : resolve();
-      });
-    });
-  }
-
-  // ---- Loot ----
-  lootAll(timeout = TIMEOUT): Promise<clientpb.Loot[] | undefined> {
-    return new Promise((resolve, reject) => {
-      this.rpc.LootAll(this.empty, this.deadline(timeout), (err, loot) => {
-        err ? reject(err) : resolve(loot?.Loot);
-      });
-    });
-  }
-
-  lootAllOf(lootType: string, timeout = TIMEOUT): Promise<clientpb.Loot[] | undefined> {
-
-    // There doesn't seem to be a good way to strongly type this parameter
-    const loot = new clientpb.Loot();
-    switch (lootType.toLowerCase()) {
-      case 'c':
-      case 'cred':
-      case 'creds':
-      case 'credential':
-      case 'credentials':
-        loot.Type = clientpb.LootType.LOOT_CREDENTIAL;
-        break;
-
-      case 'f':
-      case 'file':
-      case 'files':
-        loot.Type = clientpb.LootType.LOOT_FILE;
-        break;
-
-      default:
-        throw new Error(`Unknown loot type: ${lootType}`);
-    }
-
-    return new Promise((resolve, reject) => {
-      this.rpc.LootAllOf(loot, this.deadline(timeout), (err, allLoot) => {
-        err ? reject(err) : resolve(allLoot?.Loot);
-      });
-    });
-  }
-
-  lootAdd(loot: clientpb.Loot, timeout = TIMEOUT): Promise<clientpb.Loot | undefined> {
-    return new Promise((resolve, reject) => {
-      this.rpc.LootAdd(loot, this.deadline(timeout), (err, loot) => {
-        err ? reject(err) : resolve(loot);
-      });
-    });
-  }
-
-  lootUpdate(lootID: string, name: string, timeout = TIMEOUT): Promise<clientpb.Loot | undefined> {
-    const loot = new clientpb.Loot();
-    loot.LootID = lootID;
-    loot.Name = name;
-    return new Promise((resolve, reject) => {
-      this.rpc.LootUpdate(loot, this.deadline(timeout), (err, loot) => {
-        err ? reject(err) : resolve(loot);
-      });
-    });
-  }
-
-  lootRemove(lootID: string, timeout = TIMEOUT): Promise<void> {
-    const loot = new clientpb.Loot();
-    loot.LootID = lootID;
-    return new Promise((resolve, reject) => {
-      this.rpc.LootRm(loot, this.deadline(timeout), (err) => {
-        err ? reject(err) : resolve();
-      });
-    });
-  }
-
-  lootContent(lootID: string, timeout = TIMEOUT): Promise<clientpb.Loot | undefined> {
-    const loot = new clientpb.Loot();
-    loot.LootID = lootID;
-    return new Promise((resolve, reject) => {
-      this.rpc.LootContent(loot, this.deadline(timeout), (err, loot) => {
-        err ? reject(err) : resolve(loot);
-      });
-    });
-  }
-
-  // ---- Websites ----
-
-  websites(timeout = TIMEOUT): Promise<clientpb.Website[] | undefined> {
-    return new Promise((resolve, reject) => {
-      this.rpc.Websites(this.empty, this.deadline(timeout), (err, websites) => {
-        err ? reject(err) : resolve(websites?.Websites);
-      });
-    });
-  }
-
-  website(name: string, timeout = TIMEOUT): Promise<clientpb.Website | undefined> {
-    return new Promise((resolve, reject) => {
-      const web = new clientpb.Website();
-      web.Name = name;
-      this.rpc.Website(web, this.deadline(timeout), (err, website) => {
-        err ? reject(err) : resolve(website);
-      });
-    });
-  }
-
-  websiteRemove(name: string, timeout = TIMEOUT): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const web = new clientpb.Website();
-      web.Name = name;
-      this.rpc.WebsiteRemove(web, this.deadline(timeout), (err) => {
-        err ? reject(err) : resolve();
-      });
-    });
-  }
-
-  websiteAddContent(name: string, contents: Map<string, clientpb.WebContent>, timeout = TIMEOUT): Promise<clientpb.Website | undefined> {
-    return new Promise((resolve, reject) => {
-      const addContent = new clientpb.WebsiteAddContent();
-      addContent.Name = name;
-      addContent.Contents = contents;
-      this.rpc.WebsiteAddContent(addContent, this.deadline(timeout), (err, website) => {
-        err ? reject(err) : resolve(website);
-      });
-    });
-  }
-
-  websiteUpdateContent(name: string, contents: Map<string, clientpb.WebContent>, timeout = TIMEOUT): Promise<clientpb.Website | undefined> {
-    return new Promise((resolve, reject) => {
-      const addContent = new clientpb.WebsiteAddContent();
-      addContent.Name = name;
-      addContent.Contents = contents;
-      this.rpc.WebsiteUpdateContent(addContent, this.deadline(timeout), (err, website) => {
-        err ? reject(err) : resolve(website);
-      });
-    });
-  }
-
-  websiteRemoveContent(name: string, paths: string[], timeout = TIMEOUT): Promise<clientpb.Website | undefined> {
-    return new Promise((resolve, reject) => {
-      const rm = new clientpb.WebsiteRemoveContent();
-      rm.Name = name;
-      rm.Paths = paths;
-      this.rpc.WebsiteRemoveContent(rm, this.deadline(timeout), (err, website) => {
-        err ? reject(err) : resolve(website);
-      });
-    });
-  }
-
+  });
 }

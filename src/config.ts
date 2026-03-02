@@ -1,5 +1,6 @@
-import * as fs from 'fs';
-import * as path from 'path';
+import { readdir, readFile } from "node:fs/promises";
+import * as fs from "node:fs";
+import * as path from "node:path";
 
 export interface SliverClientConfig {
   operator: string;
@@ -11,48 +12,64 @@ export interface SliverClientConfig {
   token: string;
 }
 
-export function ParseConfigFile(filePath: string): Promise<SliverClientConfig> {
-  return new Promise((resolve, reject) => {
-    fs.exists(filePath, (exists) => {
-      if (exists) {
-        fs.readFile(filePath, (err, data) => {
-          if (!err) {
-            try {
-              const config = ParseConfig(data);
-              resolve(config);
-            } catch(err) {
-              reject(err);
-            }
-          } else {
-            reject(err);
-          }
-        });
-      } else {
-        reject('File does not exist');
-      }
-    });
-  });
+export async function parseConfigFile(filePath: string): Promise<SliverClientConfig> {
+  if (!fs.existsSync(filePath)) {
+    throw new Error(`Config file does not exist: ${filePath}`);
+  }
+  const data = await readFile(filePath);
+  return parseConfig(data);
 }
 
-export function ParseConfig(data: Buffer): SliverClientConfig {
-  return <SliverClientConfig>JSON.parse(data.toString('utf8'));
+export function parseConfig(data: Buffer): SliverClientConfig {
+  const raw = JSON.parse(data.toString("utf8")) as Partial<SliverClientConfig>;
+  validateConfig(raw);
+  return raw as SliverClientConfig;
 }
 
-export async function ListConfigs(configDir: string): Promise<SliverClientConfig[]> {
-  return new Promise((resolve) => {
-    fs.readdir(configDir, (_, items) => {
-      if (!fs.existsSync(configDir) || items === undefined) {
-        return resolve([]);
+export async function listConfigs(configDir: string): Promise<SliverClientConfig[]> {
+  try {
+    const items = await readdir(configDir);
+    const configs: SliverClientConfig[] = [];
+
+    for (const item of items) {
+      const filePath = path.join(configDir, item);
+      if (!fs.existsSync(filePath) || fs.lstatSync(filePath).isDirectory()) {
+        continue;
       }
-      const configs: SliverClientConfig[] = [];
-      for (let index = 0; index < items.length; ++index) {
-        const filePath = path.join(configDir, items[index]);
-        if (fs.existsSync(filePath) && !fs.lstatSync(filePath).isDirectory()) {
-          const fileData = fs.readFileSync(filePath);
-          configs.push(JSON.parse(fileData.toString('utf8')));
-        }
+      try {
+        configs.push(await parseConfigFile(filePath));
+      } catch {
+        // Best-effort: ignore invalid config files in the directory.
       }
-      resolve(configs);
-    });
-  });
+    }
+
+    return configs;
+  } catch {
+    return [];
+  }
 }
+
+function validateConfig(config: Partial<SliverClientConfig>): asserts config is SliverClientConfig {
+  const mustBeString = [
+    "operator",
+    "lhost",
+    "ca_certificate",
+    "certificate",
+    "private_key",
+    "token",
+  ] as const;
+
+  for (const key of mustBeString) {
+    if (typeof config[key] !== "string") {
+      throw new Error(`Invalid sliver config: missing/invalid ${key}`);
+    }
+  }
+  if (typeof config.lport !== "number" || !Number.isFinite(config.lport)) {
+    throw new Error("Invalid sliver config: missing/invalid lport");
+  }
+}
+
+// Back-compat exports (v1.x API)
+export const ParseConfigFile = parseConfigFile;
+export const ParseConfig = parseConfig;
+export const ListConfigs = listConfigs;

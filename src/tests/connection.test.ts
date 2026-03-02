@@ -1,23 +1,22 @@
-import * as os from 'os'
-import * as path from 'path'
+import * as fs from "node:fs";
+import * as path from "node:path";
 
-import { ParseConfigFile } from '../config'
-import { SliverClient } from '../client'
+import { ParseConfigFile } from "../config";
+import { SliverClient } from "../client";
 
 
-const DEFAULT_CONFIG_PATH = path.join(os.homedir(), '.sliver-client', 'configs', 'default.cfg')
-const SLIVER_CONFIG_FILE = process.env['SLIVER_CONFIG_FILE'] || DEFAULT_CONFIG_PATH;
+const SLIVER_E2E = process.env["SLIVER_E2E"] === "1";
+const DEFAULT_CONFIG_PATH = path.resolve(__dirname, "../../localhost.cfg");
+const SLIVER_CONFIG_FILE = process.env["SLIVER_CONFIG_FILE"] || DEFAULT_CONFIG_PATH;
 
-test('authenticate to server', async () => {
-    console.log(`Loading config: ${SLIVER_CONFIG_FILE}`)
-    const config = await ParseConfigFile(SLIVER_CONFIG_FILE)
-    const client = new SliverClient(config)
+const testE2E = SLIVER_E2E && fs.existsSync(SLIVER_CONFIG_FILE) ? test : test.skip;
 
-    console.log(`Connecting to ${config.lhost} ...`)
-    try {
-        await client.connect()
-        await client.disconnect()
-    } catch (err) {
-        console.error(err)
-    }
-})
+jest.setTimeout(120 * 1000);
+testE2E("authenticate to server", async () => {
+  const config = await ParseConfigFile(SLIVER_CONFIG_FILE);
+  const client = new SliverClient(config);
+
+  await client.connect();
+  await expect(client.getVersion()).resolves.toBeDefined();
+  await client.disconnect();
+});
