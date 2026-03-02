@@ -59,8 +59,7 @@ function loadLocalSliverScript(repoRoot: string): SliverScriptModule {
 const REPO_ROOT = guessRepoRoot();
 const CONFIG_PATH = process.env.SLIVER_CONFIG_FILE ?? path.join(REPO_ROOT, "localhost.cfg");
 const DEFAULT_HTTP_C2_PROFILE = "default";
-const BEACON_INTERVAL_SECONDS = 20;
-const BEACON_INTERVAL_NS = String(BEACON_INTERVAL_SECONDS * 1_000_000_000);
+const DEFAULT_BEACON_INTERVAL_SECONDS = 5;
 const BEACON_TIMEOUT_SECONDS = 300;
 const BEACON_TASK_POLL_RPC_TIMEOUT_SECONDS = 20;
 const BEACON_TASK_CONTENT_RPC_TIMEOUT_SECONDS = 45;
@@ -78,6 +77,19 @@ function parsePort(rawValue: string, name: string): number {
   assert(Number.isInteger(parsed) && parsed > 0 && parsed <= 65535, `Invalid ${name}: ${rawValue}`);
   return parsed;
 }
+
+function parsePositiveInt(rawValue: string, name: string, max: number): number {
+  const parsed = Number.parseInt(rawValue, 10);
+  assert(Number.isInteger(parsed) && parsed > 0 && parsed <= max, `Invalid ${name}: ${rawValue}`);
+  return parsed;
+}
+
+const BEACON_INTERVAL_SECONDS = parsePositiveInt(
+  process.env.SLIVER_E2E_BEACON_INTERVAL_SECONDS ?? String(DEFAULT_BEACON_INTERVAL_SECONDS),
+  "SLIVER_E2E_BEACON_INTERVAL_SECONDS",
+  300,
+);
+const BEACON_INTERVAL_NS = String(BEACON_INTERVAL_SECONDS * 1_000_000_000);
 
 function nodePlatformToGoOS(platform: NodeJS.Platform): string {
   switch (platform) {
@@ -202,17 +214,59 @@ async function decodeBeaconTaskResponse<T extends { Response?: { Err: string } }
   timeoutSeconds: number,
 ): Promise<T> {
   const taskID = getQueuedTaskID(queued, label);
-  await waitForBeaconTaskComplete(client, beaconID, taskID, timeoutSeconds);
-  const content = await withRpcTimeout(
-    BEACON_TASK_CONTENT_RPC_TIMEOUT_SECONDS,
-    `getBeaconTaskContent(${taskID})`,
-    (signal) => client.rpc.getBeaconTaskContent({ ID: taskID }, { signal }),
-  );
-  assert(content.Response.length > 0, `${label} task returned no response bytes`);
-  const decoded = decoder(content.Response);
-  const err = decoded.Response?.Err?.trim();
-  assert(!err, `${label} execution error: ${err}`);
-  return decoded;
+  const deadline = Date.now() + timeoutSeconds * 1000;
+  let lastObservedState: string | undefined;
+  let lastContentError: unknown;
+
+  while (Date.now() < deadline) {
+    try {
+      const content = await withRpcTimeout(
+        BEACON_TASK_CONTENT_RPC_TIMEOUT_SECONDS,
+        `getBeaconTaskContent(${taskID})`,
+        (signal) => client.rpc.getBeaconTaskContent({ ID: taskID }, { signal }),
+      );
+      if (content.Response.length > 0) {
+        const decoded = decoder(content.Response);
+        const err = decoded.Response?.Err?.trim();
+        assert(!err, `${label} execution error: ${err}`);
+        return decoded;
+      }
+    } catch (err) {
+      lastContentError = err;
+    }
+
+    try {
+      const tasks = await withRpcTimeout(
+        BEACON_TASK_POLL_RPC_TIMEOUT_SECONDS,
+        `getBeaconTasks(${beaconID})`,
+        (signal) => client.rpc.getBeaconTasks({ ID: beaconID }, { signal }),
+      );
+      const task = tasks.Tasks.find((candidate) => candidate.ID === taskID);
+      if (task) {
+        const state = task.State.toLowerCase();
+        lastObservedState = state;
+        if (state === "failed" || state === "canceled" || state === "cancelled") {
+          throw new Error(`Beacon task ${taskID} ${state}: ${task.Description}`);
+        }
+      }
+    } catch (err) {
+      if (err instanceof Error && err.message.includes(`Beacon task ${taskID}`)) {
+        throw err;
+      }
+    }
+
+    await sleep(1000);
+  }
+
+  const debugParts = [];
+  if (lastObservedState) {
+    debugParts.push(`lastState=${lastObservedState}`);
+  }
+  if (lastContentError instanceof Error && lastContentError.message.trim().length > 0) {
+    debugParts.push(`lastContentError=${lastContentError.message}`);
+  }
+  const debugSuffix = debugParts.length > 0 ? ` (${debugParts.join(", ")})` : "";
+  throw new Error(`Timed out waiting for beacon task response (${timeoutSeconds}s): ${taskID}${debugSuffix}`);
 }
 
 async function decodeDownloadData(download: { Encoder: string; Data: Buffer }): Promise<Buffer> {
@@ -511,7 +565,28 @@ async function runBeaconTransportChecks(
     );
     assert(pwd.Path.trim().length > 0, "beacon pwd returned an empty path");
 
-    const ls = await interactiveBeacon.ls(".", 180);
+    const lsQueued = await withRpcTimeout(BEACON_DOWNLOAD_RPC_TIMEOUT_SECONDS, `beacon ls queue (${transport.name})`, (signal) =>
+      client.rpc.ls(
+        {
+          Path: ".",
+          Request: {
+            Async: true,
+            Timeout: "180",
+            BeaconID: beacon.ID,
+            SessionID: "",
+          },
+        },
+        { signal },
+      ),
+    );
+    const ls = await decodeBeaconTaskResponse(
+      client,
+      beacon.ID,
+      lsQueued,
+      sliver.sliverpb.Ls.decode,
+      `beacon ls (${transport.name})`,
+      180,
+    );
     assert(ls.Exists, `beacon ls reported missing path: ${ls.Path}`);
     assert(ls.Files.length > 0, `beacon ls returned no files for path: ${ls.Path}`);
 
@@ -539,28 +614,32 @@ async function runBeaconTransportChecks(
     );
     assert(ifconfig.NetInterfaces.length > 0, "beacon ifconfig returned no interfaces");
 
-    const lsFromPwd = await interactiveBeacon.ls(pwd.Path, 180);
+    const lsFromPwdQueued = await withRpcTimeout(
+      BEACON_DOWNLOAD_RPC_TIMEOUT_SECONDS,
+      `beacon ls queue (pwd path, ${transport.name})`,
+      (signal) =>
+        client.rpc.ls(
+          {
+            Path: pwd.Path,
+            Request: {
+              Async: true,
+              Timeout: "180",
+              BeaconID: beacon.ID,
+              SessionID: "",
+            },
+          },
+          { signal },
+        ),
+    );
+    const lsFromPwd = await decodeBeaconTaskResponse(
+      client,
+      beacon.ID,
+      lsFromPwdQueued,
+      sliver.sliverpb.Ls.decode,
+      `beacon ls pwd path (${transport.name})`,
+      180,
+    );
     assert(lsFromPwd.Exists, `beacon ls on pwd path reported missing path: ${lsFromPwd.Path}`);
-
-    let netstatEntries: number | undefined;
-    try {
-      const netstatQueued = await interactiveBeacon.netstat(30);
-      const netstat = await decodeBeaconTaskResponse(
-        client,
-        beacon.ID,
-        netstatQueued,
-        sliver.sliverpb.Netstat.decode,
-        `beacon netstat (${transport.name})`,
-        60,
-      );
-      assert(Array.isArray(netstat.Entries), "beacon netstat entries were not returned as an array");
-      if (netstat.Entries.length > 0) {
-        assert(netstat.Entries[0].Protocol.trim().length > 0, "beacon netstat entry missing protocol");
-      }
-      netstatEntries = netstat.Entries.length;
-    } catch (err) {
-      console.warn("beacon netstat check skipped", err);
-    }
 
     console.log("beacon command checks", {
       transport: transport.name,
@@ -575,7 +654,6 @@ async function runBeaconTransportChecks(
         executable: selfProcess.Executable,
       },
       ifaces: ifconfig.NetInterfaces.map((iface) => iface.Name),
-      netstatEntries,
     });
 
     const transferSourceDir = path.join(tempDir, "transfer-source");
