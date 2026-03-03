@@ -4,7 +4,8 @@ Sliver-script is a TypeScript/JavaScript client library for Sliver, it can be us
 
 This library targets modern Sliver protobuf/gRPC APIs and provides a strongly-typed TypeScript-first client.
 
-[![NPM Publish](https://github.com/moloch--/sliver-script/actions/workflows/publish.yml/badge.svg)](https://github.com/moloch--/sliver-script/actions/workflows/publish.yml)
+[![Publish](https://github.com/moloch--/sliver-script/actions/workflows/publish.yml/badge.svg)](https://github.com/moloch--/sliver-script/actions/workflows/publish.yml)
+[![npm version](https://img.shields.io/npm/v/sliver-script.svg)](https://www.npmjs.com/package/sliver-script)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
 ### Install
