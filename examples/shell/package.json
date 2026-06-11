@@ -12,7 +12,7 @@
     "sliver-script": "^1.2.5"
   },
   "overrides": {
-    "@grpc/grpc-js": "^1.14.3",
+    "@grpc/grpc-js": "^1.14.4",
     "protobufjs": "^7.2.5"
   }
 }
