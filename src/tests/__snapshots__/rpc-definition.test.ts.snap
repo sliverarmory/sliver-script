@@ -227,6 +227,12 @@ exports[`RPC definition includes all methods (snapshot) 1`] = `
       "responseStream": false,
     },
     {
+      "key": "deleteAIConversation",
+      "name": "DeleteAIConversation",
+      "requestStream": false,
+      "responseStream": false,
+    },
+    {
       "key": "deleteImplantBuild",
       "name": "DeleteImplantBuild",
       "requestStream": false,
@@ -325,6 +331,30 @@ exports[`RPC definition includes all methods (snapshot) 1`] = `
     {
       "key": "generateWGClientConfig",
       "name": "GenerateWGClientConfig",
+      "requestStream": false,
+      "responseStream": false,
+    },
+    {
+      "key": "getAIConversation",
+      "name": "GetAIConversation",
+      "requestStream": false,
+      "responseStream": false,
+    },
+    {
+      "key": "getAIConversationMessages",
+      "name": "GetAIConversationMessages",
+      "requestStream": false,
+      "responseStream": false,
+    },
+    {
+      "key": "getAIConversations",
+      "name": "GetAIConversations",
+      "requestStream": false,
+      "responseStream": false,
+    },
+    {
+      "key": "getAIProviders",
+      "name": "GetAIProviders",
       "requestStream": false,
       "responseStream": false,
     },
@@ -835,6 +865,18 @@ exports[`RPC definition includes all methods (snapshot) 1`] = `
     {
       "key": "runSSHCommand",
       "name": "RunSSHCommand",
+      "requestStream": false,
+      "responseStream": false,
+    },
+    {
+      "key": "saveAIConversation",
+      "name": "SaveAIConversation",
+      "requestStream": false,
+      "responseStream": false,
+    },
+    {
+      "key": "saveAIConversationMessage",
+      "name": "SaveAIConversationMessage",
       "requestStream": false,
       "responseStream": false,
     },

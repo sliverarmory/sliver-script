@@ -26,3 +26,25 @@ test('ParseConfigFile', async () => {
     expect(config.token).toBe('asdf');
     fs.unlinkSync(configPath);
 });
+
+test('ParseConfig accepts optional wg block', () => {
+    const config = ParseConfig(Buffer.from(JSON.stringify({
+        operator: 'moloch',
+        token: 'asdf',
+        lhost: 'localhost',
+        lport: 31337,
+        ca_certificate: 'ca',
+        private_key: 'key',
+        certificate: 'cert',
+        wg: {
+            server_pub_key: 'server',
+            client_private_key: 'private',
+            client_pub_key: 'public',
+            client_ip: '100.65.0.2',
+            server_ip: '100.65.0.1',
+        },
+    })));
+
+    expect(config.wg?.server_pub_key).toBe('server');
+    expect(config.wg?.client_ip).toBe('100.65.0.2');
+});

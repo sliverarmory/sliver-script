@@ -2,12 +2,13 @@ import { gunzip as gunzipCb, gzip as gzipCb } from "node:zlib";
 import { promisify } from "node:util";
 
 import { createChannel, createClient, type Channel } from "nice-grpc";
-import { Subject, filter, map, type Observable } from "rxjs";
+import { BehaviorSubject, Subject, filter, map, type Observable } from "rxjs";
 
 import type { SliverClientConfig } from "./config";
 import { createSliverRpcCredentials } from "./internal/credentials";
 import { withTimeoutSignal } from "./internal/timeout";
 import { TunnelManager } from "./internal/tunnelManager";
+import { hasWireGuardWrapper, startWireGuardProxy, type WireGuardProxySession } from "./internal/wgProxy";
 import { BeaconTask } from "./pb/clientpb/client";
 import type {
   Event,
@@ -22,6 +23,12 @@ import type {
   ImplantProfile,
   Loot,
   WebContent,
+  Compiler,
+  Generate,
+  GenerateStageReq,
+  HTTPListenerReq,
+  StagerListenerReq,
+  UniqueWGIP,
 } from "./pb/clientpb/client";
 import type { Request as CommonRequest } from "./pb/commonpb/common";
 import { SliverRPCDefinition } from "./pb/rpcpb/services";
@@ -35,6 +42,31 @@ const DEFAULT_TIMEOUT_SECONDS = 30;
 const KiB = 1024;
 const MiB = 1024 * KiB;
 const GiB = 1024 * MiB;
+const EVENT_RETRY_INITIAL_MS = 500;
+const EVENT_RETRY_MAX_MS = 10_000;
+
+export interface SliverEventStreamState {
+  status: "stopped" | "connecting" | "connected" | "retrying";
+  attempt: number;
+  error?: string;
+}
+
+export interface HTTPListenerOptions {
+  domain?: string;
+  host: string;
+  port: number;
+  website?: string;
+  enforceOTP?: boolean;
+  longPollTimeoutNanoseconds?: string;
+  longPollJitterNanoseconds?: string;
+}
+
+export interface HTTPSListenerOptions extends HTTPListenerOptions {
+  acme?: boolean;
+  cert?: Buffer;
+  key?: Buffer;
+  randomizeJARM?: boolean;
+}
 
 export interface Tunnel {
   readonly id: string;
@@ -406,9 +438,15 @@ export class SliverClient {
 
   private eventsAbort: AbortController | null = null;
   private tunnels: TunnelManager | null = null;
+  private wireGuardProxy: WireGuardProxySession | null = null;
 
   private readonly eventSubject = new Subject<Event>();
   readonly event$ = this.eventSubject.asObservable();
+  private readonly eventStreamStateSubject = new BehaviorSubject<SliverEventStreamState>({
+    status: "stopped",
+    attempt: 0,
+  });
+  readonly eventStreamState$ = this.eventStreamStateSubject.asObservable();
 
   readonly session$ = this.event$.pipe(filter((event): event is Event & { Session: NonNullable<Event["Session"]> } =>
     event.Session !== undefined
@@ -429,6 +467,20 @@ export class SliverClient {
     return `${this.config.lhost}:${this.config.lport}`;
   }
 
+  private rpcChannelOptions(): Record<string, number | string> {
+    const options: Record<string, number | string> = {
+      "grpc.max_send_message_length": (2 * GiB) - 1,
+      "grpc.max_receive_message_length": (2 * GiB) - 1,
+    };
+
+    if (this.wireGuardProxy) {
+      options["grpc.ssl_target_name_override"] = this.config.lhost;
+      options["grpc.default_authority"] = this.config.lhost;
+    }
+
+    return options;
+  }
+
   get rpc(): SliverRPCClient {
     if (!this.rpcClient) {
       throw new Error("SliverClient is not connected");
@@ -446,20 +498,28 @@ export class SliverClient {
     this.eventsAbort = new AbortController();
     this.tunnels = new TunnelManager();
 
-    const creds = createSliverRpcCredentials(this.config);
-    this.channel = createChannel(this.rpcHost(), creds, {
-      "grpc.max_send_message_length": (2 * GiB) -1,
-      "grpc.max_receive_message_length": (2 * GiB) -1,
-    });
+    try {
+      let rpcTarget = this.rpcHost();
+      if (hasWireGuardWrapper(this.config)) {
+        this.wireGuardProxy = await startWireGuardProxy(this.config);
+        rpcTarget = this.wireGuardProxy.rpcHost();
+      }
 
-    this.rpcClient = createClient(SliverRPCDefinition, this.channel);
+      const creds = createSliverRpcCredentials(this.config);
+      this.channel = createChannel(rpcTarget, creds, this.rpcChannelOptions());
 
-    // Ensure auth and connectivity are working before we start streams.
-    await this.getVersion();
+      this.rpcClient = createClient(SliverRPCDefinition, this.channel);
 
-    this.tunnels.start(this.rpcClient);
-    this.startEventsStream();
-    return this;
+      // Ensure auth and connectivity are working before we start streams.
+      await this.getVersion();
+
+      this.tunnels.start(this.rpcClient);
+      this.startEventsStream();
+      return this;
+    } catch (error) {
+      await this.disconnect();
+      throw error;
+    }
   }
 
   async disconnect(): Promise<void> {
@@ -472,6 +532,12 @@ export class SliverClient {
     this.rpcClient = null;
     this.channel?.close();
     this.channel = null;
+
+    const wireGuardProxy = this.wireGuardProxy;
+    this.wireGuardProxy = null;
+    await wireGuardProxy?.stop();
+
+    this.eventStreamStateSubject.next({ status: "stopped", attempt: 0 });
   }
 
   private startEventsStream(): void {
@@ -480,17 +546,42 @@ export class SliverClient {
     if (!rpc || !abort) return;
 
     (async () => {
-      try {
-        const stream = rpc.events(this.empty, { signal: abort.signal });
-        for await (const event of stream) {
-          this.eventSubject.next(event);
+      let attempt = 0;
+
+      while (!abort.signal.aborted && this.rpcClient === rpc) {
+        this.eventStreamStateSubject.next({
+          status: attempt === 0 ? "connecting" : "retrying",
+          attempt,
+        });
+
+        try {
+          const stream = rpc.events(this.empty, { signal: abort.signal });
+          this.eventStreamStateSubject.next({ status: "connected", attempt });
+          attempt = 0;
+
+          for await (const event of stream) {
+            this.eventSubject.next(event);
+          }
+
+          if (!abort.signal.aborted) {
+            throw new Error("Sliver event stream ended unexpectedly");
+          }
+        } catch (err) {
+          // Abort is expected on disconnect; don't surface it as a retry.
+          if (abort.signal.aborted || this.rpcClient !== rpc) {
+            return;
+          }
+
+          attempt += 1;
+          this.eventStreamStateSubject.next({
+            status: "retrying",
+            attempt,
+            error: errorMessage(err),
+          });
+
+          const delayMs = Math.min(EVENT_RETRY_INITIAL_MS * (2 ** (attempt - 1)), EVENT_RETRY_MAX_MS);
+          await abortableDelay(delayMs, abort.signal);
         }
-      } catch (err) {
-        // Abort is expected on disconnect; don't surface as an error.
-        if (abort.signal.aborted) {
-          return;
-        }
-        this.eventSubject.error(err);
       }
     })();
   }
@@ -565,15 +656,29 @@ export class SliverClient {
     host: string,
     port: number,
     website = "",
-    enforceOTP = false,
+    enforceOTP = true,
     timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
   ) {
-    return withTimeoutSignal(timeoutSeconds, (signal) =>
-      this.rpc.startHTTPListener(
-        { Domain: domain, Host: host, Port: port, Secure: false, Website: website, EnforceOTP: enforceOTP },
-        { signal },
-      ),
-    );
+    return this.startHTTPListenerWithOptions({ domain, host, port, website, enforceOTP }, timeoutSeconds);
+  }
+
+  startHTTPListenerWithOptions(options: HTTPListenerOptions, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    const request: HTTPListenerReq = {
+      Domain: options.domain ?? "",
+      Host: options.host,
+      Port: options.port,
+      Secure: false,
+      Website: options.website ?? "",
+      Cert: Buffer.alloc(0),
+      Key: Buffer.alloc(0),
+      ACME: false,
+      EnforceOTP: options.enforceOTP ?? true,
+      LongPollTimeout: options.longPollTimeoutNanoseconds ?? "1000000000",
+      LongPollJitter: options.longPollJitterNanoseconds ?? "2000000000",
+      RandomizeJARM: false,
+    };
+
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.startHTTPListener(request, { signal }));
   }
 
   startHTTPSListener(
@@ -584,35 +689,56 @@ export class SliverClient {
     acme = false,
     cert?: Buffer,
     key?: Buffer,
-    enforceOTP = false,
+    enforceOTP = true,
     timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
   ) {
-    return withTimeoutSignal(timeoutSeconds, (signal) =>
-      this.rpc.startHTTPSListener(
-        {
-          Domain: domain,
-          Host: host,
-          Port: port,
-          Secure: true,
-          Website: website,
-          ACME: acme,
-          Cert: cert ?? Buffer.alloc(0),
-          Key: key ?? Buffer.alloc(0),
-          EnforceOTP: enforceOTP,
-        },
-        { signal },
-      ),
+    return this.startHTTPSListenerWithOptions(
+      { domain, host, port, website, acme, cert, key, enforceOTP },
+      timeoutSeconds,
     );
+  }
+
+  startHTTPSListenerWithOptions(options: HTTPSListenerOptions, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    const request: HTTPListenerReq = {
+      Domain: options.domain ?? "",
+      Host: options.host,
+      Port: options.port,
+      Secure: true,
+      Website: options.website ?? "",
+      ACME: options.acme ?? false,
+      Cert: options.cert ?? Buffer.alloc(0),
+      Key: options.key ?? Buffer.alloc(0),
+      EnforceOTP: options.enforceOTP ?? true,
+      LongPollTimeout: options.longPollTimeoutNanoseconds ?? "1000000000",
+      LongPollJitter: options.longPollJitterNanoseconds ?? "2000000000",
+      RandomizeJARM: options.randomizeJARM ?? true,
+    };
+
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.startHTTPSListener(request, { signal }));
   }
 
   startTCPStagerListener(host: string, port: number, data: Buffer, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
-    return withTimeoutSignal(timeoutSeconds, (signal) =>
-      this.rpc.startTCPStagerListener({ Protocol: 0, Host: host, Port: port, Data: data }, { signal }),
-    );
+    return this.startTCPStagerListenerWithOptions({ Protocol: 0, Host: host, Port: port, Data: data, ProfileName: "" }, timeoutSeconds);
+  }
+
+  startTCPStagerListenerWithOptions(request: StagerListenerReq, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.startTCPStagerListener(request, { signal }));
+  }
+
+  getCompiler(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Compiler> {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.getCompiler(this.empty, { signal }));
+  }
+
+  generateUniqueIP(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<UniqueWGIP> {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.generateUniqueIP(this.empty, { signal }));
+  }
+
+  generateImplant(config: ImplantConfig, name = "", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Generate> {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.generate({ Config: config, Name: name }, { signal }));
   }
 
   async generate(config: ImplantConfig, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
-    const res = await withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.generate({ Config: config }, { signal }));
+    const res = await this.generateImplant(config, "", timeoutSeconds);
     return res.File;
   }
 
@@ -623,10 +749,24 @@ export class SliverClient {
   }
 
   async regenerate(implantName: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
-    const res = await withTimeoutSignal(timeoutSeconds, (signal) =>
+    const res = await this.regenerateImplant(implantName, timeoutSeconds);
+    return res.File;
+  }
+
+  regenerateImplant(implantName: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Generate> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.regenerate({ ImplantName: implantName }, { signal }),
     );
-    return res.File;
+  }
+
+  generateStage(request: GenerateStageReq, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Generate> {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.generateStage(request, { signal }));
+  }
+
+  stageImplantBuild(buildNames: string[], timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      await this.rpc.stageImplantBuild({ Build: buildNames }, { signal });
+    });
   }
 
   implantBuilds(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
@@ -753,6 +893,26 @@ export class SliverClient {
   async rmBeacon(beaconId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
     await withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.rmBeacon({ ID: beaconId } as Beacon, { signal }));
   }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+function abortableDelay(delayMs: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+
+  return new Promise((resolve) => {
+    const timer = setTimeout(done, delayMs);
+
+    function done() {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    }
+
+    signal.addEventListener("abort", done, { once: true });
+  });
 }
 
 async function waitForBeaconTask(taskResult$: Observable<Event>, taskId: string, timeoutSeconds: number) {

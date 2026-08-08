@@ -22,7 +22,21 @@ const sliverBuildStampPath = path.join(cacheDir, "sliver-server-submodule.sha");
 const daemonStartupTimeoutMs = 60_000;
 const daemonStopTimeoutMs = 10_000;
 const portWaitIntervalMs = 200;
+const daemonConnectRetryIntervalMs = 1_000;
 const e2eTempRootPrefix = "sliver-script-e2e-";
+const daemonReadyScript = `
+const { ParseConfigFile, SliverClient } = require("./lib");
+
+(async () => {
+  const config = await ParseConfigFile(process.env.SLIVER_CONFIG_FILE);
+  const client = new SliverClient(config);
+  await client.connect();
+  await client.disconnect();
+})().catch((error) => {
+  console.error(error && error.stack ? error.stack : String(error));
+  process.exit(1);
+});
+`.trim();
 
 function log(message) {
   console.log(`[e2e] ${message}`);
@@ -185,37 +199,41 @@ async function ensureSliverServerBuilt(sharedEnv) {
   log(`Reusing existing sliver-server build for submodule HEAD ${currentHead}`);
 }
 
-function attemptTcpConnect(host, port, timeoutMs = 1_000) {
-  return new Promise((resolve) => {
-    const socket = net.connect({ host, port });
-
-    const done = (ok) => {
-      socket.removeAllListeners();
-      socket.destroy();
-      resolve(ok);
-    };
-
-    socket.setTimeout(timeoutMs);
-    socket.once("connect", () => done(true));
-    socket.once("timeout", () => done(false));
-    socket.once("error", () => done(false));
-  });
+async function attemptDaemonConnect(operatorConfigPath, env) {
+  try {
+    await runCommand(process.execPath, ["-e", daemonReadyScript], {
+      cwd: repoRoot,
+      env: {
+        ...env,
+        SLIVER_CONFIG_FILE: operatorConfigPath,
+      },
+      capture: true,
+    });
+    return null;
+  } catch (error) {
+    return error;
+  }
 }
 
-async function waitForDaemonPort(host, port, daemonChild) {
+async function waitForDaemonReady(operatorConfigPath, daemonChild, env) {
   const deadline = Date.now() + daemonStartupTimeoutMs;
+  let lastError = null;
+
   while (Date.now() < deadline) {
     if (daemonChild.exitCode !== null) {
       throw new Error(`sliver-server daemon exited before startup (code ${daemonChild.exitCode})`);
     }
 
-    if (await attemptTcpConnect(host, port)) {
+    lastError = await attemptDaemonConnect(operatorConfigPath, env);
+    if (!lastError) {
       return;
     }
 
-    await sleep(portWaitIntervalMs);
+    await sleep(daemonConnectRetryIntervalMs);
   }
-  throw new Error(`Timed out waiting for sliver-server daemon on ${host}:${port}`);
+
+  const errorMessage = lastError instanceof Error ? `\n${lastError.message}` : "";
+  throw new Error(`Timed out waiting for sliver-server daemon using ${operatorConfigPath}${errorMessage}`);
 }
 
 async function allocateFreePort(host) {
@@ -335,6 +353,7 @@ async function main() {
     TEMP: tmpDir,
     GOCACHE: goCacheDir,
     GOTMPDIR: goTmpDir,
+    GOTOOLCHAIN: process.env.GOTOOLCHAIN || "local",
   };
 
   await Promise.all(
@@ -397,8 +416,8 @@ async function main() {
   const httpHost = process.env.SLIVER_E2E_HTTP_HOST || operatorHost;
   const httpPort = await resolvePort("SLIVER_E2E_HTTP_PORT", process.env.SLIVER_E2E_HTTP_PORT, httpBindHost);
 
-  const wgBindHost = process.env.SLIVER_E2E_WG_BIND_HOST || daemonHost;
-  const wgHost = process.env.SLIVER_E2E_WG_HOST || operatorHost;
+  const wgBindHost = process.env.SLIVER_E2E_WG_BIND_HOST || "127.0.0.1";
+  const wgHost = process.env.SLIVER_E2E_WG_HOST || wgBindHost;
   const wgPort = await resolvePort("SLIVER_E2E_WG_PORT", process.env.SLIVER_E2E_WG_PORT, wgBindHost);
   const wgNPort = await resolvePort("SLIVER_E2E_WG_NPORT", process.env.SLIVER_E2E_WG_NPORT, wgBindHost);
   const wgKeyPort = await resolvePort("SLIVER_E2E_WG_KEYPORT", process.env.SLIVER_E2E_WG_KEYPORT, wgBindHost);
@@ -496,14 +515,14 @@ async function main() {
     daemonProcess = daemon.child;
     daemonOutputGetter = daemon.getCombinedOutput;
 
-    await waitForDaemonPort(daemonHost, lport, daemonProcess);
-    log("Daemon is accepting connections");
-
     log("Building TypeScript library + e2e tests");
     await runCommand("npm", ["run", "build:examples"], {
       cwd: repoRoot,
       env: sharedEnv,
     });
+
+    await waitForDaemonReady(operatorConfigPath, daemonProcess, sharedEnv);
+    log("Daemon is accepting connections");
 
     const testFiles = await collectE2ETestFiles();
     if (testFiles.length === 0) {

@@ -832,7 +832,7 @@ async function main() {
   const httpBindHost = process.env.SLIVER_E2E_HTTP_BIND_HOST ?? "127.0.0.1";
   const httpPort = parsePort(process.env.SLIVER_E2E_HTTP_PORT ?? String(mtlsPort + 1), "SLIVER_E2E_HTTP_PORT");
 
-  const wgHost = process.env.SLIVER_E2E_WG_HOST ?? "localhost";
+  const wgHost = process.env.SLIVER_E2E_WG_HOST ?? "127.0.0.1";
   const wgBindHost = process.env.SLIVER_E2E_WG_BIND_HOST ?? "127.0.0.1";
   const wgPort = parsePort(process.env.SLIVER_E2E_WG_PORT ?? String(httpPort + 1), "SLIVER_E2E_WG_PORT");
   const wgNPort = parsePort(process.env.SLIVER_E2E_WG_NPORT ?? String(wgPort + 1), "SLIVER_E2E_WG_NPORT");

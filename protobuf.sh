@@ -13,7 +13,13 @@ fi
 IN_DIR="${SLIVER_PROTO_ROOT:-${DEFAULT_IN_DIR}}"
 OUT_DIR="${ROOT_DIR}/src/pb"
 
-TS_PROTO_PLUGIN="${ROOT_DIR}/node_modules/.bin/protoc-gen-ts_proto"
+# npm may install package bins as regular files instead of symlinks. The
+# ts-proto launcher resolves ./build relative to itself, so prefer the package
+# entrypoint and only fall back to .bin for package managers that omit it.
+TS_PROTO_PLUGIN="${ROOT_DIR}/node_modules/ts-proto/protoc-gen-ts_proto"
+if [[ ! -x "${TS_PROTO_PLUGIN}" ]]; then
+  TS_PROTO_PLUGIN="${ROOT_DIR}/node_modules/.bin/protoc-gen-ts_proto"
+fi
 
 if [[ ! -d "${IN_DIR}" ]]; then
   echo "Missing protobuf input directory: ${IN_DIR}"
