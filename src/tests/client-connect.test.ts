@@ -2,6 +2,8 @@ const createChannel = jest.fn();
 const createClient = jest.fn();
 const createSliverRpcCredentials = jest.fn();
 const startWireGuardProxy = jest.fn();
+const SERVER_PUBLIC_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const CLIENT_PRIVATE_KEY = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
 
 jest.mock("nice-grpc", () => ({
   createChannel: (...args: unknown[]) => createChannel(...args),
@@ -13,7 +15,7 @@ jest.mock("../internal/credentials", () => ({
 }));
 
 jest.mock("../internal/wgProxy", () => ({
-  hasWireGuardWrapper: (config: { wg?: unknown }) => config.wg !== undefined,
+  hasWireGuardWrapper: (config: { wg?: { enabled?: boolean } }) => config.wg?.enabled === true,
   startWireGuardProxy: (...args: unknown[]) => startWireGuardProxy(...args),
 }));
 
@@ -62,6 +64,11 @@ test("SliverClient.connect() uses the direct operator endpoint without wg", asyn
   await client.connect();
 
   expect(startWireGuardProxy).not.toHaveBeenCalled();
+  expect(createSliverRpcCredentials).toHaveBeenCalledTimes(1);
+  expect(createChannel).toHaveBeenCalledTimes(6);
+  for (const [, credentials] of createChannel.mock.calls) {
+    expect(credentials).toBe(createSliverRpcCredentials.mock.results[0]!.value);
+  }
   expect(createChannel).toHaveBeenCalledWith(
     "localhost:31337",
     { kind: "creds" },
@@ -84,8 +91,9 @@ test("SliverClient.connect() routes through the WireGuard proxy when the config 
   const client = new SliverClient({
     ...dummyConfig(),
     wg: {
-      server_pub_key: "server",
-      client_private_key: "private",
+      enabled: true,
+      server_pub_key: SERVER_PUBLIC_KEY,
+      client_private_key: CLIENT_PRIVATE_KEY,
       client_ip: "100.65.0.2",
     },
   });
@@ -123,12 +131,62 @@ test("SliverClient.connect() cleans up the WireGuard proxy when startup fails", 
   const client = new SliverClient({
     ...dummyConfig(),
     wg: {
-      server_pub_key: "server",
-      client_private_key: "private",
+      enabled: true,
+      server_pub_key: SERVER_PUBLIC_KEY,
+      client_private_key: CLIENT_PRIVATE_KEY,
       client_ip: "100.65.0.2",
     },
   });
 
   await expect(client.connect()).rejects.toThrow("auth failed");
   expect(proxyStop).toHaveBeenCalledTimes(1);
+});
+
+test("SliverClient serializes concurrent connect and disconnect operations", async () => {
+  let resolveVersion!: (value: object) => void;
+  let reportVersionStarted!: () => void;
+  const versionStarted = new Promise<void>((resolve) => {
+    reportVersionStarted = resolve;
+  });
+  const getVersion = jest.fn(() => {
+    reportVersionStarted();
+    return new Promise<object>((resolve) => {
+      resolveVersion = resolve;
+    });
+  });
+  createClient.mockImplementation(() => ({
+    getVersion,
+    events: jest.fn(() => emptyStream()),
+    tunnelData: jest.fn(() => emptyStream()),
+  }));
+
+  const proxyStop = jest.fn(async () => {});
+  startWireGuardProxy.mockResolvedValue({
+    rpcHost: () => "127.0.0.1:4444",
+    stop: proxyStop,
+  });
+  const client = new SliverClient({
+    ...dummyConfig(),
+    wg: {
+      enabled: true,
+      server_pub_key: SERVER_PUBLIC_KEY,
+      client_private_key: CLIENT_PRIVATE_KEY,
+      client_ip: "100.65.0.2",
+    },
+  });
+
+  const firstConnect = client.connect();
+  const secondConnect = client.connect();
+  await versionStarted;
+  const disconnect = client.disconnect();
+
+  expect(startWireGuardProxy).toHaveBeenCalledTimes(1);
+  expect(proxyStop).not.toHaveBeenCalled();
+
+  resolveVersion({});
+  await Promise.all([firstConnect, secondConnect, disconnect]);
+
+  expect(startWireGuardProxy).toHaveBeenCalledTimes(1);
+  expect(proxyStop).toHaveBeenCalledTimes(1);
+  expect(client.isConnected).toBe(false);
 });

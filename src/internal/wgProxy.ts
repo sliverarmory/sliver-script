@@ -1,27 +1,58 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import * as fs from "node:fs";
-import { copyFile, mkdir, mkdtemp, rm, stat } from "node:fs/promises";
+import { rmSync } from "node:fs";
+import { chmod, lstat, mkdtemp, rm } from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as readline from "node:readline";
 
 import type { SliverClientConfig, SliverClientWireGuardConfig } from "../config";
+import { validateWireGuardKey, wireGuardAddressFamily } from "./wireGuardConfig";
 
 const HELPER_BINARY_ENV = "SLIVER_SCRIPT_WG_PROXY_BINARY";
-const SLIVER_DIR_ENV = "SLIVER_SCRIPT_SLIVER_DIR";
-// `sliver-script` is CommonJS when consumed directly, but Electron bundles it
-// into an ESM main-process artifact. `typeof` keeps the bundled form safe while
-// retaining package-relative discovery for the regular CommonJS build.
-const packageRoot = typeof __dirname === "string" ? path.resolve(__dirname, "../..") : process.cwd();
-const helperSourcePath = path.join(packageRoot, "wireguard-proxy/main.go");
-const defaultSliverDir = path.join(packageRoot, "sliver");
-const helperBinaryPath = path.join(
-  os.tmpdir(),
-  "sliver-script",
-  "wgproxy",
-  `${process.platform}-${process.arch}`,
-  process.platform === "win32" ? "sliver-script-wgproxy.exe" : "sliver-script-wgproxy",
-);
+const HELPER_STARTUP_TIMEOUT_MILLISECONDS = 30_000;
+const HELPER_BUILD_TIMEOUT_MILLISECONDS = 120_000;
+const HELPER_OUTPUT_MAX_CHARACTERS = 64 * 1024;
+// A regular CommonJS install has a trustworthy package-relative source root.
+// Bundlers may erase __dirname; in that mode we fail closed unless the host
+// supplies an explicit absolute helper path rather than trusting process.cwd().
+export function packageRootForDirectory(directory: string | undefined): string | null {
+  return directory === undefined ? null : path.resolve(directory, "../..");
+}
+
+export function wireGuardHelperBuildEnvironment(
+  environment: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return {
+    ...environment,
+    CGO_ENABLED: "0",
+    GOTOOLCHAIN: environment.GOTOOLCHAIN ?? "local",
+    GOWORK: "off",
+  };
+}
+
+export function wireGuardHelperRuntimeEnvironment(
+  environment: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): NodeJS.ProcessEnv {
+  const allowed = platform === "win32"
+    ? new Set(["SYSTEMROOT", "WINDIR", "TEMP", "TMP"])
+    : new Set(["TMPDIR"]);
+  const runtime: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(environment)) {
+    const canonical = key.toUpperCase();
+    if (allowed.has(canonical) && value !== undefined) {
+      runtime[canonical] = value;
+    }
+  }
+  return runtime;
+}
+
+const packageRoot = packageRootForDirectory(typeof __dirname === "string" ? __dirname : undefined);
+const helperRoot = packageRoot === null ? null : path.join(packageRoot, "wireguard-proxy");
+const helperExecutableName = process.platform === "win32" ? "sliver-script-wgproxy.exe" : "sliver-script-wgproxy";
+const helperSourcePaths = helperRoot === null
+  ? []
+  : ["go.mod", "go.sum", "main.go", "netstack.go"].map((name) => path.join(helperRoot, name));
 
 interface ProxyReadyMessage {
   listen_host: string;
@@ -34,9 +65,40 @@ export interface WireGuardProxySession {
 }
 
 let helperBinaryPromise: Promise<string> | null = null;
+let helperBuildDirectory: string | null = null;
+
+// Source builds are process-private and are retained only while this Node
+// process can launch them. The synchronous exit hook also covers process.exit()
+// where promises and other asynchronous cleanup cannot run.
+process.once("exit", () => {
+  if (helperBuildDirectory) {
+    try {
+      rmSync(helperBuildDirectory, { recursive: true, force: true });
+    } catch {
+      // Exit cleanup is best-effort; the directory is already process-private.
+    }
+  }
+});
 
 export function hasWireGuardWrapper(config: SliverClientConfig): boolean {
-  return config.wg !== undefined;
+  return config.wg?.enabled === true;
+}
+
+export function serializeWireGuardHelperConfig(config: SliverClientConfig): Buffer {
+  if (!config.wg) {
+    throw new Error("WireGuard proxy requested without a wg config block");
+  }
+  return Buffer.from(`${JSON.stringify({
+    lhost: config.lhost,
+    lport: config.lport,
+    wg: {
+      server_pub_key: config.wg.server_pub_key,
+      client_private_key: config.wg.client_private_key,
+      ...(config.wg.preshared_key === undefined ? {} : { preshared_key: config.wg.preshared_key }),
+      client_ip: config.wg.client_ip,
+      ...(config.wg.server_ip === undefined ? {} : { server_ip: config.wg.server_ip }),
+    },
+  })}\n`, "utf8");
 }
 
 export async function startWireGuardProxy(config: SliverClientConfig): Promise<WireGuardProxySession> {
@@ -46,14 +108,56 @@ export async function startWireGuardProxy(config: SliverClientConfig): Promise<W
 
   validateWireGuardConfig(config.wg);
 
-  const binaryPath = await resolveHelperBinary();
-  const child = spawn(binaryPath, [], { stdio: ["pipe", "pipe", "pipe"] });
+  // The operator config also contains the RPC token and mTLS private key. Keep
+  // the helper boundary deliberately narrower than SliverClientConfig.
+  const serializedConfig = serializeWireGuardHelperConfig(config);
+
+  let binaryPath: string;
+  try {
+    binaryPath = await resolveHelperBinary();
+  } catch (error) {
+    serializedConfig.fill(0);
+    throw error;
+  }
+
+  let child: ChildProcessWithoutNullStreams;
+  try {
+    child = spawn(binaryPath, [], {
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+      env: wireGuardHelperRuntimeEnvironment(),
+    });
+  } catch (error) {
+    serializedConfig.fill(0);
+    throw error;
+  }
 
   const stderr = collectText(child.stderr);
   const ready = waitForReady(child, stderr);
-  child.stdin.end(JSON.stringify(config));
+  const inputWritten = new Promise<void>((resolve, reject) => {
+    let settled = false;
+    child.stdin.on("error", () => {
+      serializedConfig.fill(0);
+      if (settled) return;
+      settled = true;
+      reject(new Error("WireGuard helper closed its configuration input before startup"));
+    });
+    child.stdin.write(serializedConfig, () => {
+      serializedConfig.fill(0);
+      if (settled) return;
+      settled = true;
+      resolve();
+    });
+  });
 
-  const message = await ready;
+  let message: ProxyReadyMessage;
+  try {
+    [message] = await Promise.all([ready, inputWritten]);
+  } catch (error) {
+    serializedConfig.fill(0);
+    await stopChild(child);
+    throw error;
+  }
   return {
     rpcHost: () => `${message.listen_host}:${message.listen_port}`,
     stop: async () => {
@@ -78,6 +182,23 @@ function validateWireGuardConfig(config: SliverClientWireGuardConfig): void {
   if (missing.length !== 0) {
     throw new Error(`Invalid sliver config: incomplete wg block (missing ${missing.join(", ")})`);
   }
+
+  validateWireGuardKey(config.server_pub_key, "server_pub_key");
+  validateWireGuardKey(config.client_private_key, "client_private_key");
+  if (config.client_pub_key !== undefined) {
+    validateWireGuardKey(config.client_pub_key, "client_pub_key");
+  }
+  if (config.preshared_key !== undefined) {
+    validateWireGuardKey(config.preshared_key, "preshared_key");
+  }
+
+  const clientFamily = wireGuardAddressFamily(config.client_ip, "client_ip");
+  const serverFamily = config.server_ip === undefined
+    ? 4
+    : wireGuardAddressFamily(config.server_ip, "server_ip");
+  if (clientFamily !== serverFamily) {
+    throw new Error("Invalid sliver config: wg.client_ip and wg.server_ip must use the same address family");
+  }
 }
 
 function hasText(value: string | undefined): boolean {
@@ -87,10 +208,14 @@ function hasText(value: string | undefined): boolean {
 async function resolveHelperBinary(): Promise<string> {
   const configuredBinary = process.env[HELPER_BINARY_ENV];
   if (configuredBinary) {
-    if (!fs.existsSync(configuredBinary)) {
+    if (!path.isAbsolute(configuredBinary) || !(await isRegularFile(configuredBinary))) {
       throw new Error(`Configured WireGuard helper does not exist: ${configuredBinary}`);
     }
     return configuredBinary;
+  }
+
+  if (helperRoot === null) {
+    throw new Error(`Bundled WireGuard support requires an absolute ${HELPER_BINARY_ENV} path`);
   }
 
   if (!helperBinaryPromise) {
@@ -106,56 +231,49 @@ async function resolveHelperBinary(): Promise<string> {
 }
 
 async function buildHelperBinary(): Promise<string> {
-  if (!fs.existsSync(helperSourcePath)) {
-    throw new Error(`WireGuard helper source is missing: ${helperSourcePath}`);
+  if (helperRoot === null) {
+    throw new Error(`Bundled WireGuard support requires an absolute ${HELPER_BINARY_ENV} path`);
+  }
+  for (const sourcePath of helperSourcePaths) {
+    if (!(await isRegularFile(sourcePath))) {
+      throw new Error(`WireGuard helper source is missing: ${sourcePath}`);
+    }
   }
 
-  if (await isHelperBinaryFresh()) {
-    return helperBinaryPath;
-  }
-
-  const sliverDir = resolveSliverDir();
-  await mkdir(path.dirname(helperBinaryPath), { recursive: true });
-
-  const stagedDir = await mkdtemp(path.join(sliverDir, "sliver-script-wgproxy-"));
-  const stagedSourcePath = path.join(stagedDir, "main.go");
+  const stagedDir = await mkdtemp(path.join(os.tmpdir(), "sliver-script-wgproxy-"));
+  await chmod(stagedDir, 0o700);
+  const stagedBinaryPath = path.join(stagedDir, helperExecutableName);
 
   try {
-    await copyFile(helperSourcePath, stagedSourcePath);
-    await runCommand("go", ["build", "-mod=vendor", "-o", helperBinaryPath, `./${path.basename(stagedDir)}`], sliverDir);
-    return helperBinaryPath;
-  } finally {
+    await runCommand(
+      "go",
+      ["build", "-mod=readonly", "-trimpath", "-buildvcs=false", "-o", stagedBinaryPath, "."],
+      helperRoot,
+      HELPER_BUILD_TIMEOUT_MILLISECONDS,
+    );
+    helperBuildDirectory = stagedDir;
+    return stagedBinaryPath;
+  } catch (error) {
     await rm(stagedDir, { recursive: true, force: true });
+    throw error;
   }
 }
 
-async function isHelperBinaryFresh(): Promise<boolean> {
+async function isRegularFile(filePath: string): Promise<boolean> {
   try {
-    const [binaryStats, sourceStats] = await Promise.all([stat(helperBinaryPath), stat(helperSourcePath)]);
-    return binaryStats.mtimeMs >= sourceStats.mtimeMs;
+    const info = await lstat(filePath);
+    if (info.isSymbolicLink()) return false;
+    return info.isFile();
   } catch {
     return false;
   }
-}
-
-function resolveSliverDir(): string {
-  const configuredDir = process.env[SLIVER_DIR_ENV];
-  const sliverDir = configuredDir ? path.resolve(configuredDir) : defaultSliverDir;
-
-  if (!fs.existsSync(path.join(sliverDir, "go.mod"))) {
-    throw new Error(
-      `WireGuard support requires a Sliver checkout. Set ${SLIVER_DIR_ENV} or place sliver at ${defaultSliverDir}`,
-    );
-  }
-
-  return sliverDir;
 }
 
 function collectText(stream: NodeJS.ReadableStream): () => string {
   let buffer = "";
   stream.setEncoding("utf8");
   stream.on("data", (chunk: string) => {
-    buffer += chunk;
+    buffer = (buffer + chunk).slice(-HELPER_OUTPUT_MAX_CHARACTERS);
   });
   return () => buffer.trim();
 }
@@ -167,8 +285,12 @@ function waitForReady(
   return new Promise<ProxyReadyMessage>((resolve, reject) => {
     let settled = false;
     const lines = readline.createInterface({ input: child.stdout });
+    const timer = setTimeout(() => {
+      rejectWith(`WireGuard helper did not become ready within ${HELPER_STARTUP_TIMEOUT_MILLISECONDS}ms`);
+    }, HELPER_STARTUP_TIMEOUT_MILLISECONDS);
 
     const cleanup = () => {
+      clearTimeout(timer);
       child.off("error", onError);
       child.off("exit", onExit);
       lines.close();
@@ -196,19 +318,30 @@ function waitForReady(
     };
 
     lines.once("line", (line) => {
+      let message: Partial<ProxyReadyMessage>;
       try {
-        const message = JSON.parse(line) as Partial<ProxyReadyMessage>;
-        if (typeof message.listen_host !== "string" || typeof message.listen_port !== "number") {
-          throw new Error(`Invalid WireGuard helper startup payload: ${line}`);
-        }
-
-        settled = true;
-        cleanup();
-        resolve({ listen_host: message.listen_host, listen_port: message.listen_port });
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        rejectWith(message);
+        message = JSON.parse(line) as Partial<ProxyReadyMessage>;
+      } catch {
+        rejectWith("WireGuard helper returned invalid startup JSON");
+        return;
       }
+
+      const listenHost = message.listen_host;
+      const listenPort = message.listen_port;
+      if (
+        (listenHost !== "127.0.0.1" && listenHost !== "::1") ||
+        typeof listenPort !== "number" ||
+        !Number.isSafeInteger(listenPort) ||
+        listenPort < 1 ||
+        listenPort > 65_535
+      ) {
+        rejectWith("WireGuard helper returned an invalid startup payload");
+        return;
+      }
+
+      settled = true;
+      cleanup();
+      resolve({ listen_host: listenHost, listen_port: listenPort });
     });
 
     child.once("error", onError);
@@ -248,35 +381,58 @@ function waitForExit(child: ChildProcessWithoutNullStreams): Promise<void> {
   });
 }
 
-function runCommand(command: string, args: string[], cwd: string): Promise<void> {
+function runCommand(command: string, args: string[], cwd: string, timeoutMilliseconds: number): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        GOCACHE: process.env.GOCACHE ?? path.join(os.tmpdir(), "sliver-script-gocache"),
-      },
+      windowsHide: true,
+      env: wireGuardHelperBuildEnvironment(),
     });
 
     let stdout = "";
     let stderr = "";
+    let settled = false;
+    let timedOut = false;
+    let forceTimer: NodeJS.Timeout | undefined;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      timedOut = true;
+      child.kill();
+      forceTimer = setTimeout(() => {
+        if (!settled) child.kill("SIGKILL");
+      }, 2_000);
+    }, timeoutMilliseconds);
 
     child.stdout.setEncoding("utf8");
     child.stdout.on("data", (chunk: string) => {
-      stdout += chunk;
+      stdout = (stdout + chunk).slice(-HELPER_OUTPUT_MAX_CHARACTERS);
     });
 
     child.stderr.setEncoding("utf8");
     child.stderr.on("data", (chunk: string) => {
-      stderr += chunk;
+      stderr = (stderr + chunk).slice(-HELPER_OUTPUT_MAX_CHARACTERS);
     });
 
     child.once("error", (error) => {
-      reject(new Error(`Failed to run '${command}': ${error.message}`));
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (forceTimer) clearTimeout(forceTimer);
+      reject(timedOut
+        ? new Error(`'${command} ${args.join(" ")}' exceeded ${timeoutMilliseconds}ms`)
+        : new Error(`Failed to run '${command}': ${error.message}`));
     });
 
     child.once("exit", (code, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (forceTimer) clearTimeout(forceTimer);
+      if (timedOut) {
+        reject(new Error(`'${command} ${args.join(" ")}' exceeded ${timeoutMilliseconds}ms`));
+        return;
+      }
       if (code === 0) {
         resolve();
         return;

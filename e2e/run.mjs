@@ -296,38 +296,16 @@ async function stopProcess(child, name) {
 async function collectE2ETestFiles() {
   const distDir = path.join(repoRoot, "e2e", "dist");
   const entries = await readdir(distDir, { withFileTypes: true });
+  const pattern = process.env.SLIVER_E2E_TEST_PATTERN;
   return entries
     .filter((entry) => entry.isFile() && entry.name.endsWith(".js"))
+    .filter((entry) => !pattern || entry.name.includes(pattern))
     .map((entry) => path.join(distDir, entry.name))
     .sort();
 }
 
-async function cleanupStaleTestRoots(baseDir) {
-  let entries = [];
-  try {
-    entries = await readdir(baseDir, { withFileTypes: true });
-  } catch {
-    return;
-  }
-
-  const staleDirs = entries.filter(
-    (entry) => entry.isDirectory() && entry.name.startsWith(e2eTempRootPrefix),
-  );
-  for (const entry of staleDirs) {
-    const fullPath = path.join(baseDir, entry.name);
-    try {
-      await rm(fullPath, { recursive: true, force: true, maxRetries: 3, retryDelay: 200 });
-      log(`Removed previous e2e temp dir: ${fullPath}`);
-    } catch {
-      // Ignore cleanup issues; they should not block test execution.
-    }
-  }
-}
-
 async function main() {
   const tmpBaseDir = os.tmpdir();
-  await cleanupStaleTestRoots(tmpBaseDir);
-
   const testRoot = await mkdtemp(path.join(tmpBaseDir, e2eTempRootPrefix));
   const sliverRootDir = path.join(testRoot, "sliver");
   const sliverClientDir = path.join(testRoot, "sliver-client");
@@ -339,6 +317,7 @@ async function main() {
   const goCacheDir = path.join(testRoot, "go-cache");
   const goTmpDir = path.join(testRoot, "go-tmp");
   const operatorConfigPath = path.join(testRoot, "operator.cfg");
+  const readinessConfigPath = path.join(testRoot, "readiness-operator.cfg");
 
   const sharedEnv = {
     SLIVER_ROOT_DIR: sliverRootDir,
@@ -428,6 +407,7 @@ async function main() {
   }
 
   const operatorName = process.env.SLIVER_E2E_OPERATOR || "e2e";
+  const operatorWireGuard = process.env.SLIVER_E2E_OPERATOR_WG !== "0";
 
   let daemonProcess;
   let daemonOutputGetter = () => "";
@@ -455,6 +435,7 @@ async function main() {
     log(`Using isolated test root: ${testRoot}`);
     log(`Using daemon listener: ${daemonHost}:${lport}`);
     log(`Using operator config endpoint: ${operatorHost}:${lport}`);
+    log(`Using operator transport: ${operatorWireGuard ? "WireGuard-wrapped mTLS" : "direct mTLS"}`);
     log(`Using mTLS listener bind: ${mtlsBindHost}:${mtlsPort}`);
     log(`Using implant mTLS endpoint: ${mtlsHost}:${mtlsPort}`);
     log(`Using HTTP listener bind: ${httpBindHost}:${httpPort}`);
@@ -472,12 +453,11 @@ async function main() {
     });
 
     log(`Generating operator config for '${operatorName}'`);
-    await runCommand(
-      sliverServerPath,
-      [
+    const operatorArgs = (name, savePath) => {
+      const args = [
         "operator",
         "--name",
-        operatorName,
+        name,
         "--lhost",
         operatorHost,
         "--lport",
@@ -485,8 +465,24 @@ async function main() {
         "--permissions",
         "all",
         "--save",
-        operatorConfigPath,
-      ],
+        savePath,
+      ];
+      if (operatorWireGuard) args.splice(-2, 0, "--enable-wg");
+      return args;
+    };
+    await runCommand(
+      sliverServerPath,
+      operatorArgs(operatorName, operatorConfigPath),
+      {
+        cwd: sliverDir,
+        env: sharedEnv,
+      },
+    );
+    // Readiness uses a separate WireGuard peer so its short-lived TCP state
+    // cannot affect the operator identity exercised by the actual tests.
+    await runCommand(
+      sliverServerPath,
+      operatorArgs(`${operatorName}-readiness`, readinessConfigPath),
       {
         cwd: sliverDir,
         env: sharedEnv,
@@ -498,15 +494,17 @@ async function main() {
     }
 
     log("Starting sliver-server daemon");
+    const daemonArgs = [
+      "daemon",
+      "--lhost",
+      daemonHost,
+      "--lport",
+      String(lport),
+    ];
+    if (operatorWireGuard) daemonArgs.push("--enable-wg");
     const daemon = startDaemon(
       sliverServerPath,
-      [
-        "daemon",
-        "--lhost",
-        daemonHost,
-        "--lport",
-        String(lport),
-      ],
+      daemonArgs,
       {
         cwd: sliverDir,
         env: sharedEnv,
@@ -521,12 +519,14 @@ async function main() {
       env: sharedEnv,
     });
 
-    await waitForDaemonReady(operatorConfigPath, daemonProcess, sharedEnv);
+    await waitForDaemonReady(readinessConfigPath, daemonProcess, sharedEnv);
     log("Daemon is accepting connections");
 
     const testFiles = await collectE2ETestFiles();
     if (testFiles.length === 0) {
-      throw new Error("No compiled e2e tests found in ./e2e/dist");
+      throw new Error(`No compiled e2e tests found in ./e2e/dist${process.env.SLIVER_E2E_TEST_PATTERN
+        ? ` matching '${process.env.SLIVER_E2E_TEST_PATTERN}'`
+        : ""}`);
     }
 
     const testEnv = {

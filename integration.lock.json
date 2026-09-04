@@ -1,0 +1,79 @@
+{
+  "schemaVersion": 1,
+  "wrapper": {
+    "repository": "https://github.com/sliverarmory/sliver-script.git",
+    "publishedBase": "837fb21c5291eef6285c2e168eef0620b99a5394",
+    "integrationBase": "01f1029cc17898da681e52b64af4a708ff82c3d3"
+  },
+  "authoritativeGui": {
+    "repository": "https://github.com/sliverarmory/sliver-gui.git",
+    "commit": "f0fa15af24365c9fdab1a2cdff769c88c1ad7cf6",
+    "vendoredRoot": "vendor/sliver-script",
+    "provenanceManifest": "protocol/sliver-script-provenance.json",
+    "provenanceManifestSha256": "9607e5a36c39361b626e52e601180c131ba59b01ae69e019f2d3cd7b186e3572",
+    "handwrittenOverlay": "protocol/sliver-script-handwritten-overlay.patch",
+    "handwrittenOverlaySha256": "a0a286d9717ea8349f4494606fa8719ebe115b30b46202786fdaca37a8057f1b"
+  },
+  "sliver": {
+    "repository": "https://github.com/BishopFox/sliver.git",
+    "sourceCommit": "ca685f5eed64c3327c0e57504928cfd2d2e96bea",
+    "protobufLock": "protobuf.lock.json"
+  },
+  "importedPaths": [
+    "src/client.ts",
+    "src/config.ts",
+    "src/events/index.ts",
+    "src/index.ts",
+    "src/internal/asyncQueue.ts",
+    "src/internal/credentials.ts",
+    "src/internal/timeout.ts",
+    "src/internal/tunnelManager.ts",
+    "src/internal/wgProxy.ts",
+    "src/messageBudget.ts",
+    "src/pb/clientpb/client.ts",
+    "src/pb/commonpb/common.ts",
+    "src/pb/dnspb/dns.ts",
+    "src/pb/rpcpb/services.ts",
+    "src/pb/sliverpb/sliver.ts"
+  ],
+  "standaloneAdaptations": [
+    {
+      "paths": [
+        "src/client.ts",
+        "src/config.ts",
+        "src/internal/credentials.ts",
+        "src/internal/timeout.ts"
+      ],
+      "reason": "Preserve the standalone public API and constructor compatibility while enforcing exact channel domains, canonical deadlines, strict configuration validation, serialized lifecycle transitions, and short-lived credential buffers."
+    },
+    {
+      "paths": [
+        "src/internal/asyncQueue.ts",
+        "src/internal/tunnelManager.ts"
+      ],
+      "reason": "Retain bounded fair queues with secure overflow disposal and legacy RxJS compatibility while opening the TunnelData stream only for an actual managed tunnel."
+    },
+    {
+      "paths": [
+        "src/internal/wgProxy.ts",
+        "src/internal/wireGuardConfig.ts",
+        "wireguard-proxy"
+      ],
+      "reason": "Deliver opt-in WireGuard operator transport as a packaged, pinned, CGO-free helper with narrow secret input, exact hexadecimal key validation, IP-family enforcement, bounded connections, parent-death cleanup, and a process-private source build."
+    },
+    {
+      "paths": [
+        "scripts",
+        ".github/workflows/build-check.yml",
+        ".github/workflows/publish.yml"
+      ],
+      "reason": "Add hermetic protobuf, clean-consumer, cross-platform helper, signed-tag, exact-tarball, OIDC, and registry-integrity release gates for the standalone package."
+    }
+  ],
+  "guiOnlyOmissions": [
+    "Electron main-process adapter and operation registry",
+    "renderer IPC and native-dialog ownership",
+    "GUI state stores, capability records, and form normalization",
+    "archival snapshot bundle and historical patch copies"
+  ]
+}

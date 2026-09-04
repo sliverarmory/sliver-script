@@ -2,10 +2,14 @@ import { readdir, readFile } from "node:fs/promises";
 import * as fs from "node:fs";
 import * as path from "node:path";
 
+import { validateWireGuardKey, wireGuardAddressFamily } from "./internal/wireGuardConfig";
+
 export interface SliverClientWireGuardConfig {
+  enabled?: boolean;
   server_pub_key: string;
   client_private_key: string;
   client_pub_key?: string;
+  preshared_key?: string;
   client_ip: string;
   server_ip?: string;
 }
@@ -73,7 +77,15 @@ function validateConfig(config: Partial<SliverClientConfig>): asserts config is 
       throw new Error(`Invalid sliver config: missing/invalid ${key}`);
     }
   }
-  if (typeof config.lport !== "number" || !Number.isFinite(config.lport)) {
+  if (!config.ca_certificate?.trim()) {
+    throw new Error("Invalid sliver config: missing/invalid ca_certificate");
+  }
+  if (
+    typeof config.lport !== "number"
+    || !Number.isSafeInteger(config.lport)
+    || config.lport < 1
+    || config.lport > 65_535
+  ) {
     throw new Error("Invalid sliver config: missing/invalid lport");
   }
 
@@ -86,9 +98,14 @@ function validateConfig(config: Partial<SliverClientConfig>): asserts config is 
       "server_pub_key",
       "client_private_key",
       "client_pub_key",
+      "preshared_key",
       "client_ip",
       "server_ip",
     ] as const;
+
+    if (config.wg.enabled !== undefined && typeof config.wg.enabled !== "boolean") {
+      throw new Error("Invalid sliver config: missing/invalid wg.enabled");
+    }
 
     for (const key of wgKeys) {
       const value = config.wg[key];
@@ -96,8 +113,36 @@ function validateConfig(config: Partial<SliverClientConfig>): asserts config is 
         throw new Error(`Invalid sliver config: missing/invalid wg.${key}`);
       }
     }
+
+    for (const key of ["server_pub_key", "client_private_key", "client_ip"] as const) {
+      if (!config.wg[key]?.trim()) {
+        throw new Error(`Invalid sliver config: missing/invalid wg.${key}`);
+      }
+    }
+
+    for (const key of ["server_pub_key", "client_private_key", "client_pub_key", "preshared_key"] as const) {
+      const value = config.wg[key];
+      if (value !== undefined) {
+        validateWireGuardKey(value, key);
+      }
+    }
+
+    let clientFamily: 4 | 6 | undefined;
+    if (config.wg.client_ip !== undefined) {
+      clientFamily = wireGuardAddressFamily(config.wg.client_ip, "client_ip");
+    }
+    let serverFamily: 4 | 6 | undefined;
+    if (config.wg.server_ip !== undefined) {
+      serverFamily = wireGuardAddressFamily(config.wg.server_ip, "server_ip");
+    } else if (config.wg.enabled === true) {
+      serverFamily = 4;
+    }
+    if (clientFamily !== undefined && serverFamily !== undefined && clientFamily !== serverFamily) {
+      throw new Error("Invalid sliver config: wg.client_ip and wg.server_ip must use the same address family");
+    }
   }
 }
+
 
 // Back-compat exports (v1.x API)
 export const ParseConfigFile = parseConfigFile;

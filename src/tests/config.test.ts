@@ -8,6 +8,11 @@ const TEST_CONFIG = '{"operator":"moloch","token":"asdf","lhost":"localhost","lp
 
 import { ParseConfig } from '../config'; 
 
+const SERVER_PUBLIC_KEY = '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef';
+const CLIENT_PRIVATE_KEY = 'abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789';
+const CLIENT_PUBLIC_KEY = '2222222222222222222222222222222222222222222222222222222222222222';
+const PRESHARED_KEY = '1111111111111111111111111111111111111111111111111111111111111111';
+
 test('ParseConfig', () => {
     expect(ParseConfig(Buffer.from(TEST_CONFIG)).operator).toBe('moloch');
     expect(ParseConfig(Buffer.from(TEST_CONFIG)).lhost).toBe('localhost');
@@ -37,14 +42,114 @@ test('ParseConfig accepts optional wg block', () => {
         private_key: 'key',
         certificate: 'cert',
         wg: {
-            server_pub_key: 'server',
-            client_private_key: 'private',
-            client_pub_key: 'public',
+            enabled: true,
+            server_pub_key: SERVER_PUBLIC_KEY,
+            client_private_key: CLIENT_PRIVATE_KEY,
+            client_pub_key: CLIENT_PUBLIC_KEY,
+            preshared_key: PRESHARED_KEY,
             client_ip: '100.65.0.2',
             server_ip: '100.65.0.1',
         },
     })));
 
-    expect(config.wg?.server_pub_key).toBe('server');
+    expect(config.wg?.server_pub_key).toBe(SERVER_PUBLIC_KEY);
     expect(config.wg?.client_ip).toBe('100.65.0.2');
+    expect(config.wg?.enabled).toBe(true);
+});
+
+test.each([0, -1, 65_536, 1.5, Number.MAX_SAFE_INTEGER + 1])(
+    'ParseConfig rejects invalid operator port %p',
+    (lport) => {
+        const parsed = JSON.parse(TEST_CONFIG) as Record<string, unknown>;
+        parsed.lport = lport;
+        expect(() => ParseConfig(Buffer.from(JSON.stringify(parsed)))).toThrow(/invalid lport/u);
+    },
+);
+
+test.each(['server_pub_key', 'client_private_key', 'client_ip'] as const)(
+    'ParseConfig requires non-empty wg.%s when WireGuard is enabled',
+    (missingKey) => {
+        const parsed = JSON.parse(TEST_CONFIG) as Record<string, any>;
+        parsed.wg = {
+            enabled: true,
+            server_pub_key: SERVER_PUBLIC_KEY,
+            client_private_key: CLIENT_PRIVATE_KEY,
+            client_ip: '100.65.0.2',
+        };
+        parsed.wg[missingKey] = ' ';
+        expect(() => ParseConfig(Buffer.from(JSON.stringify(parsed)))).toThrow(
+            new RegExp(`invalid wg\\.${missingKey}`, 'u'),
+        );
+    },
+);
+
+test.each([
+    ['server_pub_key', 'abcd'],
+    ['client_private_key', 'z'.repeat(64)],
+    ['client_pub_key', `${'a'.repeat(64)}\nprivate_key=attacker`],
+    ['preshared_key', 'g'.repeat(64)],
+] as const)('ParseConfig rejects malformed or injected wg.%s', (field, value) => {
+    const parsed = JSON.parse(TEST_CONFIG) as Record<string, any>;
+    parsed.wg = {
+        enabled: true,
+        server_pub_key: SERVER_PUBLIC_KEY,
+        client_private_key: CLIENT_PRIVATE_KEY,
+        client_pub_key: CLIENT_PUBLIC_KEY,
+        preshared_key: PRESHARED_KEY,
+        client_ip: '100.65.0.2',
+        server_ip: '100.65.0.1',
+        [field]: value,
+    };
+    expect(() => ParseConfig(Buffer.from(JSON.stringify(parsed)))).toThrow(/exactly 64 hexadecimal characters/u);
+});
+
+test.each(['server_pub_key', 'client_private_key', 'client_pub_key', 'preshared_key'] as const)(
+    'ParseConfig rejects an all-zero wg.%s',
+    (field) => {
+        const parsed = JSON.parse(TEST_CONFIG) as Record<string, any>;
+        parsed.wg = {
+            enabled: true,
+            server_pub_key: SERVER_PUBLIC_KEY,
+            client_private_key: CLIENT_PRIVATE_KEY,
+            client_pub_key: CLIENT_PUBLIC_KEY,
+            preshared_key: PRESHARED_KEY,
+            client_ip: '100.65.0.2',
+            server_ip: '100.65.0.1',
+            [field]: '0'.repeat(64),
+        };
+        expect(() => ParseConfig(Buffer.from(JSON.stringify(parsed)))).toThrow(/all-zero WireGuard key/u);
+    },
+);
+
+test.each(['fe80::1%lo0', '::ffff:192.0.2.1', '0:0:0:0:0:ffff:c000:201', '100.65.0.2/24'])(
+    'ParseConfig rejects unsupported WireGuard address %s',
+    (clientIP) => {
+        const parsed = JSON.parse(TEST_CONFIG) as Record<string, any>;
+        parsed.wg = {
+            enabled: true,
+            server_pub_key: SERVER_PUBLIC_KEY,
+            client_private_key: CLIENT_PRIVATE_KEY,
+            client_ip: clientIP,
+            server_ip: clientIP.includes(':') ? 'fd00::1' : '100.65.0.1',
+        };
+        expect(() => ParseConfig(Buffer.from(JSON.stringify(parsed)))).toThrow(/valid IP address or prefix/u);
+    },
+);
+
+test('ParseConfig requires a complete WireGuard block even when disabled', () => {
+    const parsed = JSON.parse(TEST_CONFIG) as Record<string, unknown>;
+    parsed.wg = { enabled: false };
+    expect(() => ParseConfig(Buffer.from(JSON.stringify(parsed)))).toThrow(/invalid wg\.server_pub_key/u);
+});
+
+test('ParseConfig rejects a WireGuard client/server address-family mismatch', () => {
+    const parsed = JSON.parse(TEST_CONFIG) as Record<string, any>;
+    parsed.wg = {
+        enabled: true,
+        server_pub_key: SERVER_PUBLIC_KEY,
+        client_private_key: CLIENT_PRIVATE_KEY,
+        client_ip: 'fd00::2',
+        server_ip: '100.65.0.1',
+    };
+    expect(() => ParseConfig(Buffer.from(JSON.stringify(parsed)))).toThrow(/same address family/u);
 });

