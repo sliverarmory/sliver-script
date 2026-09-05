@@ -5,7 +5,6 @@ import { fileURLToPath } from "node:url";
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const allowedPaths = new Map([
   ["lib", resolve(repositoryRoot, "lib")],
-  ["e2e/dist", resolve(repositoryRoot, "e2e/dist")],
 ]);
 
 if (process.argv.length !== 3 || !allowedPaths.has(process.argv[2])) {

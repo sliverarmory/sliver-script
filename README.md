@@ -5,7 +5,6 @@ Sliver-script is a TypeScript/JavaScript client library for Sliver, it can be us
 This library targets modern Sliver protobuf/gRPC APIs and provides a strongly-typed TypeScript-first client.
 
 [![Build Check](https://github.com/sliverarmory/sliver-script/actions/workflows/build-check.yml/badge.svg)](https://github.com/sliverarmory/sliver-script/actions/workflows/build-check.yml)
-[![Publish](https://github.com/sliverarmory/sliver-script/actions/workflows/publish.yml/badge.svg)](https://github.com/sliverarmory/sliver-script/actions/workflows/publish.yml)
 [![npm version](https://img.shields.io/npm/v/sliver-script.svg)](https://www.npmjs.com/package/sliver-script)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
@@ -38,11 +37,7 @@ That command is restorative, not an upgrade command. Advancing Sliver, protoc, o
 
 The npm tarball carries those generated TypeScript modules and their provenance lock, but deliberately excludes the Sliver submodule and therefore is not a self-contained protobuf regeneration checkout.
 
-Before preparing a package, run `npm run audit:all` and `npm run verify`. The full audit covers the publication toolchain; verification separately audits the exact packed runtime dependency graph, then executes unit tests, protobuf checks, a clean TypeScript build, `npm pack --dry-run`, and CommonJS, ESM, and TypeScript NodeNext smoke tests against the packed tarball in a temporary consumer. The published tarball includes the TypeScript source and locked protobuf provenance in addition to compiled JavaScript and declarations.
-
-Publishing is tag-only: the workflow requires a GitHub-verified, signed annotated `vMAJOR.MINOR.PATCH` tag (optionally with a SemVer prerelease) whose target and version match both package metadata files. It reruns the full cross-platform package and E2E gate, verifies one retained release tarball, and publishes those exact bytes through npm trusted publishing with OIDC and provenance; stable versions use the `latest` dist-tag while prereleases are kept off `latest`. After publication, the workflow independently installs the exact registry artifact, verifies its SRI and dist-tag, runs npm's attestation audit, and re-verifies the SLSA bundle with the pinned Sigstore implementation against the exact repository, workflow, tag, commit, GitHub IDs, run, and publishing environment.
-
-Before the first release, configure the `sliver-script` package's npm trusted publisher for GitHub repository `sliverarmory/sliver-script`, workflow filename `publish.yml`, environment `publish`, and direct `npm publish` permission. The workflow deliberately has no long-lived npm publish token fallback.
+Before preparing a package, run `npm run audit:all` and `npm run verify`. Verification audits the exact packed runtime dependency graph, then executes unit tests, protobuf checks, a clean TypeScript build, `npm pack --dry-run`, and CommonJS, ESM, and TypeScript NodeNext smoke tests against the packed tarball in a temporary consumer. The packed tarball includes the TypeScript source and locked protobuf provenance in addition to compiled JavaScript and declarations.
 
 
 ### TypeScript Example
