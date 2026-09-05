@@ -7,9 +7,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const retainedPackDestination = parsePackDestination(process.argv.slice(2));
-const temporary = retainedPackDestination
-  ?? await mkdtemp(join(tmpdir(), "sliver-script-pack-check-"));
+const temporary = await mkdtemp(join(tmpdir(), "sliver-script-pack-check-"));
 const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 
 const requiredFiles = [
@@ -23,17 +21,13 @@ const requiredFiles = [
   "scripts/clean.mjs",
   "scripts/pack-check.mjs",
   "scripts/pack-dry-run.mjs",
-  "scripts/pack-receipt-check.mjs",
   "scripts/protobuf.mjs",
-  "scripts/publish-order-check.mjs",
-  "scripts/registry-provenance-check.mjs",
   "lib/index.js",
   "lib/index.d.ts",
   "src/index.ts",
 ];
 const forbiddenPrefixes = [
   "docs/",
-  "e2e/",
   "examples/",
   "lib/tests/",
   "node_modules/",
@@ -51,14 +45,6 @@ const forbiddenFiles = [
 ];
 
 try {
-  if (retainedPackDestination !== null) {
-    await mkdir(temporary, { recursive: true });
-    const existing = await readdir(temporary);
-    if (existing.length !== 0) {
-      throw new Error(`Pack destination must be empty: ${temporary}`);
-    }
-  }
-
   const packOutput = execFileSync(
     npm,
     ["pack", ".", "--json", "--ignore-scripts", "--pack-destination", temporary],
@@ -222,31 +208,13 @@ try {
   if (entry.shasum !== tarballShasum) {
     throw new Error(`Packed tarball shasum mismatch: ${entry.shasum} != ${tarballShasum}`);
   }
-  if (retainedPackDestination !== null) {
-    await writeFile(
-      join(temporary, "pack-receipt.json"),
-      `${JSON.stringify({
-        name: installedManifest.name,
-        version: installedManifest.version,
-        sourceCommit: process.env.GITHUB_SHA ?? null,
-        filename: entry.filename,
-        integrity: tarballIntegrity,
-        shasum: tarballShasum,
-        size: entry.size,
-        unpackedSize: entry.unpackedSize,
-        fileCount: files.size,
-      }, null, 2)}\n`,
-    );
-  }
   console.log(
     `Packed and loaded ${installedManifest.name}@${installedManifest.version} from a clean consumer ` +
       `(${files.size} files, ${entry.unpackedSize} unpacked bytes; ${tarballIntegrity}; ` +
       `CJS, ESM, strict nested TypeScript NodeNext, and production audit verified)`,
   );
 } finally {
-  if (retainedPackDestination === null) {
-    await rm(temporary, { recursive: true, force: true });
-  }
+  await rm(temporary, { recursive: true, force: true });
 }
 
 function npmEnvironment(cache) {
@@ -268,12 +236,4 @@ async function listFiles(root, current = root) {
     }
   }
   return files;
-}
-
-function parsePackDestination(args) {
-  if (args.length === 0) return null;
-  if (args.length !== 2 || args[0] !== "--pack-destination" || args[1].trim() === "") {
-    throw new Error("Usage: node scripts/pack-check.mjs [--pack-destination DIRECTORY]");
-  }
-  return resolve(args[1]);
 }

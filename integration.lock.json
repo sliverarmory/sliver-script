@@ -55,10 +55,9 @@
     {
       "paths": [
         "scripts",
-        ".github/workflows/build-check.yml",
-        ".github/workflows/publish.yml"
+        ".github/workflows/build-check.yml"
       ],
-      "reason": "Add hermetic protobuf, clean-consumer, signed-tag, exact-tarball, OIDC, and registry-integrity release gates for the standalone package."
+      "reason": "Add hermetic protobuf and clean-consumer package validation for the standalone package."
     }
   ],
   "standaloneOmissions": [
