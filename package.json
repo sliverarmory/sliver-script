@@ -4,47 +4,75 @@
   "description": "TypeScript/JavaScript Sliver client library",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
+  "packageManager": "npm@11.19.0",
   "engines": {
     "node": ">=24"
   },
   "scripts": {
-    "build": "rm -rf ./lib && tsc -p tsconfig.json",
-    "build:examples": "npm run build && rm -rf ./e2e/dist && tsc -p tsconfig.examples.json",
-    "pb": "./protobuf.sh",
+    "build": "node ./scripts/clean.mjs lib && tsc -p tsconfig.json",
+    "build:examples": "npm run build && node ./scripts/clean.mjs e2e/dist && tsc -p tsconfig.examples.json",
+    "pb": "npm run protobuf:generate",
+    "protobuf:generate": "node ./scripts/protobuf.mjs --write",
+    "protobuf:check": "node ./scripts/protobuf.mjs --check",
     "docs": "typedoc --out ./docs/ ./src",
     "test": "jest --config jestconfig.json",
     "test:e2e": "node e2e/run.mjs",
     "test:e2e:jest": "SLIVER_E2E=1 jest --config jestconfig.json",
-    "example:e2e": "npm run build:examples && node e2e/dist/status.js"
+    "example:e2e": "npm run build:examples && node e2e/dist/status.js",
+    "audit:all": "npm audit",
+    "audit:production": "npm audit --omit=dev",
+    "pack:dry-run": "node ./scripts/pack-dry-run.mjs",
+    "pack:check": "node ./scripts/pack-check.mjs",
+    "publish-order:check": "node ./scripts/publish-order-check.mjs --self-test",
+    "verify": "npm test && npm run publish-order:check && npm run protobuf:check && npm run build && npm run pack:dry-run && npm run pack:check",
+    "prepack": "npm run build",
+    "prepublishOnly": "npm run audit:all && npm run verify"
   },
-  "prepublishOnly": "npm test && npm run build",
   "files": [
-    "lib/**/*"
+    "lib/**/*",
+    "src/*.ts",
+    "src/events/**/*",
+    "src/internal/**/*",
+    "src/pb/**/*",
+    "scripts/*.mjs",
+    "integration.lock.json",
+    "protobuf.lock.json",
+    "protobuf.sh",
+    "tsconfig.json"
   ],
   "keywords": [],
   "author": "moloch",
   "license": "GPL-3.0-or-later",
   "repository": {
     "type": "git",
-    "url": "https://github.com/moloch--/sliver-script"
+    "url": "git+https://github.com/sliverarmory/sliver-script.git"
+  },
+  "homepage": "https://github.com/sliverarmory/sliver-script#readme",
+  "bugs": {
+    "url": "https://github.com/sliverarmory/sliver-script/issues"
   },
   "devDependencies": {
     "@types/jest": "^29.5.14",
     "@types/node": "^22.13.5",
     "jest": "^29.7.0",
     "marked": "^15.0.7",
+    "semver": "7.8.5",
     "ts-jest": "^29.2.6",
-    "ts-proto": "^2.7.7",
+    "ts-proto": "2.11.4",
     "typedoc": "^0.27.7",
-    "typescript": "^5.7.3"
+    "typescript": "5.8.3"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.11.0",
-    "@grpc/grpc-js": "^1.14.3",
+    "@grpc/grpc-js": "1.14.4",
     "nice-grpc": "^2.1.12",
+    "nice-grpc-common": "^2.0.2",
     "rxjs": "^7.8.2"
   },
   "overrides": {
-    "protobufjs": "^7.2.5"
+    "protobufjs": "7.6.5",
+    "@protobufjs/utf8": "1.1.2",
+    "dprint-node": "1.0.8",
+    "ts-poet": "6.12.0"
   }
 }

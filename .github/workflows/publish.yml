@@ -4,43 +4,776 @@ on:
   push:
     tags:
       - "v*.*.*"
-  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
-  publish:
+  tag_gate:
+    name: signed version tag
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      dist_tag: ${{ steps.guard.outputs.dist_tag }}
+      tag_object_sha: ${{ steps.guard.outputs.tag_object_sha }}
+      version: ${{ steps.guard.outputs.version }}
+    steps:
+      - name: Check out complete tag history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up exact Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.20.0
+          package-manager-cache: false
+
+      - name: Require a signed annotated tag matching package metadata
+        id: guard
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG_NAME="${GITHUB_REF_NAME}"
+          SEMVER_PATTERN='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*))*)?$'
+
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            echo "::error title=Tag required::Publishing is allowed only from a pushed version tag."
+            exit 1
+          fi
+
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+          LOCK_VERSION="$(node -p "require('./package-lock.json').packages[''].version")"
+          if [[ ! "${PACKAGE_VERSION}" =~ ${SEMVER_PATTERN} || "${TAG_NAME}" != "v${PACKAGE_VERSION}" ]]; then
+            echo "::error title=Invalid version tag::Tag '${TAG_NAME}' must exactly match package semver '${PACKAGE_VERSION}', including any prerelease."
+            exit 1
+          fi
+          if [[ "${PACKAGE_VERSION}" != "${LOCK_VERSION}" ]]; then
+            echo "::error title=Version mismatch::package.json '${PACKAGE_VERSION}' and package-lock.json '${LOCK_VERSION}' must match."
+            exit 1
+          fi
+
+          TAG_OBJECT_TYPE="$(git cat-file -t "refs/tags/${TAG_NAME}")"
+          if [[ "${TAG_OBJECT_TYPE}" != "tag" ]]; then
+            echo "::error title=Annotated tag required::Tag '${TAG_NAME}' is lightweight; publishing requires a signed annotated tag."
+            exit 1
+          fi
+          TAG_OBJECT_SHA="$(git rev-parse "refs/tags/${TAG_NAME}")"
+          VERIFIED="$(gh api "/repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT_SHA}" --jq '.verification.verified')"
+          VERIFY_REASON="$(gh api "/repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT_SHA}" --jq '.verification.reason')"
+          API_TARGET_TYPE="$(gh api "/repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT_SHA}" --jq '.object.type')"
+          API_TARGET_SHA="$(gh api "/repos/${GITHUB_REPOSITORY}/git/tags/${TAG_OBJECT_SHA}" --jq '.object.sha')"
+          if [[ "${VERIFIED}" != "true" ]]; then
+            echo "::error title=Verified signature required::GitHub did not verify '${TAG_NAME}' (${VERIFY_REASON})."
+            exit 1
+          fi
+          if [[ "${API_TARGET_TYPE}" != "commit" ]]; then
+            echo "::error title=Commit tag required::Tag '${TAG_NAME}' targets '${API_TARGET_TYPE}', not a commit."
+            exit 1
+          fi
+
+          TAG_COMMIT="$(git rev-parse "refs/tags/${TAG_NAME}^{}")"
+          HEAD_COMMIT="$(git rev-parse HEAD)"
+          if [[ "${TAG_COMMIT}" != "${HEAD_COMMIT}" || "${API_TARGET_SHA}" != "${HEAD_COMMIT}" ]]; then
+            echo "::error title=Tag target mismatch::The local and GitHub tag targets for '${TAG_NAME}' must equal checked-out HEAD."
+            exit 1
+          fi
+
+          DIST_TAG="latest"
+          if [[ "${PACKAGE_VERSION}" == *-* ]]; then
+            PRERELEASE="${PACKAGE_VERSION#*-}"
+            case "${PRERELEASE}" in
+              alpha|alpha.*) DIST_TAG="alpha" ;;
+              beta|beta.*) DIST_TAG="beta" ;;
+              rc|rc.*) DIST_TAG="next" ;;
+              *) DIST_TAG="next" ;;
+            esac
+          fi
+
+          echo "dist_tag=${DIST_TAG}" >> "${GITHUB_OUTPUT}"
+          echo "tag_object_sha=${TAG_OBJECT_SHA}" >> "${GITHUB_OUTPUT}"
+          echo "version=${PACKAGE_VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "Verified signed ${TAG_NAME} at ${HEAD_COMMIT}; npm dist-tag will be '${DIST_TAG}'."
+
+  quality_gate:
+    name: full package and E2E gate
+    needs: tag_gate
+    uses: ./.github/workflows/build-check.yml
+    permissions:
+      contents: read
+
+  prepare_release:
+    name: prepare exact release artifact
+    needs: [tag_gate, quality_gate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      artifact_digest: ${{ steps.release_artifact.outputs.artifact-digest }}
+      artifact_id: ${{ steps.release_artifact.outputs.artifact-id }}
+      artifact_name: ${{ steps.release_pack.outputs.artifact_name }}
+      tarball_name: ${{ steps.release_pack.outputs.tarball_name }}
+    steps:
+      - name: Check out source and pinned Sliver input
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up exact Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.20.0
+          package-manager-cache: false
+
+      - name: Set up exact npm
+        shell: bash
+        run: |
+          if [[ "$(npm --version)" != "11.19.0" ]]; then
+            echo "::error title=Wrong bundled npm::Node.js 24.20.0 must provide npm 11.19.0."
+            exit 1
+          fi
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Audit the locked publication toolchain
+        run: npm run audit:all
+
+      - name: Build and verify the exact release tarball
+        id: release_pack
+        shell: bash
+        run: |
+          PACK_DIR="${RUNNER_TEMP}/sliver-script-release"
+          mkdir -p "${PACK_DIR}"
+          npm run build
+          node ./scripts/pack-check.mjs --pack-destination "${PACK_DIR}"
+          TARBALL_NAME="$(node -p "require('${PACK_DIR}/pack-receipt.json').filename")"
+          TARBALL_PATH="${PACK_DIR}/${TARBALL_NAME}"
+          test -f "${TARBALL_PATH}"
+          PACKAGE_NAME="$(node -p "require('./package.json').name")"
+          node ./scripts/pack-receipt-check.mjs \
+            "${PACK_DIR}/pack-receipt.json" \
+            "${TARBALL_PATH}" \
+            "${PACKAGE_NAME}" \
+            "${{ needs.tag_gate.outputs.version }}" \
+            "${GITHUB_SHA}"
+
+          ARTIFACT_NAME="sliver-script-release-${GITHUB_SHA}-${GITHUB_RUN_ATTEMPT}.tar"
+          ARTIFACT_PATH="${RUNNER_TEMP}/${ARTIFACT_NAME}"
+          tar --create \
+            --file "${ARTIFACT_PATH}" \
+            --directory "${PACK_DIR}" \
+            "${TARBALL_NAME}" \
+            pack-receipt.json
+          ARTIFACT_DIGEST="$(node --input-type=commonjs --eval '
+            const { createHash } = require("node:crypto");
+            const { readFileSync } = require("node:fs");
+            process.stdout.write(createHash("sha256").update(readFileSync(process.argv[1])).digest("hex"));
+          ' "${ARTIFACT_PATH}")"
+
+          echo "artifact_name=${ARTIFACT_NAME}" >> "${GITHUB_OUTPUT}"
+          echo "artifact_path=${ARTIFACT_PATH}" >> "${GITHUB_OUTPUT}"
+          echo "artifact_digest=${ARTIFACT_DIGEST}" >> "${GITHUB_OUTPUT}"
+          echo "tarball_name=${TARBALL_NAME}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "### Verified npm release tarball"
+            echo '```json'
+            cat "${PACK_DIR}/pack-receipt.json"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload retained release artifact
+        id: release_artifact
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          path: ${{ steps.release_pack.outputs.artifact_path }}
+          archive: false
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Verify uploaded artifact digest
+        shell: bash
+        env:
+          COMPUTED_DIGEST: ${{ steps.release_pack.outputs.artifact_digest }}
+          UPLOADED_DIGEST: ${{ steps.release_artifact.outputs.artifact-digest }}
+          UPLOADED_ID: ${{ steps.release_artifact.outputs.artifact-id }}
+        run: |
+          if [[ ! "${COMPUTED_DIGEST}" =~ ^[0-9a-f]{64}$ \
+            || "${UPLOADED_DIGEST}" != "${COMPUTED_DIGEST}" \
+            || ! "${UPLOADED_ID}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error title=Artifact upload mismatch::The retained release artifact ID or digest is invalid."
+            exit 1
+          fi
+
+  publish:
+    name: publish ${{ needs.tag_gate.outputs.version }}
+    needs: [tag_gate, prepare_release]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     environment: publish
+    concurrency:
+      # Tag-independent and queued by entry time. Version order can differ from
+      # arrival order, so the registry monotonicity guard remains mandatory.
+      group: npm-publish
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Set up Node.js with bundled npm
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.20.0
+          package-manager-cache: false
+
+      - name: Download exact release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare_release.outputs.artifact_id }}
+          digest-mismatch: error
+          path: ${{ runner.temp }}/sliver-script-publish-artifact
+
+      - name: Verify artifact, receipt, source, and package manifest
+        id: release_artifact
+        shell: bash
+        env:
+          ARTIFACT_DIGEST: ${{ needs.prepare_release.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ needs.prepare_release.outputs.artifact_id }}
+          ARTIFACT_NAME: ${{ needs.prepare_release.outputs.artifact_name }}
+          PACKAGE_VERSION: ${{ needs.tag_gate.outputs.version }}
+          TARBALL_NAME: ${{ needs.prepare_release.outputs.tarball_name }}
+        run: |
+          if [[ "$(node --version)" != "v24.20.0" || "$(npm --version)" != "11.19.0" ]]; then
+            echo "::error title=Wrong publication toolchain::Publishing requires bundled Node.js 24.20.0 and npm 11.19.0."
+            exit 1
+          fi
+
+          ARTIFACT_DIR="${RUNNER_TEMP}/sliver-script-publish-artifact"
+          mapfile -t DOWNLOADED_FILES < <(find "${ARTIFACT_DIR}" -type f -print)
+          if [[ "${#DOWNLOADED_FILES[@]}" -ne 1 \
+            || "${DOWNLOADED_FILES[0]##*/}" != "${ARTIFACT_NAME}" ]]; then
+            echo "::error title=Invalid artifact download layout::Expected exactly one downloaded file with the retained artifact basename."
+            exit 1
+          fi
+          ARTIFACT_PATH="${DOWNLOADED_FILES[0]}"
+          # artifact-attempt-inline:start
+          ARTIFACT_PATTERN="^sliver-script-release-${GITHUB_SHA}-([1-9][0-9]*)\\.tar$"
+          if [[ ! "${ARTIFACT_NAME}" =~ ${ARTIFACT_PATTERN} ]]; then
+            echo "::error title=Invalid release artifact identity::The downloaded artifact name does not bind this source commit and a positive prepare attempt."
+            exit 1
+          fi
+          PREPARE_ATTEMPT="${BASH_REMATCH[1]}"
+          if [[ ! "${GITHUB_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ \
+            || ! "${ARTIFACT_ID}" =~ ^[1-9][0-9]*$ \
+            || ! "${ARTIFACT_DIGEST}" =~ ^[0-9a-f]{64}$ \
+            || ! -f "${ARTIFACT_PATH}" ]]; then
+            echo "::error title=Invalid release artifact identity::The current attempt, artifact digest, or downloaded path is invalid."
+            exit 1
+          fi
+          if (( PREPARE_ATTEMPT > GITHUB_RUN_ATTEMPT )); then
+            echo "::error title=Future release artifact::Prepare attempt ${PREPARE_ATTEMPT} is newer than current attempt ${GITHUB_RUN_ATTEMPT}."
+            exit 1
+          fi
+          # artifact-attempt-inline:end
+          ACTUAL_ARTIFACT_DIGEST="$(node --input-type=commonjs --eval '
+            const { createHash } = require("node:crypto");
+            const { readFileSync } = require("node:fs");
+            process.stdout.write(createHash("sha256").update(readFileSync(process.argv[1])).digest("hex"));
+          ' "${ARTIFACT_PATH}")"
+          if [[ "${ACTUAL_ARTIFACT_DIGEST}" != "${ARTIFACT_DIGEST}" ]]; then
+            echo "::error title=Downloaded artifact mismatch::The downloaded artifact bytes do not match the prepare job digest."
+            exit 1
+          fi
+
+          if [[ "${TARBALL_NAME}" == */* || ! "${TARBALL_NAME}" =~ ^sliver-script-[0-9A-Za-z.+-]+\.tgz$ ]]; then
+            echo "::error title=Invalid tarball name::The prepare job returned an unsafe tarball name."
+            exit 1
+          fi
+          mapfile -t ARTIFACT_MEMBERS < <(tar --list --file "${ARTIFACT_PATH}")
+          if [[ "${#ARTIFACT_MEMBERS[@]}" -ne 2 \
+            || "${ARTIFACT_MEMBERS[0]}" != "${TARBALL_NAME}" \
+            || "${ARTIFACT_MEMBERS[1]}" != "pack-receipt.json" ]]; then
+            echo "::error title=Invalid release artifact contents::Expected only the exact npm tarball and its receipt."
+            exit 1
+          fi
+
+          VERIFIED_DIR="${RUNNER_TEMP}/sliver-script-publish-verified"
+          mkdir -m 700 "${VERIFIED_DIR}"
+          tar --extract --file "${ARTIFACT_PATH}" --directory "${VERIFIED_DIR}"
+          TARBALL_PATH="${VERIFIED_DIR}/${TARBALL_NAME}"
+          RECEIPT_PATH="${VERIFIED_DIR}/pack-receipt.json"
+          PACKAGE_MANIFEST_PATH="${VERIFIED_DIR}/package.json"
+          node --input-type=commonjs --eval '
+            const { createHash } = require("node:crypto");
+            const { basename } = require("node:path");
+            const { readFileSync, statSync } = require("node:fs");
+            const [receiptPath, tarballPath, expectedName, expectedVersion, expectedCommit] = process.argv.slice(1);
+            const receipt = JSON.parse(readFileSync(receiptPath, "utf8"));
+            const tarball = readFileSync(tarballPath);
+            const expected = {
+              name: expectedName,
+              version: expectedVersion,
+              sourceCommit: expectedCommit,
+              filename: basename(tarballPath),
+              integrity: `sha512-${createHash("sha512").update(tarball).digest("base64")}`,
+              shasum: createHash("sha1").update(tarball).digest("hex"),
+              size: statSync(tarballPath).size,
+            };
+            const mismatches = Object.entries(expected).filter(([key, value]) => receipt[key] !== value);
+            if (mismatches.length > 0) throw new Error(`Release receipt fields mismatch: ${mismatches.map(([key]) => key).join(", ")}`);
+          ' "${RECEIPT_PATH}" "${TARBALL_PATH}" sliver-script "${PACKAGE_VERSION}" "${GITHUB_SHA}"
+          if ! tar --extract --to-stdout --file "${TARBALL_PATH}" package/package.json > "${PACKAGE_MANIFEST_PATH}"; then
+            echo "::error title=Missing package manifest::The verified npm tarball has no package/package.json."
+            exit 1
+          fi
+          node --input-type=commonjs --eval '
+            const { readFileSync } = require("node:fs");
+            const manifest = JSON.parse(readFileSync(process.argv[1], "utf8"));
+            if (manifest.name !== "sliver-script" || manifest.version !== process.argv[2]) {
+              throw new Error("Tarball package name/version mismatch");
+            }
+          ' "${PACKAGE_MANIFEST_PATH}" "${PACKAGE_VERSION}"
+
+          echo "manifest=${PACKAGE_MANIFEST_PATH}" >> "${GITHUB_OUTPUT}"
+          echo "receipt=${RECEIPT_PATH}" >> "${GITHUB_OUTPUT}"
+          echo "tarball=${TARBALL_PATH}" >> "${GITHUB_OUTPUT}"
+
+      - name: Revalidate signed tag immediately before publication
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_TAG_OBJECT: ${{ needs.tag_gate.outputs.tag_object_sha }}
+        run: |
+          if ! CURRENT_TAG_OBJECT="$(gh api "/repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" --jq '.object.sha')"; then
+            echo "::error title=Tag missing::Tag '${GITHUB_REF_NAME}' disappeared after verification; refusing to publish."
+            exit 1
+          fi
+          if [[ "${CURRENT_TAG_OBJECT}" != "${EXPECTED_TAG_OBJECT}" ]]; then
+            echo "::error title=Tag changed::Tag '${GITHUB_REF_NAME}' moved after verification; refusing to publish."
+            exit 1
+          fi
+          VERIFIED="$(gh api "/repos/${GITHUB_REPOSITORY}/git/tags/${CURRENT_TAG_OBJECT}" --jq '.verification.verified')"
+          TARGET_TYPE="$(gh api "/repos/${GITHUB_REPOSITORY}/git/tags/${CURRENT_TAG_OBJECT}" --jq '.object.type')"
+          TARGET_SHA="$(gh api "/repos/${GITHUB_REPOSITORY}/git/tags/${CURRENT_TAG_OBJECT}" --jq '.object.sha')"
+          if [[ "${VERIFIED}" != "true" || "${TARGET_TYPE}" != "commit" || "${TARGET_SHA}" != "${GITHUB_SHA}" ]]; then
+            echo "::error title=Signed tag revalidation failed::The immutable verified tag object no longer proves the expected source commit."
+            exit 1
+          fi
+
+      - name: Publish exact tarball and verify registry postcondition
+        shell: bash
+        env:
+          EXPECTED_DIST_TAG: ${{ needs.tag_gate.outputs.dist_tag }}
+          PACKAGE_VERSION: ${{ needs.tag_gate.outputs.version }}
+          PACKAGE_MANIFEST_PATH: ${{ steps.release_artifact.outputs.manifest }}
+          RECEIPT_PATH: ${{ steps.release_artifact.outputs.receipt }}
+          TARBALL_PATH: ${{ steps.release_artifact.outputs.tarball }}
+        run: |
+          # Registry attestations cannot prove whether npm authorized a publish
+          # with OIDC or a long-lived token. Remove that ambiguity operationally:
+          # reject every alternate credential source and publish with empty
+          # user/global configs, leaving GitHub trusted publishing as the only
+          # available authentication mechanism.
+          ACTIVE_USER_NPMRC="$(npm config get userconfig)"
+          ACTIVE_GLOBAL_NPMRC="$(npm config get globalconfig)"
+          node --input-type=commonjs --eval '
+            const { existsSync, readFileSync } = require("node:fs");
+            const hasUrlCredentials = (value) => {
+              try {
+                const url = new URL(value);
+                return url.username.length > 0 || url.password.length > 0;
+              } catch {
+                return false;
+              }
+            };
+            const explicitNames = ["NODE_AUTH_TOKEN", "NPM_TOKEN", "NPM_ID_TOKEN"];
+            const forbiddenEnvironment = explicitNames.filter((name) => process.env[name]?.length > 0);
+            for (const [name, value] of Object.entries(process.env)) {
+              if (value.length > 0 && /^NPM_CONFIG_/i.test(name)
+                && (/(?:AUTH|TOKEN|PASSWORD|PASS|CREDENTIAL|USERNAME|OTP|KEY|CERT)/i.test(name)
+                  || hasUrlCredentials(value))) {
+                forbiddenEnvironment.push(name);
+              }
+            }
+            if (forbiddenEnvironment.length > 0) {
+              console.error(`Refusing alternate npm credential environment variables: ${[...new Set(forbiddenEnvironment)].sort().join(", ")}`);
+              process.exit(1);
+            }
+
+            const forbiddenDirectives = [];
+            for (const filename of new Set(process.argv.slice(1))) {
+              if (!filename || !existsSync(filename)) continue;
+              const lines = readFileSync(filename, "utf8").split(/\r?\n/);
+              for (let index = 0; index < lines.length; index += 1) {
+                const line = lines[index].trim();
+                if (!line || line.startsWith("#") || line.startsWith(";")) continue;
+                const equals = line.indexOf("=");
+                const key = (equals === -1 ? line : line.slice(0, equals)).trim();
+                const value = equals === -1 ? "" : line.slice(equals + 1).trim();
+                if (/(?:auth|token|password|passwd|username|otp|key|cert)/i.test(key)
+                  || hasUrlCredentials(value)) {
+                  forbiddenDirectives.push(`${filename}:${index + 1}`);
+                }
+              }
+            }
+            if (forbiddenDirectives.length > 0) {
+              console.error(`Refusing npm credential directives at: ${forbiddenDirectives.join(", ")}`);
+              process.exit(1);
+            }
+
+            const manifest = JSON.parse(readFileSync(process.env.PACKAGE_MANIFEST_PATH, "utf8"));
+            const forbiddenPublishConfig = [];
+            for (const [key, value] of Object.entries(manifest.publishConfig ?? {})) {
+              if (/(?:auth|token|password|passwd|credential|username|otp|key|cert)/i.test(key)
+                || (typeof value === "string" && hasUrlCredentials(value))) {
+                forbiddenPublishConfig.push(key);
+              }
+            }
+            if (forbiddenPublishConfig.length > 0) {
+              console.error(`Refusing credential-bearing package publishConfig keys: ${forbiddenPublishConfig.sort().join(", ")}`);
+              process.exit(1);
+            }
+          ' "${GITHUB_WORKSPACE}/.npmrc" "${ACTIVE_USER_NPMRC}" "${ACTIVE_GLOBAL_NPMRC}"
+
+          PUBLISH_CONFIG_DIR="$(mktemp -d "${RUNNER_TEMP}/sliver-script-publish-config.XXXXXX")"
+          trap 'rm -rf -- "${PUBLISH_CONFIG_DIR}"' EXIT
+          EMPTY_USER_NPMRC="${PUBLISH_CONFIG_DIR}/user.npmrc"
+          EMPTY_GLOBAL_NPMRC="${PUBLISH_CONFIG_DIR}/global.npmrc"
+          node --input-type=commonjs --eval '
+            const { writeFileSync } = require("node:fs");
+            for (const filename of process.argv.slice(1)) {
+              writeFileSync(filename, "", { flag: "wx", mode: 0o600 });
+            }
+          ' "${EMPTY_USER_NPMRC}" "${EMPTY_GLOBAL_NPMRC}"
+
+          PACKAGE_NAME="$(node --input-type=commonjs --eval 'process.stdout.write(JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8")).name)' "${PACKAGE_MANIFEST_PATH}")"
+          EXPECTED_INTEGRITY="$(node -p "JSON.parse(require('node:fs').readFileSync(process.env.RECEIPT_PATH, 'utf8')).integrity")"
+          EXPECTED_SHASUM="$(node -p "JSON.parse(require('node:fs').readFileSync(process.env.RECEIPT_PATH, 'utf8')).shasum")"
+
+          # Concurrency ordering follows the time jobs enter the queue, not tag
+          # version order. Re-read the target tag inside the serialized job and
+          # refuse to move it backwards if a newer candidate ran first.
+          DIST_TAGS_PATH="${PUBLISH_CONFIG_DIR}/dist-tags.json"
+          DIST_TAG_LOOKUP_COMPLETE=0
+          for LOOKUP_ATTEMPT in {1..3}; do
+            if npm view "${PACKAGE_NAME}" dist-tags \
+              --json \
+              --loglevel=silent \
+              --prefer-online \
+              --registry=https://registry.npmjs.org/ \
+              --userconfig "${EMPTY_USER_NPMRC}" \
+              --globalconfig "${EMPTY_GLOBAL_NPMRC}" \
+              > "${DIST_TAGS_PATH}"; then
+              DIST_TAG_LOOKUP_COMPLETE=1
+              break
+            fi
+
+            if node --input-type=commonjs --eval '
+              /* publish-e404-inline:start */
+              const { readFileSync } = require("node:fs");
+              const [filename, packageName] = process.argv.slice(1);
+              const report = JSON.parse(readFileSync(filename, "utf8"));
+              const expectedSummary = `Not Found - GET https://registry.npmjs.org/${packageName} - Not found`;
+              if (report?.error?.code !== "E404" || report.error.summary !== expectedSummary) process.exit(1);
+              /* publish-e404-inline:end */
+            ' "${DIST_TAGS_PATH}" "${PACKAGE_NAME}"; then
+              printf '{}\n' > "${DIST_TAGS_PATH}"
+              echo "Package ${PACKAGE_NAME} is absent from npm; treating every target dist-tag as absent."
+              DIST_TAG_LOOKUP_COMPLETE=1
+              break
+            fi
+            if [[ "${LOOKUP_ATTEMPT}" -lt 3 ]]; then
+              sleep 5
+            fi
+          done
+          if [[ "${DIST_TAG_LOOKUP_COMPLETE}" -ne 1 ]]; then
+            echo "::error title=Dist-tag lookup failed::Could not prove current npm dist-tags or a genuine package E404 after three attempts; refusing to publish."
+            exit 1
+          fi
+          NPM_GLOBAL_ROOT="$(npm root --global \
+            --userconfig "${EMPTY_USER_NPMRC}" \
+            --globalconfig "${EMPTY_GLOBAL_NPMRC}")"
+          node --input-type=commonjs --eval '
+            /* publish-order-inline:start */
+            (() => {
+            const { readFileSync } = require("node:fs");
+            const { join } = require("node:path");
+            const [candidate, targetTag, distTagsPath, npmRoot] = process.argv.slice(1);
+            const semverRoot = join(npmRoot, "npm", "node_modules", "semver");
+            const semverManifest = JSON.parse(readFileSync(join(semverRoot, "package.json"), "utf8"));
+            if (semverManifest.version !== "7.8.5") throw new Error(`Expected npm-bundled semver 7.8.5, got ${semverManifest.version}`);
+            const semver = require(semverRoot);
+            const strictVersion = (value, label) => {
+              if (typeof value !== "string" || value.length === 0 || value !== value.trim()
+                || /^[v=]/i.test(value) || semver.valid(value) === null) {
+                throw new Error(`${label} is not strict SemVer: ${JSON.stringify(value)}`);
+              }
+              return value;
+            };
+            strictVersion(candidate, "Candidate version");
+            if (!/^[a-z][a-z0-9._-]*$/.test(targetTag)) throw new Error("Invalid target dist-tag");
+            const distTags = JSON.parse(readFileSync(distTagsPath, "utf8"));
+            if (distTags === null || typeof distTags !== "object" || Array.isArray(distTags)) throw new Error("Registry dist-tags response is not an object");
+            if (!Object.prototype.hasOwnProperty.call(distTags, targetTag)) {
+              console.log(`Target dist-tag ${targetTag} is absent; ${candidate} may publish.`);
+              return;
+            }
+            const current = strictVersion(distTags[targetTag], `Current ${targetTag} version`);
+            if (current === candidate) {
+              console.log(`Target dist-tag ${targetTag} already equals ${candidate}; allowing retry.`);
+              return;
+            }
+            const comparison = semver.compare(candidate, current);
+            if (comparison <= 0) {
+              throw new Error(comparison === 0
+                ? `Candidate ${candidate} has equal precedence but is not exactly ${current}`
+                : `Candidate ${candidate} would move ${targetTag} backwards from ${current}`);
+            }
+            console.log(`Candidate ${candidate} advances ${targetTag} from ${current}.`);
+            })();
+            /* publish-order-inline:end */
+          ' "${PACKAGE_VERSION}" "${EXPECTED_DIST_TAG}" "${DIST_TAGS_PATH}" "${NPM_GLOBAL_ROOT}"
+
+          PUBLISH_STATUS=0
+          npm publish "${TARBALL_PATH}" \
+            --ignore-scripts \
+            --access public \
+            --provenance \
+            --registry https://registry.npmjs.org/ \
+            --userconfig "${EMPTY_USER_NPMRC}" \
+            --globalconfig "${EMPTY_GLOBAL_NPMRC}" \
+            --tag "${EXPECTED_DIST_TAG}" || PUBLISH_STATUS=$?
+
+          for ATTEMPT in {1..12}; do
+            ACTUAL_INTEGRITY="$(npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" dist.integrity --prefer-online --registry=https://registry.npmjs.org/ --userconfig "${EMPTY_USER_NPMRC}" --globalconfig "${EMPTY_GLOBAL_NPMRC}" 2>/dev/null || true)"
+            ACTUAL_SHASUM="$(npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" dist.shasum --prefer-online --registry=https://registry.npmjs.org/ --userconfig "${EMPTY_USER_NPMRC}" --globalconfig "${EMPTY_GLOBAL_NPMRC}" 2>/dev/null || true)"
+            ACTUAL_DIST_TAG="$(npm view "${PACKAGE_NAME}" "dist-tags.${EXPECTED_DIST_TAG}" --prefer-online --registry=https://registry.npmjs.org/ --userconfig "${EMPTY_USER_NPMRC}" --globalconfig "${EMPTY_GLOBAL_NPMRC}" 2>/dev/null || true)"
+            if [[ "${ACTUAL_INTEGRITY}" == "${EXPECTED_INTEGRITY}" \
+              && "${ACTUAL_SHASUM}" == "${EXPECTED_SHASUM}" \
+              && "${ACTUAL_DIST_TAG}" == "${PACKAGE_VERSION}" ]]; then
+              if [[ "${PUBLISH_STATUS}" -ne 0 ]]; then
+                echo "npm publish exited ${PUBLISH_STATUS}, but the exact package and dist-tag already exist; treating this retry as successful."
+              fi
+              echo "Verified npm registry integrity and '${EXPECTED_DIST_TAG}' dist-tag for ${PACKAGE_NAME}@${PACKAGE_VERSION}."
+              exit 0
+            fi
+            if [[ "${ATTEMPT}" -lt 12 ]]; then
+              sleep 5
+            fi
+          done
+
+          if [[ "${PUBLISH_STATUS}" -ne 0 ]]; then
+            echo "::error title=Publish failed::npm publish exited ${PUBLISH_STATUS}, and no matching registry postcondition was observed."
+          else
+            echo "::error title=Registry postcondition mismatch::Published ${PACKAGE_NAME}@${PACKAGE_VERSION} does not match the tested tarball receipt and expected '${EXPECTED_DIST_TAG}' dist-tag."
+          fi
+          exit 1
+
+  registry_provenance:
+    name: verify exact registry provenance
+    needs: [tag_gate, prepare_release, publish]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out provenance verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          submodules: recursive
-      - uses: actions/setup-node@v4
+          persist-credentials: false
+
+      - name: Set up Node.js with bundled npm
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.x
-          registry-url: https://registry.npmjs.org
-          cache: npm
-      - name: Verify tag matches package version
-        if: github.event_name == 'push'
-        run: |
-          TAG_NAME="${GITHUB_REF_NAME}"
+          node-version: 24.20.0
+          package-manager-cache: false
 
-          if [[ ! "${TAG_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error title=Invalid tag format::Tag '${TAG_NAME}' must use 'vMAJOR.MINOR.PATCH' (example: v2.0.0)."
-            exit 1
-          fi
+      - name: Download exact release artifact
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ needs.prepare_release.outputs.artifact_id }}
+          digest-mismatch: error
+          path: ${{ runner.temp }}/sliver-script-provenance-artifact
 
-          TAG_VERSION="${TAG_NAME#v}"
-          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
-
-          if [ "${TAG_VERSION}" != "${PACKAGE_VERSION}" ]; then
-            echo "::error title=Version mismatch::Tag '${TAG_NAME}' does not match package.json version '${PACKAGE_VERSION}'."
-            exit 1
-          fi
-
-          echo "Tag version matches package.json (${PACKAGE_VERSION})."
-      - run: npm ci
-      - run: npm publish
+      - name: Verify downloaded release artifact
+        id: release_artifact
+        shell: bash
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          ARTIFACT_DIGEST: ${{ needs.prepare_release.outputs.artifact_digest }}
+          ARTIFACT_ID: ${{ needs.prepare_release.outputs.artifact_id }}
+          ARTIFACT_NAME: ${{ needs.prepare_release.outputs.artifact_name }}
+          PACKAGE_VERSION: ${{ needs.tag_gate.outputs.version }}
+          TARBALL_NAME: ${{ needs.prepare_release.outputs.tarball_name }}
+        run: |
+          if [[ "$(node --version)" != "v24.20.0" || "$(npm --version)" != "11.19.0" ]]; then
+            echo "::error title=Wrong verification toolchain::Provenance verification requires bundled Node.js 24.20.0 and npm 11.19.0."
+            exit 1
+          fi
+          ARTIFACT_DIR="${RUNNER_TEMP}/sliver-script-provenance-artifact"
+          mapfile -t DOWNLOADED_FILES < <(find "${ARTIFACT_DIR}" -type f -print)
+          if [[ "${#DOWNLOADED_FILES[@]}" -ne 1 \
+            || "${DOWNLOADED_FILES[0]##*/}" != "${ARTIFACT_NAME}" ]]; then
+            echo "::error title=Invalid artifact download layout::Expected exactly one downloaded file with the retained artifact basename."
+            exit 1
+          fi
+          ARTIFACT_PATH="${DOWNLOADED_FILES[0]}"
+          # artifact-attempt-inline:start
+          ARTIFACT_PATTERN="^sliver-script-release-${GITHUB_SHA}-([1-9][0-9]*)\\.tar$"
+          if [[ ! "${ARTIFACT_NAME}" =~ ${ARTIFACT_PATTERN} ]]; then
+            echo "::error title=Invalid release artifact identity::The provenance artifact name does not bind this source commit and a positive prepare attempt."
+            exit 1
+          fi
+          PREPARE_ATTEMPT="${BASH_REMATCH[1]}"
+          if [[ ! "${GITHUB_RUN_ATTEMPT}" =~ ^[1-9][0-9]*$ \
+            || ! "${ARTIFACT_ID}" =~ ^[1-9][0-9]*$ \
+            || ! -f "${ARTIFACT_PATH}" ]]; then
+            echo "::error title=Invalid release artifact identity::The current attempt or provenance artifact path is invalid."
+            exit 1
+          fi
+          if (( PREPARE_ATTEMPT > GITHUB_RUN_ATTEMPT )); then
+            echo "::error title=Future release artifact::Prepare attempt ${PREPARE_ATTEMPT} is newer than current attempt ${GITHUB_RUN_ATTEMPT}."
+            exit 1
+          fi
+          # artifact-attempt-inline:end
+          ACTUAL_ARTIFACT_DIGEST="$(node --input-type=commonjs --eval '
+            const { createHash } = require("node:crypto");
+            const { readFileSync } = require("node:fs");
+            process.stdout.write(createHash("sha256").update(readFileSync(process.argv[1])).digest("hex"));
+          ' "${ARTIFACT_PATH}")"
+          if [[ ! "${ARTIFACT_DIGEST}" =~ ^[0-9a-f]{64}$ \
+            || "${ACTUAL_ARTIFACT_DIGEST}" != "${ARTIFACT_DIGEST}" ]]; then
+            echo "::error title=Downloaded artifact mismatch::The provenance job did not receive the exact prepared artifact."
+            exit 1
+          fi
+          if [[ "${TARBALL_NAME}" == */* || ! "${TARBALL_NAME}" =~ ^sliver-script-[0-9A-Za-z.+-]+\.tgz$ ]]; then
+            echo "::error title=Invalid tarball name::The prepare job returned an unsafe tarball name."
+            exit 1
+          fi
+          mapfile -t ARTIFACT_MEMBERS < <(tar --list --file "${ARTIFACT_PATH}")
+          if [[ "${#ARTIFACT_MEMBERS[@]}" -ne 2 \
+            || "${ARTIFACT_MEMBERS[0]}" != "${TARBALL_NAME}" \
+            || "${ARTIFACT_MEMBERS[1]}" != "pack-receipt.json" ]]; then
+            echo "::error title=Invalid release artifact contents::Expected only the exact npm tarball and its receipt."
+            exit 1
+          fi
+          VERIFIED_DIR="${RUNNER_TEMP}/sliver-script-provenance-verified"
+          mkdir -m 700 "${VERIFIED_DIR}"
+          tar --extract --file "${ARTIFACT_PATH}" --directory "${VERIFIED_DIR}"
+          TARBALL_PATH="${VERIFIED_DIR}/${TARBALL_NAME}"
+          RECEIPT_PATH="${VERIFIED_DIR}/pack-receipt.json"
+          node ./scripts/pack-receipt-check.mjs \
+            "${RECEIPT_PATH}" \
+            "${TARBALL_PATH}" \
+            sliver-script \
+            "${PACKAGE_VERSION}" \
+            "${GITHUB_SHA}"
+          echo "receipt=${RECEIPT_PATH}" >> "${GITHUB_OUTPUT}"
+
+      - name: Verify exact published provenance
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ needs.tag_gate.outputs.version }}
+          RECEIPT_PATH: ${{ steps.release_artifact.outputs.receipt }}
+        run: |
+
+          PACKAGE_NAME="$(node -p "require('./package.json').name")"
+          EXPECTED_INTEGRITY="$(node -p "JSON.parse(require('node:fs').readFileSync(process.env.RECEIPT_PATH, 'utf8')).integrity")"
+          PROVENANCE_DIR="$(mktemp -d "${RUNNER_TEMP}/sliver-script-provenance.XXXXXX")"
+          trap 'rm -rf -- "${PROVENANCE_DIR}"' EXIT
+
+          node --input-type=commonjs --eval \
+            'require("node:fs").writeFileSync(process.argv[1], JSON.stringify({ name: "sliver-script-provenance-verifier", private: true }, null, 2) + "\n")' \
+            "${PROVENANCE_DIR}/package.json"
+          (
+            cd "${PROVENANCE_DIR}"
+            npm install \
+              --ignore-scripts \
+              --no-audit \
+              --no-fund \
+              --package-lock=true \
+              --save-exact \
+              --registry=https://registry.npmjs.org/ \
+              "${PACKAGE_NAME}@${PACKAGE_VERSION}"
+          )
+
+          mapfile -t INSTALL_METADATA < <(
+            node --input-type=commonjs --eval '
+              const { readFileSync } = require("node:fs");
+              const { join } = require("node:path");
+              const directory = process.argv[1];
+              const name = process.argv[2];
+              const manifest = JSON.parse(readFileSync(join(directory, "node_modules", name, "package.json"), "utf8"));
+              const lock = JSON.parse(readFileSync(join(directory, "package-lock.json"), "utf8"));
+              const locked = lock.packages?.[`node_modules/${name}`];
+              if (!locked) throw new Error(`Missing locked registry package ${name}`);
+              for (const value of [manifest.version, locked.version, locked.integrity]) console.log(value ?? "");
+            ' "${PROVENANCE_DIR}" "${PACKAGE_NAME}"
+          )
+          if [[ "${#INSTALL_METADATA[@]}" -ne 3 \
+            || "${INSTALL_METADATA[0]}" != "${PACKAGE_VERSION}" \
+            || "${INSTALL_METADATA[1]}" != "${PACKAGE_VERSION}" \
+            || "${INSTALL_METADATA[2]}" != "${EXPECTED_INTEGRITY}" ]]; then
+            echo "::error title=Installed package mismatch::The isolated registry install did not lock the exact published version and receipt integrity."
+            exit 1
+          fi
+
+          node ./scripts/registry-provenance-check.mjs --self-test
+
+          AUDIT_JSON="${PROVENANCE_DIR}/audit-signatures.json"
+          AUDIT_ERROR="${PROVENANCE_DIR}/audit-signatures.stderr"
+          VERIFY_OUTPUT="${PROVENANCE_DIR}/provenance-check.stdout"
+          VERIFY_ERROR="${PROVENANCE_DIR}/provenance-check.stderr"
+          PROVENANCE_VERIFIED=0
+          for ATTEMPT in {1..12}; do
+            AUDIT_SUCCEEDED=0
+            PARSER_SUCCEEDED=0
+            if (
+              cd "${PROVENANCE_DIR}"
+              npm audit signatures \
+                --json \
+                --include-attestations \
+                --omit=dev \
+                --ignore-scripts \
+                --registry=https://registry.npmjs.org/ \
+                > "${AUDIT_JSON}" 2> "${AUDIT_ERROR}"
+            ); then
+              AUDIT_SUCCEEDED=1
+            fi
+            if node ./scripts/registry-provenance-check.mjs \
+              "${AUDIT_JSON}" \
+              "${RECEIPT_PATH}" \
+              "${PACKAGE_VERSION}" \
+              "${GITHUB_REF}" \
+              "${GITHUB_SHA}" \
+              "${GITHUB_REPOSITORY_ID}" \
+              "${GITHUB_REPOSITORY_OWNER_ID}" \
+              "${GITHUB_RUN_ID}" \
+              "${GITHUB_RUN_ATTEMPT}" \
+              > "${VERIFY_OUTPUT}" 2> "${VERIFY_ERROR}"; then
+              PARSER_SUCCEEDED=1
+            fi
+            if [[ "${AUDIT_SUCCEEDED}" -eq 1 && "${PARSER_SUCCEEDED}" -eq 1 ]]; then
+              cat "${VERIFY_OUTPUT}"
+              PROVENANCE_VERIFIED=1
+              break
+            fi
+            if [[ "${ATTEMPT}" -lt 12 ]]; then
+              sleep 5
+            fi
+          done
+
+          if [[ "${PROVENANCE_VERIFIED}" -ne 1 ]]; then
+            echo "::error title=Registry provenance verification failed::npm 11.19.0 and its pinned Sigstore verifier could not prove the exact npm/GitHub/Fulcio binding for ${PACKAGE_NAME}@${PACKAGE_VERSION}."
+            if [[ -s "${AUDIT_ERROR}" ]]; then
+              cat "${AUDIT_ERROR}" >&2
+            fi
+            if [[ -s "${VERIFY_ERROR}" ]]; then
+              cat "${VERIFY_ERROR}" >&2
+            fi
+            exit 1
+          fi

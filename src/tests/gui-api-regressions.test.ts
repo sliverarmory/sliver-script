@@ -27,7 +27,14 @@ function dummyConfig(): SliverClientConfig {
 
 function clientWithRpc(rpc: Record<string, unknown>): SliverClient {
   const client = new SliverClient(dummyConfig());
-  (client as any).rpcClient = rpc;
+  Object.assign((client as any).rpcClients, {
+    control: rpc,
+    inventory: rpc,
+    artifact: rpc,
+    "workbench-artifact": rpc,
+    "task-content": rpc,
+    "tunnel-stream": rpc,
+  });
   return client;
 }
 
@@ -266,5 +273,53 @@ describe("GUI event stream reliability", () => {
     await client.disconnect();
     eventSubscription.unsubscribe();
     stateSubscription.unsubscribe();
+  });
+
+  test("preserves exponential backoff until a stream yields its first event", async () => {
+    jest.useFakeTimers();
+
+    const recoveredEvent = Event.create({ EventType: "session-opened", Err: "" });
+    const failingStream = (message: string) => ({
+      [Symbol.asyncIterator]: async function* () {
+        throw new Error(message);
+      },
+    });
+    const events = jest
+      .fn()
+      .mockImplementationOnce(() => failingStream("first establishment failure"))
+      .mockImplementationOnce(() => failingStream("second establishment failure"))
+      .mockImplementationOnce((_request: unknown, options: { signal: AbortSignal }) => ({
+        [Symbol.asyncIterator]: async function* () {
+          yield recoveredEvent;
+          await new Promise<void>((resolve) => {
+            options.signal.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      }));
+    const client = clientWithRpc({ events });
+    (client as any).eventsAbort = new AbortController();
+    const states: Array<{ status: string; attempt: number; error?: string }> = [];
+    const subscription = client.eventStreamState$.subscribe((state) => states.push(state));
+
+    (client as any).startEventsStream();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(events).toHaveBeenCalledTimes(1);
+    expect(states.filter((state) => state.status === "connected")).toEqual([]);
+
+    await jest.advanceTimersByTimeAsync(500);
+    expect(events).toHaveBeenCalledTimes(2);
+    expect(states).toContainEqual({
+      status: "retrying", attempt: 2, error: "second establishment failure",
+    });
+
+    await jest.advanceTimersByTimeAsync(999);
+    expect(events).toHaveBeenCalledTimes(2);
+    await jest.advanceTimersByTimeAsync(1);
+    expect(events).toHaveBeenCalledTimes(3);
+    expect(states).toContainEqual({ status: "connected", attempt: 2 });
+
+    await client.disconnect();
+    subscription.unsubscribe();
   });
 });

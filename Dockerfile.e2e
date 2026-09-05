@@ -1,6 +1,6 @@
-FROM node:25-bookworm
+FROM node:24.20.0-bookworm
 
-ARG GO_VERSION=1.25.7
+ARG GO_VERSION=1.26.6
 
 RUN apt-get update \
   && apt-get install -y --no-install-recommends \
@@ -20,6 +20,7 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 WORKDIR /workspace
 
 COPY package.json package-lock.json ./
+RUN npm install --global npm@11.19.0 --ignore-scripts
 RUN npm ci
 
 COPY . .

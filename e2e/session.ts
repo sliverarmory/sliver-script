@@ -58,6 +58,7 @@ const REPO_ROOT = guessRepoRoot();
 const CONFIG_PATH = process.env.SLIVER_CONFIG_FILE ?? path.join(REPO_ROOT, "localhost.cfg");
 const SESSION_TIMEOUT_SECONDS = 180;
 const DEFAULT_HTTP_C2_PROFILE = "default";
+const LARGE_EXECUTE_OUTPUT_BYTES = 17 * 1024 * 1024;
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
@@ -330,6 +331,27 @@ async function runSessionTransportChecks(
       `execute(no env) stdout mismatch: expected '${executeNoEnvToken}', got '${executeNoEnvStdout}'`,
     );
 
+    const largeExecute = await interactiveSession.execute(
+      "/bin/sh",
+      ["-c", `dd if=/dev/zero bs=1048576 count=17 2>/dev/null`],
+      true,
+      120,
+    );
+    try {
+      assert(largeExecute.Status === 0, `execute(large output) non-zero status: ${largeExecute.Status}`);
+      assert(
+        largeExecute.Stdout.length === LARGE_EXECUTE_OUTPUT_BYTES,
+        `execute(large output) returned ${largeExecute.Stdout.length}/${LARGE_EXECUTE_OUTPUT_BYTES} bytes`,
+      );
+      assert(
+        largeExecute.Stdout.every((byte) => byte === 0),
+        "execute(large output) returned non-zero bytes",
+      );
+    } finally {
+      largeExecute.Stdout.fill(0);
+      largeExecute.Stderr.fill(0);
+    }
+
     const executeEnvValue = `EXEC_ENV_${transport.name}_${Date.now()}_${randomInt(10_000, 99_999)}`;
     const executeWithEnv = await client.rpc.execute({
       Path: "/bin/sh",
@@ -356,6 +378,7 @@ async function runSessionTransportChecks(
       transport: transport.name,
       noEnvToken: executeNoEnvStdout,
       envToken: executeWithEnvStdout,
+      largeOutputBytes: LARGE_EXECUTE_OUTPUT_BYTES,
     });
 
     const pwd = await interactiveSession.pwd(60);
