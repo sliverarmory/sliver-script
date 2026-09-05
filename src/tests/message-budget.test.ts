@@ -52,16 +52,15 @@ describe("Sliver RPC message budgets", () => {
     }
   });
 
-  test("adds only the authority overrides needed by IP targets and local proxies", () => {
+  test("adds only the authority overrides needed by direct targets", () => {
     expect(rpcMessageChannelOptions("control", "operator.internal")).toEqual({
       "grpc.max_send_message_length": 8 * MiB,
       "grpc.max_receive_message_length": 16 * MiB,
       "grpc.ssl_target_name_override": "operator.internal",
       "grpc.default_authority": "operator.internal",
     });
-    expect(rpcTlsAuthorityOverride("127.0.0.1", false)).toBe("sliver");
-    expect(rpcTlsAuthorityOverride("[::1]", false)).toBe("sliver");
-    expect(rpcTlsAuthorityOverride("operator.internal", false)).toBeUndefined();
-    expect(rpcTlsAuthorityOverride("operator.internal", true)).toBe("operator.internal");
+    expect(rpcTlsAuthorityOverride("127.0.0.1")).toBe("sliver");
+    expect(rpcTlsAuthorityOverride("[::1]")).toBe("sliver");
+    expect(rpcTlsAuthorityOverride("operator.internal")).toBeUndefined();
   });
 });

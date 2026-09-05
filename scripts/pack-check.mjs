@@ -29,15 +29,7 @@ const requiredFiles = [
   "scripts/registry-provenance-check.mjs",
   "lib/index.js",
   "lib/index.d.ts",
-  "lib/internal/wgProxy.js",
-  "lib/internal/wgProxy.d.ts",
   "src/index.ts",
-  "src/internal/wgProxy.ts",
-  "wireguard-proxy/main.go",
-  "wireguard-proxy/main_test.go",
-  "wireguard-proxy/netstack.go",
-  "wireguard-proxy/go.mod",
-  "wireguard-proxy/go.sum",
 ];
 const forbiddenPrefixes = [
   "docs/",
@@ -47,6 +39,15 @@ const forbiddenPrefixes = [
   "node_modules/",
   "sliver/",
   "src/tests/",
+  "wireguard-proxy/",
+];
+const forbiddenFiles = [
+  "lib/internal/wgProxy.js",
+  "lib/internal/wgProxy.d.ts",
+  "lib/internal/wireGuardConfig.js",
+  "lib/internal/wireGuardConfig.d.ts",
+  "src/internal/wgProxy.ts",
+  "src/internal/wireGuardConfig.ts",
 ];
 
 try {
@@ -82,6 +83,7 @@ try {
   const missing = [...requiredFiles, ...sourceFiles].filter((file) => !files.has(file));
   const forbidden = [...files].filter((file) =>
     forbiddenPrefixes.some((prefix) => file.startsWith(prefix))
+    || forbiddenFiles.includes(file)
     || file.includes("/__snapshots__/")
     || file.endsWith(".snap")
   );
@@ -212,103 +214,6 @@ try {
   );
 
   const installedPackage = join(consumer, "node_modules/sliver-script");
-  for (const helperFile of ["main.go", "main_test.go", "netstack.go", "go.mod", "go.sum"]) {
-    const installedPath = join(installedPackage, "wireguard-proxy", helperFile);
-    if (!existsSync(installedPath)) {
-      throw new Error(`Installed package is missing ${installedPath}`);
-    }
-  }
-
-  const installedHelper = join(installedPackage, "wireguard-proxy");
-  const helperRuntimeTemp = join(temporary, "helper-runtime-temp");
-  await mkdir(helperRuntimeTemp, { recursive: true });
-  const helperEnvironment = {
-    ...process.env,
-    CGO_ENABLED: "0",
-    GOCACHE: join(temporary, "go-build-cache"),
-    GOMODCACHE: join(temporary, "go-module-cache"),
-    // The test owns and removes this disposable module cache. Writable module
-    // files keep that cleanup reliable on Windows; production source builds do
-    // not set this flag and retain Go's read-only shared-cache default.
-    GOFLAGS: "-modcacherw",
-    GOTOOLCHAIN: "local",
-    GOWORK: "off",
-    TMPDIR: helperRuntimeTemp,
-    TEMP: helperRuntimeTemp,
-    TMP: helperRuntimeTemp,
-  };
-  for (const key of Object.keys(helperEnvironment)) {
-    if (key.toUpperCase() === "SLIVER_SCRIPT_WG_PROXY_BINARY") {
-      delete helperEnvironment[key];
-    }
-  }
-  execFileSync("go", ["test", "./..."], {
-    cwd: installedHelper,
-    env: helperEnvironment,
-    stdio: "inherit",
-    timeout: 300_000,
-  });
-  const helperBinary = join(
-    temporary,
-    process.platform === "win32" ? "sliver-script-wgproxy.exe" : "sliver-script-wgproxy",
-  );
-  execFileSync("go", ["build", "-o", helperBinary, "."], {
-    cwd: installedHelper,
-    env: helperEnvironment,
-    stdio: "inherit",
-    timeout: 300_000,
-  });
-  if (!existsSync(helperBinary)) {
-    throw new Error(`Installed WireGuard helper did not build ${helperBinary}`);
-  }
-
-  execFileSync(
-    process.execPath,
-    [
-      "-e",
-      [
-        "const { randomBytes } = require('node:crypto')",
-        "const { startWireGuardProxy } = require('sliver-script/lib/internal/wgProxy')",
-        ";(async () => {",
-        "  const session = await startWireGuardProxy({",
-        "    operator: 'pack-check',",
-        "    lhost: '127.0.0.1',",
-        "    lport: 9,",
-        "    ca_certificate: 'not-forwarded',",
-        "    certificate: 'not-forwarded',",
-        "    private_key: 'not-forwarded',",
-        "    token: 'not-forwarded',",
-        "    wg: {",
-        "      enabled: true,",
-        "      server_pub_key: randomBytes(32).toString('hex'),",
-        "      client_private_key: randomBytes(32).toString('hex'),",
-        "      client_ip: '100.65.0.2',",
-        "      server_ip: '100.65.0.1',",
-        "    },",
-        "  })",
-        "  try {",
-        "    if (!/^127\\.0\\.0\\.1:[1-9][0-9]*$/.test(session.rpcHost())) {",
-        "      throw new Error(`Invalid installed helper endpoint: ${session.rpcHost()}`)",
-        "    }",
-        "  } finally {",
-        "    await session.stop()",
-        "  }",
-        "})().catch((error) => { console.error(error); process.exitCode = 1 })",
-      ].join("\n"),
-    ],
-    {
-      cwd: consumer,
-      env: { ...helperEnvironment, GOFLAGS: "" },
-      stdio: "inherit",
-      timeout: 180_000,
-    },
-  );
-  const runtimeLeftovers = (await readdir(helperRuntimeTemp))
-    .filter((file) => file.startsWith("sliver-script-wgproxy-"));
-  if (runtimeLeftovers.length !== 0) {
-    throw new Error(`Installed WireGuard resolver left private build directories: ${runtimeLeftovers.join(", ")}`);
-  }
-
   const installedManifest = JSON.parse(await readFile(join(installedPackage, "package.json"), "utf8"));
   if (installedManifest.dependencies?.["nice-grpc-common"] !== "^2.0.2") {
     throw new Error("Packed manifest does not declare the generated nice-grpc-common import");
@@ -336,7 +241,7 @@ try {
   console.log(
     `Packed and loaded ${installedManifest.name}@${installedManifest.version} from a clean consumer ` +
       `(${files.size} files, ${entry.unpackedSize} unpacked bytes; ${tarballIntegrity}; ` +
-      `CJS, ESM, strict nested TypeScript NodeNext, production audit, and helper runtime verified)`,
+      `CJS, ESM, strict nested TypeScript NodeNext, and production audit verified)`,
   );
 } finally {
   if (retainedPackDestination === null) {

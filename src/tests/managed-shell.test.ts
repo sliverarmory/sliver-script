@@ -17,9 +17,6 @@ import {
 } from "../internal/tunnelManager";
 
 const activeHarnesses = new Set<TunnelHarness>();
-const SERVER_PUBLIC_KEY = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-const CLIENT_PRIVATE_KEY = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
-
 afterEach(async () => {
   await Promise.all([...activeHarnesses].map((harness) => harness.stop()));
 });
@@ -353,28 +350,6 @@ describe("bounded managed session shell", () => {
     await handle.close();
   });
 
-  test("keeps the managed shell surface transport-neutral for WireGuard configs", async () => {
-    const harness = new TunnelHarness();
-    const client = clientWithShellRpc(harness.manager, {
-      createTunnel: jest.fn(async () => ({ TunnelID: "wg-shell", SessionID: "session-wg" })),
-      shell: jest.fn(async () => shellResponse("wg-shell", "/bin/sh", 303, true)),
-      closeTunnel: jest.fn(async () => ({})),
-    }, {
-      ...baseConfig(),
-      wg: {
-        enabled: true,
-        server_pub_key: SERVER_PUBLIC_KEY,
-        client_private_key: CLIENT_PRIVATE_KEY,
-        client_ip: "100.65.0.2",
-      },
-    });
-
-    const handle = await client.startShellSession("session-wg", {
-      path: "/bin/sh", pty: true, rows: 24, cols: 80,
-    }, 0);
-    await expect(handle.write("transport-neutral\n")).resolves.toBeUndefined();
-    await handle.close();
-  });
 });
 
 describe("legacy interactive session shell compatibility", () => {
@@ -758,9 +733,8 @@ class PushAsyncIterable<T> implements AsyncIterable<T> {
 function clientWithShellRpc(
   manager: TunnelManager,
   control: Record<string, unknown>,
-  config: SliverClientConfig = baseConfig(),
 ): SliverClient {
-  const client = new SliverClient(config);
+  const client = new SliverClient(baseConfig());
   const internals = client as unknown as { rpcClients: Record<string, unknown>; tunnels: TunnelManager };
   internals.rpcClients.control = control;
   internals.rpcClients.artifact = control;

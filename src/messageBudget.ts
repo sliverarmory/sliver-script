@@ -88,11 +88,10 @@ export function rpcMessageChannelOptions(
 /**
  * Node rejects IP literals as TLS SNI values. grpc-js still derives SNI from
  * an IP-literal target even when Sliver's CA-only identity check is in use, so
- * provide a stable DNS-form authority for direct IP targets. A loopback proxy
- * also needs the original DNS authority when the configured host is a name.
+ * provide a stable DNS-form authority for direct IP targets.
  */
-export function rpcTlsAuthorityOverride(host: string, throughProxy: boolean): string | undefined {
+export function rpcTlsAuthorityOverride(host: string): string | undefined {
   const normalized = host.trim().replace(/^\[|\]$/gu, "");
   if (isIP(normalized) !== 0) return IP_LITERAL_TLS_AUTHORITY;
-  return throughProxy && normalized ? normalized : undefined;
+  return undefined;
 }

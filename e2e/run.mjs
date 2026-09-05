@@ -407,7 +407,6 @@ async function main() {
   }
 
   const operatorName = process.env.SLIVER_E2E_OPERATOR || "e2e";
-  const operatorWireGuard = process.env.SLIVER_E2E_OPERATOR_WG !== "0";
 
   let daemonProcess;
   let daemonOutputGetter = () => "";
@@ -435,7 +434,7 @@ async function main() {
     log(`Using isolated test root: ${testRoot}`);
     log(`Using daemon listener: ${daemonHost}:${lport}`);
     log(`Using operator config endpoint: ${operatorHost}:${lport}`);
-    log(`Using operator transport: ${operatorWireGuard ? "WireGuard-wrapped mTLS" : "direct mTLS"}`);
+    log("Using operator transport: direct mTLS");
     log(`Using mTLS listener bind: ${mtlsBindHost}:${mtlsPort}`);
     log(`Using implant mTLS endpoint: ${mtlsHost}:${mtlsPort}`);
     log(`Using HTTP listener bind: ${httpBindHost}:${httpPort}`);
@@ -453,23 +452,19 @@ async function main() {
     });
 
     log(`Generating operator config for '${operatorName}'`);
-    const operatorArgs = (name, savePath) => {
-      const args = [
-        "operator",
-        "--name",
-        name,
-        "--lhost",
-        operatorHost,
-        "--lport",
-        String(lport),
-        "--permissions",
-        "all",
-        "--save",
-        savePath,
-      ];
-      if (operatorWireGuard) args.splice(-2, 0, "--enable-wg");
-      return args;
-    };
+    const operatorArgs = (name, savePath) => [
+      "operator",
+      "--name",
+      name,
+      "--lhost",
+      operatorHost,
+      "--lport",
+      String(lport),
+      "--permissions",
+      "all",
+      "--save",
+      savePath,
+    ];
     await runCommand(
       sliverServerPath,
       operatorArgs(operatorName, operatorConfigPath),
@@ -478,7 +473,7 @@ async function main() {
         env: sharedEnv,
       },
     );
-    // Readiness uses a separate WireGuard peer so its short-lived TCP state
+    // Readiness uses a separate operator identity so its short-lived connection
     // cannot affect the operator identity exercised by the actual tests.
     await runCommand(
       sliverServerPath,
@@ -494,17 +489,9 @@ async function main() {
     }
 
     log("Starting sliver-server daemon");
-    const daemonArgs = [
-      "daemon",
-      "--lhost",
-      daemonHost,
-      "--lport",
-      String(lport),
-    ];
-    if (operatorWireGuard) daemonArgs.push("--enable-wg");
     const daemon = startDaemon(
       sliverServerPath,
-      daemonArgs,
+      ["daemon", "--lhost", daemonHost, "--lport", String(lport)],
       {
         cwd: sliverDir,
         env: sharedEnv,

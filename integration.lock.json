@@ -28,7 +28,6 @@
     "src/internal/credentials.ts",
     "src/internal/timeout.ts",
     "src/internal/tunnelManager.ts",
-    "src/internal/wgProxy.ts",
     "src/messageBudget.ts",
     "src/pb/clientpb/client.ts",
     "src/pb/commonpb/common.ts",
@@ -55,20 +54,15 @@
     },
     {
       "paths": [
-        "src/internal/wgProxy.ts",
-        "src/internal/wireGuardConfig.ts",
-        "wireguard-proxy"
-      ],
-      "reason": "Deliver opt-in WireGuard operator transport as a packaged, pinned, CGO-free helper with narrow secret input, exact hexadecimal key validation, IP-family enforcement, bounded connections, parent-death cleanup, and a process-private source build."
-    },
-    {
-      "paths": [
         "scripts",
         ".github/workflows/build-check.yml",
         ".github/workflows/publish.yml"
       ],
-      "reason": "Add hermetic protobuf, clean-consumer, cross-platform helper, signed-tag, exact-tarball, OIDC, and registry-integrity release gates for the standalone package."
+      "reason": "Add hermetic protobuf, clean-consumer, signed-tag, exact-tarball, OIDC, and registry-integrity release gates for the standalone package."
     }
+  ],
+  "standaloneOmissions": [
+    "Operator-to-server WireGuard proxy and bundled helper; standalone operator connections use direct mTLS"
   ],
   "guiOnlyOmissions": [
     "Electron main-process adapter and operation registry",

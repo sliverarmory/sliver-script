@@ -8,7 +8,6 @@ import type { SliverClientConfig } from "./config";
 import { createSliverRpcCredentials } from "./internal/credentials";
 import { timeoutSecondsToNanoseconds, validateTimeoutSeconds, withTimeoutSignal } from "./internal/timeout";
 import { TunnelManager } from "./internal/tunnelManager";
-import { hasWireGuardWrapper, startWireGuardProxy, type WireGuardProxySession } from "./internal/wgProxy";
 import {
   RPC_MESSAGE_BUDGETS,
   RPC_MESSAGE_DOMAINS,
@@ -840,7 +839,6 @@ export class SliverClient {
 
   private eventsAbort: AbortController | null = null;
   private tunnels: TunnelManager | null = null;
-  private wireGuardProxy: WireGuardProxySession | null = null;
   private lifecycleTail: Promise<void> = Promise.resolve();
 
   private readonly eventSubject = new Subject<Event>();
@@ -864,7 +862,13 @@ export class SliverClient {
   readonly beacon$ = this.event$.pipe(filter((event) => event.EventType === SliverClient.EVENT_BEACON_REGISTERED));
   readonly taskResult$ = this.event$.pipe(filter((event) => event.EventType === SliverClient.EVENT_BEACON_TASKRESULT));
 
-  constructor(readonly config: SliverClientConfig) {}
+  constructor(readonly config: SliverClientConfig) {
+    if (Object.prototype.hasOwnProperty.call(config, "wg")) {
+      throw new Error(
+        "WireGuard operator transport is not supported; use a direct mTLS operator config",
+      );
+    }
+  }
 
   rpcHost(): string {
     return `${this.config.lhost}:${this.config.lport}`;
@@ -945,17 +949,11 @@ export class SliverClient {
     this.tunnels = new TunnelManager();
 
     try {
-      let rpcTarget = this.rpcHost();
-      if (hasWireGuardWrapper(this.config)) {
-        this.wireGuardProxy = await startWireGuardProxy(this.config);
-        rpcTarget = this.wireGuardProxy.rpcHost();
-      }
-
       const credentials = createSliverRpcCredentials(this.config);
       for (const domain of RPC_MESSAGE_DOMAINS) {
-        const authorityOverride = rpcTlsAuthorityOverride(this.config.lhost, this.wireGuardProxy !== null);
+        const authorityOverride = rpcTlsAuthorityOverride(this.config.lhost);
         const channel = createChannel(
-          rpcTarget,
+          this.rpcHost(),
           credentials,
           rpcMessageChannelOptions(domain, authorityOverride),
         );
@@ -991,10 +989,6 @@ export class SliverClient {
       this.channels[domain]?.close();
       delete this.channels[domain];
     }
-
-    const wireGuardProxy = this.wireGuardProxy;
-    this.wireGuardProxy = null;
-    await wireGuardProxy?.stop();
 
     this.eventStreamStateSubject.next({ status: "stopped", attempt: 0 });
   }

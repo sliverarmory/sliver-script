@@ -344,9 +344,8 @@ export class TunnelManager {
     const normalized = tunnelId.trim();
     if (!normalized) throw new Error("Tunnel id is required");
 
-    // Sliver's WireGuard multiplayer transport is sensitive to unnecessary
-    // long-lived TCP streams. Establish TunnelData only when a caller actually
-    // registers a tunnel; regular control and artifact RPCs do not need it.
+    // Establish TunnelData only when a caller actually registers a tunnel;
+    // regular control and artifact RPCs do not need a long-lived stream.
     this.ensureRunning();
 
     let state = this.byTunnelId.get(normalized);

@@ -39,7 +39,7 @@ async function main(): Promise<void> {
       throw new Error(`Large artifact round trip mismatch (${returned?.length ?? 0}/${payload.length} bytes)`);
     }
     console.log("operator artifact round trip", {
-      transport: config.wg?.enabled === true ? "wireguard" : "mtls",
+      transport: "mtls",
       version: `${version.Major}.${version.Minor}.${version.Patch}`,
       bytes: payload.length,
     });

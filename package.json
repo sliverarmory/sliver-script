@@ -19,13 +19,12 @@
     "test:e2e": "node e2e/run.mjs",
     "test:e2e:jest": "SLIVER_E2E=1 jest --config jestconfig.json",
     "example:e2e": "npm run build:examples && node e2e/dist/status.js",
-    "helper:check": "cd wireguard-proxy && go test ./...",
     "audit:all": "npm audit",
     "audit:production": "npm audit --omit=dev",
     "pack:dry-run": "node ./scripts/pack-dry-run.mjs",
     "pack:check": "node ./scripts/pack-check.mjs",
     "publish-order:check": "node ./scripts/publish-order-check.mjs --self-test",
-    "verify": "npm test && npm run publish-order:check && npm run protobuf:check && npm run helper:check && npm run build && npm run pack:dry-run && npm run pack:check",
+    "verify": "npm test && npm run publish-order:check && npm run protobuf:check && npm run build && npm run pack:dry-run && npm run pack:check",
     "prepack": "npm run build",
     "prepublishOnly": "npm run audit:all && npm run verify"
   },
@@ -39,10 +38,7 @@
     "integration.lock.json",
     "protobuf.lock.json",
     "protobuf.sh",
-    "tsconfig.json",
-    "wireguard-proxy/*.go",
-    "wireguard-proxy/go.mod",
-    "wireguard-proxy/go.sum"
+    "tsconfig.json"
   ],
   "keywords": [],
   "author": "moloch",
