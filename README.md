@@ -9,7 +9,7 @@ This library targets modern Sliver protobuf/gRPC APIs and provides a strongly-ty
 [![npm version](https://img.shields.io/npm/v/sliver-script.svg)](https://www.npmjs.com/package/sliver-script)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
-The integrated wrapper provenance is pinned in `integration.lock.json`: standalone base `01f1029cc17898da681e52b64af4a708ff82c3d3`, authoritative Sliver GUI source `f0fa15af24365c9fdab1a2cdff769c88c1ad7cf6`, and Sliver/protobuf source `ca685f5eed64c3327c0e57504928cfd2d2e96bea`. The package exposes explicit typed convenience methods and no method-name/request-object dispatcher. For compatibility it still exports the generated `rpcpb` namespace and the existing statically typed `SliverClient.rpc` getter; trusted applications must impose their own narrower capability boundary, as Sliver GUI does in its main-process adapter.
+The standalone package lineage and generic adaptations are pinned in `integration.lock.json`. The canonical Sliver/protobuf source and generated artifacts are pinned in `protobuf.lock.json`, which the integration lock cross-references. Both locks describe only this package and its upstream protocol inputs. The package exposes explicit typed convenience methods and no method-name/request-object dispatcher. For compatibility it still exports the generated `rpcpb` namespace and the existing statically typed `SliverClient.rpc` getter; trusted applications must impose their own narrower capability boundary.
 
 ### Install
 
@@ -47,6 +47,17 @@ That command is restorative, not an upgrade command. Advancing Sliver, protoc, o
 The npm tarball carries those generated TypeScript modules and their provenance lock, but deliberately excludes the Sliver submodule and therefore is not a self-contained protobuf regeneration checkout.
 
 Before preparing a package, run `npm run audit:all` and `npm run verify`. Verification audits the exact packed runtime dependency graph, then executes unit tests, protobuf checks, a clean TypeScript build, `npm pack --dry-run`, and CommonJS, ESM, and TypeScript NodeNext smoke tests against the packed tarball in a temporary consumer. The packed tarball includes the TypeScript source and locked protobuf provenance in addition to compiled JavaScript and declarations.
+
+### Publishing releases
+
+Pushing a version tag such as `v2.0.0` starts the npm publishing workflow. Both
+Build Check and the full native E2E matrix must pass for that commit before the
+validated tarball can be published. Stable versions use npm's `latest` channel;
+prereleases such as `v2.0.0-rc.1` use `next`.
+
+The workflow also supports a manual dry-run before creating a tag. See
+[`RELEASING.md`](https://github.com/sliverarmory/sliver-script/blob/master/RELEASING.md)
+for npm trusted publisher setup, dry-runs, release steps, and retry behavior.
 
 
 ### TypeScript Example

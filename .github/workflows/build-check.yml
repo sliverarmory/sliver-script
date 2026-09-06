@@ -6,6 +6,15 @@ on:
   pull_request:
     branches: [master, v2]
   workflow_call:
+    inputs:
+      source-ref:
+        description: Immutable source commit selected by the release workflow
+        type: string
+        default: ""
+      release-artifact:
+        description: Retain the checked Linux tarball for npm publication
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -20,6 +29,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.source-ref }}
 
       - name: Set up exact Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -58,6 +68,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.source-ref }}
 
       - name: Set up exact Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
@@ -80,6 +91,10 @@ jobs:
       - name: Run unit tests
         run: npm test
 
+      - name: Test npm release validation
+        shell: bash
+        run: node --test scripts/npm-release/*.test.mjs
+
       - name: Build package
         run: npm run build
 
@@ -87,7 +102,26 @@ jobs:
         run: npm run pack:dry-run
 
       - name: Verify packed CJS, ESM, and NodeNext consumers
-        run: npm run pack:check
+        shell: bash
+        env:
+          RETAIN_RELEASE: ${{ inputs.release-artifact && matrix.os == 'ubuntu-latest' }}
+        run: |
+          if [[ "$RETAIN_RELEASE" == "true" ]]; then
+            npm run pack:check -- --output-dir "$RUNNER_TEMP/npm-release"
+          else
+            npm run pack:check
+          fi
+
+      - name: Upload the validated release tarball
+        if: ${{ inputs.release-artifact && matrix.os == 'ubuntu-latest' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: npm-release
+          path: ${{ runner.temp }}/npm-release/
+          if-no-files-found: error
+          # A full rerun replaces this artifact only after consumer checks pass.
+          overwrite: true
+          retention-days: 14
 
   protobuf-check:
     name: protobuf provenance
@@ -98,6 +132,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.source-ref }}
           submodules: recursive
 
       - name: Set up exact Node.js
