@@ -7,7 +7,7 @@
   },
   "sliver": {
     "repository": "https://github.com/BishopFox/sliver.git",
-    "sourceCommit": "ca685f5eed64c3327c0e57504928cfd2d2e96bea",
+    "sourceCommit": "c3e8a97f66e10b63e0d2f37c3656013a4f8aadf4",
     "protobufLock": "protobuf.lock.json"
   },
   "importedPaths": [

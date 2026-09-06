@@ -2,15 +2,15 @@
   "schemaVersion": 1,
   "source": {
     "repository": "https://github.com/BishopFox/sliver.git",
-    "commit": "ca685f5eed64c3327c0e57504928cfd2d2e96bea",
-    "tree": "25e1385fa1fe6e0a7e41606e426b1c1d0cd320b1"
+    "commit": "c3e8a97f66e10b63e0d2f37c3656013a4f8aadf4",
+    "tree": "24ad355e39cb8e4af80c701db28a7d13bcf7908a"
   },
   "toolchain": {
     "protoc": "35.1",
     "tsProto": "2.12.1"
   },
   "protobuf": {
-    "descriptorSetSha256": "3494d2caef3f8dedf17c05d3f1d7eb246b162e282e98dca3f759b3d29abe616d",
+    "descriptorSetSha256": "b6bb511affd5a7cf00f99f28aa0450e43856e44ced128c52b57fce89ed3bb8a1",
     "files": [
       {
         "path": "commonpb/common.proto",
@@ -22,7 +22,7 @@
       },
       {
         "path": "sliverpb/sliver.proto",
-        "sha256": "e6f18211ab4ece5dd557fad79aeba218cf0b3097ba0d9237895e6a2b01fc5a76"
+        "sha256": "be75c3b184b29c2ea9abb4f899c3d7c58fc99fbf796d8a66305cbe6f6672c349"
       },
       {
         "path": "rpcpb/services.proto",
@@ -44,7 +44,7 @@
       },
       {
         "path": "sliverpb/sliver.ts",
-        "sha256": "1777f029dcba538a1daf85993518a1736349530fae288a0d1cc0c74d69f68133"
+        "sha256": "a0a5fdca50e108930c9b4f8eab5e35037141d9924ee4523bc0deaa2e35aca034"
       },
       {
         "path": "rpcpb/services.ts",

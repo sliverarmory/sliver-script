@@ -14,6 +14,8 @@ export const protobufPackage = "sliverpb";
 export enum ImplantCapability {
   IMPLANT_CAPABILITY_NONE = 0,
   IMPLANT_CAPABILITY_BOF_V1 = 1,
+  IMPLANT_CAPABILITY_TUNNEL_TERMINAL_V1 = 2,
+  IMPLANT_CAPABILITY_SOCKS_FLOW_CONTROL_V1 = 4,
   UNRECOGNIZED = -1,
 }
 
@@ -25,6 +27,12 @@ export function implantCapabilityFromJSON(object: any): ImplantCapability {
     case 1:
     case "IMPLANT_CAPABILITY_BOF_V1":
       return ImplantCapability.IMPLANT_CAPABILITY_BOF_V1;
+    case 2:
+    case "IMPLANT_CAPABILITY_TUNNEL_TERMINAL_V1":
+      return ImplantCapability.IMPLANT_CAPABILITY_TUNNEL_TERMINAL_V1;
+    case 4:
+    case "IMPLANT_CAPABILITY_SOCKS_FLOW_CONTROL_V1":
+      return ImplantCapability.IMPLANT_CAPABILITY_SOCKS_FLOW_CONTROL_V1;
     case -1:
     case "UNRECOGNIZED":
     default:
@@ -38,6 +46,10 @@ export function implantCapabilityToJSON(object: ImplantCapability): string {
       return "IMPLANT_CAPABILITY_NONE";
     case ImplantCapability.IMPLANT_CAPABILITY_BOF_V1:
       return "IMPLANT_CAPABILITY_BOF_V1";
+    case ImplantCapability.IMPLANT_CAPABILITY_TUNNEL_TERMINAL_V1:
+      return "IMPLANT_CAPABILITY_TUNNEL_TERMINAL_V1";
+    case ImplantCapability.IMPLANT_CAPABILITY_SOCKS_FLOW_CONTROL_V1:
+      return "IMPLANT_CAPABILITY_SOCKS_FLOW_CONTROL_V1";
     case ImplantCapability.UNRECOGNIZED:
     default:
       return "UNRECOGNIZED";
@@ -992,6 +1004,7 @@ export interface Portfwd {
 export interface Socks {
   TunnelID: string;
   SessionID: string;
+  Capabilities: string;
 }
 
 export interface SocksData {
@@ -1000,6 +1013,13 @@ export interface SocksData {
   Username: string;
   Password: string;
   Sequence: string;
+  /**
+   * Ack is the next sequence after the last frame fully consumed by the
+   * receiving SOCKS endpoint. It is meaningful only when flow control was
+   * negotiated for this tunnel.
+   */
+  Ack: string;
+  Capabilities: string;
   TunnelID: string;
   Request?: Request | undefined;
 }
@@ -1214,12 +1234,20 @@ export interface CallExtensionReq {
   Export: string;
   BOFData: Buffer;
   IsBOF: boolean;
+  /** WantBOFOutputs requests ordered typed records instead of legacy Output. */
+  WantBOFOutputs: boolean;
   Request?: Request | undefined;
 }
 
 export interface CallExtension {
+  /** Output is the legacy ordered concatenation of BOF record data. */
   Output: Buffer;
   ServerStore: boolean;
+  /**
+   * BOFOutputs preserves record boundaries and raw Beacon output channels
+   * when requested by CallExtensionReq.WantBOFOutputs.
+   */
+  BOFOutputs: BOFOutput[];
   Response?: Response | undefined;
 }
 
@@ -1243,6 +1271,7 @@ export interface RportFwdStartListenerReq {
   ForwardPort: number;
   ForwardAddress: string;
   KeepAlive: number;
+  AuthorizationID: string;
   Request?: Request | undefined;
 }
 
@@ -1252,6 +1281,7 @@ export interface RportFwdListener {
   BindPort: number;
   ForwardAddress: string;
   ForwardPort: number;
+  AuthorizationID: string;
   Response?: Response | undefined;
 }
 
@@ -1265,9 +1295,17 @@ export interface RportFwdListenersReq {
 }
 
 export interface RPortfwd {
+  /**
+   * Legacy wire metadata only. The teamserver must resolve AuthorizationID to
+   * a server-owned destination and must never dial Host or Port directly.
+   *
+   * @deprecated
+   */
   Port: number;
   Protocol: number;
+  /** @deprecated */
   Host: string;
+  AuthorizationID: string;
   /** Bind to this tunnel */
   TunnelID: string;
   Response?: Response | undefined;
@@ -1423,6 +1461,15 @@ export interface ServiceDetail {
 export interface StartServiceByNameReq {
   ServiceInfo?: ServiceInfoReq | undefined;
   Request?: Request | undefined;
+}
+
+/**
+ * BOFOutput preserves one ordered record emitted through a Beacon output
+ * callback. Type is the raw Cobalt-compatible output channel value.
+ */
+export interface BOFOutput {
+  Type: number;
+  Data: Buffer;
 }
 
 function createBaseEnvelope(): Envelope {
@@ -15024,7 +15071,7 @@ export const Portfwd: MessageFns<Portfwd> = {
 };
 
 function createBaseSocks(): Socks {
-  return { TunnelID: "0", SessionID: "" };
+  return { TunnelID: "0", SessionID: "", Capabilities: "0" };
 }
 
 export const Socks: MessageFns<Socks> = {
@@ -15034,6 +15081,9 @@ export const Socks: MessageFns<Socks> = {
     }
     if (message.SessionID !== "") {
       writer.uint32(74).string(message.SessionID);
+    }
+    if (message.Capabilities !== "0") {
+      writer.uint32(80).uint64(message.Capabilities);
     }
     return writer;
   },
@@ -15067,6 +15117,14 @@ export const Socks: MessageFns<Socks> = {
             message.SessionID = reader.string();
             continue;
           }
+          case 10: {
+            if (tag !== 80) {
+              break;
+            }
+
+            message.Capabilities = reader.uint64().toString();
+            continue;
+          }
         }
         if ((tag & 7) === 4 || tag === 0) {
           break;
@@ -15083,6 +15141,7 @@ export const Socks: MessageFns<Socks> = {
     return {
       TunnelID: isSet(object.TunnelID) ? globalThis.String(object.TunnelID) : "0",
       SessionID: isSet(object.SessionID) ? globalThis.String(object.SessionID) : "",
+      Capabilities: isSet(object.Capabilities) ? globalThis.String(object.Capabilities) : "0",
     };
   },
 
@@ -15094,6 +15153,9 @@ export const Socks: MessageFns<Socks> = {
     if (message.SessionID !== "") {
       obj.SessionID = message.SessionID;
     }
+    if (message.Capabilities !== "0") {
+      obj.Capabilities = message.Capabilities;
+    }
     return obj;
   },
 
@@ -15104,6 +15166,7 @@ export const Socks: MessageFns<Socks> = {
     const message = createBaseSocks();
     message.TunnelID = object.TunnelID ?? "0";
     message.SessionID = object.SessionID ?? "";
+    message.Capabilities = object.Capabilities ?? "0";
     return message;
   },
 };
@@ -15115,6 +15178,8 @@ function createBaseSocksData(): SocksData {
     Username: "",
     Password: "",
     Sequence: "0",
+    Ack: "0",
+    Capabilities: "0",
     TunnelID: "0",
     Request: undefined,
   };
@@ -15136,6 +15201,12 @@ export const SocksData: MessageFns<SocksData> = {
     }
     if (message.Sequence !== "0") {
       writer.uint32(40).uint64(message.Sequence);
+    }
+    if (message.Ack !== "0") {
+      writer.uint32(48).uint64(message.Ack);
+    }
+    if (message.Capabilities !== "0") {
+      writer.uint32(56).uint64(message.Capabilities);
     }
     if (message.TunnelID !== "0") {
       writer.uint32(64).uint64(message.TunnelID);
@@ -15199,6 +15270,22 @@ export const SocksData: MessageFns<SocksData> = {
             message.Sequence = reader.uint64().toString();
             continue;
           }
+          case 6: {
+            if (tag !== 48) {
+              break;
+            }
+
+            message.Ack = reader.uint64().toString();
+            continue;
+          }
+          case 7: {
+            if (tag !== 56) {
+              break;
+            }
+
+            message.Capabilities = reader.uint64().toString();
+            continue;
+          }
           case 8: {
             if (tag !== 64) {
               break;
@@ -15234,6 +15321,8 @@ export const SocksData: MessageFns<SocksData> = {
       Username: isSet(object.Username) ? globalThis.String(object.Username) : "",
       Password: isSet(object.Password) ? globalThis.String(object.Password) : "",
       Sequence: isSet(object.Sequence) ? globalThis.String(object.Sequence) : "0",
+      Ack: isSet(object.Ack) ? globalThis.String(object.Ack) : "0",
+      Capabilities: isSet(object.Capabilities) ? globalThis.String(object.Capabilities) : "0",
       TunnelID: isSet(object.TunnelID) ? globalThis.String(object.TunnelID) : "0",
       Request: isSet(object.Request) ? Request.fromJSON(object.Request) : undefined,
     };
@@ -15256,6 +15345,12 @@ export const SocksData: MessageFns<SocksData> = {
     if (message.Sequence !== "0") {
       obj.Sequence = message.Sequence;
     }
+    if (message.Ack !== "0") {
+      obj.Ack = message.Ack;
+    }
+    if (message.Capabilities !== "0") {
+      obj.Capabilities = message.Capabilities;
+    }
     if (message.TunnelID !== "0") {
       obj.TunnelID = message.TunnelID;
     }
@@ -15275,6 +15370,8 @@ export const SocksData: MessageFns<SocksData> = {
     message.Username = object.Username ?? "";
     message.Password = object.Password ?? "";
     message.Sequence = object.Sequence ?? "0";
+    message.Ack = object.Ack ?? "0";
+    message.Capabilities = object.Capabilities ?? "0";
     message.TunnelID = object.TunnelID ?? "0";
     message.Request = (object.Request !== undefined && object.Request !== null)
       ? Request.fromPartial(object.Request)
@@ -18753,6 +18850,7 @@ function createBaseCallExtensionReq(): CallExtensionReq {
     Export: "",
     BOFData: Buffer.alloc(0),
     IsBOF: false,
+    WantBOFOutputs: false,
     Request: undefined,
   };
 }
@@ -18776,6 +18874,9 @@ export const CallExtensionReq: MessageFns<CallExtensionReq> = {
     }
     if (message.IsBOF !== false) {
       writer.uint32(48).bool(message.IsBOF);
+    }
+    if (message.WantBOFOutputs !== false) {
+      writer.uint32(56).bool(message.WantBOFOutputs);
     }
     if (message.Request !== undefined) {
       Request.encode(message.Request, writer.uint32(74).fork()).join();
@@ -18844,6 +18945,14 @@ export const CallExtensionReq: MessageFns<CallExtensionReq> = {
             message.IsBOF = reader.bool();
             continue;
           }
+          case 7: {
+            if (tag !== 56) {
+              break;
+            }
+
+            message.WantBOFOutputs = reader.bool();
+            continue;
+          }
           case 9: {
             if (tag !== 74) {
               break;
@@ -18872,6 +18981,7 @@ export const CallExtensionReq: MessageFns<CallExtensionReq> = {
       Export: isSet(object.Export) ? globalThis.String(object.Export) : "",
       BOFData: isSet(object.BOFData) ? Buffer.from(bytesFromBase64(object.BOFData)) : Buffer.alloc(0),
       IsBOF: isSet(object.IsBOF) ? globalThis.Boolean(object.IsBOF) : false,
+      WantBOFOutputs: isSet(object.WantBOFOutputs) ? globalThis.Boolean(object.WantBOFOutputs) : false,
       Request: isSet(object.Request) ? Request.fromJSON(object.Request) : undefined,
     };
   },
@@ -18896,6 +19006,9 @@ export const CallExtensionReq: MessageFns<CallExtensionReq> = {
     if (message.IsBOF !== false) {
       obj.IsBOF = message.IsBOF;
     }
+    if (message.WantBOFOutputs !== false) {
+      obj.WantBOFOutputs = message.WantBOFOutputs;
+    }
     if (message.Request !== undefined) {
       obj.Request = Request.toJSON(message.Request);
     }
@@ -18913,6 +19026,7 @@ export const CallExtensionReq: MessageFns<CallExtensionReq> = {
     message.Export = object.Export ?? "";
     message.BOFData = object.BOFData ?? Buffer.alloc(0);
     message.IsBOF = object.IsBOF ?? false;
+    message.WantBOFOutputs = object.WantBOFOutputs ?? false;
     message.Request = (object.Request !== undefined && object.Request !== null)
       ? Request.fromPartial(object.Request)
       : undefined;
@@ -18921,7 +19035,7 @@ export const CallExtensionReq: MessageFns<CallExtensionReq> = {
 };
 
 function createBaseCallExtension(): CallExtension {
-  return { Output: Buffer.alloc(0), ServerStore: false, Response: undefined };
+  return { Output: Buffer.alloc(0), ServerStore: false, BOFOutputs: [], Response: undefined };
 }
 
 export const CallExtension: MessageFns<CallExtension> = {
@@ -18931,6 +19045,9 @@ export const CallExtension: MessageFns<CallExtension> = {
     }
     if (message.ServerStore !== false) {
       writer.uint32(16).bool(message.ServerStore);
+    }
+    for (const v of message.BOFOutputs) {
+      BOFOutput.encode(v!, writer.uint32(26).fork()).join();
     }
     if (message.Response !== undefined) {
       Response.encode(message.Response, writer.uint32(74).fork()).join();
@@ -18967,6 +19084,14 @@ export const CallExtension: MessageFns<CallExtension> = {
             message.ServerStore = reader.bool();
             continue;
           }
+          case 3: {
+            if (tag !== 26) {
+              break;
+            }
+
+            message.BOFOutputs.push(BOFOutput.decode(reader, reader.uint32()));
+            continue;
+          }
           case 9: {
             if (tag !== 74) {
               break;
@@ -18991,6 +19116,9 @@ export const CallExtension: MessageFns<CallExtension> = {
     return {
       Output: isSet(object.Output) ? Buffer.from(bytesFromBase64(object.Output)) : Buffer.alloc(0),
       ServerStore: isSet(object.ServerStore) ? globalThis.Boolean(object.ServerStore) : false,
+      BOFOutputs: globalThis.Array.isArray(object?.BOFOutputs)
+        ? object.BOFOutputs.map((e: any) => BOFOutput.fromJSON(e))
+        : [],
       Response: isSet(object.Response) ? Response.fromJSON(object.Response) : undefined,
     };
   },
@@ -19002,6 +19130,9 @@ export const CallExtension: MessageFns<CallExtension> = {
     }
     if (message.ServerStore !== false) {
       obj.ServerStore = message.ServerStore;
+    }
+    if (message.BOFOutputs?.length) {
+      obj.BOFOutputs = message.BOFOutputs.map((e) => BOFOutput.toJSON(e));
     }
     if (message.Response !== undefined) {
       obj.Response = Response.toJSON(message.Response);
@@ -19016,6 +19147,7 @@ export const CallExtension: MessageFns<CallExtension> = {
     const message = createBaseCallExtension();
     message.Output = object.Output ?? Buffer.alloc(0);
     message.ServerStore = object.ServerStore ?? false;
+    message.BOFOutputs = object.BOFOutputs?.map((e) => BOFOutput.fromPartial(e)) || [];
     message.Response = (object.Response !== undefined && object.Response !== null)
       ? Response.fromPartial(object.Response)
       : undefined;
@@ -19267,7 +19399,15 @@ export const RportFwdStopListenerReq: MessageFns<RportFwdStopListenerReq> = {
 };
 
 function createBaseRportFwdStartListenerReq(): RportFwdStartListenerReq {
-  return { BindAddress: "", BindPort: 0, ForwardPort: 0, ForwardAddress: "", KeepAlive: 0, Request: undefined };
+  return {
+    BindAddress: "",
+    BindPort: 0,
+    ForwardPort: 0,
+    ForwardAddress: "",
+    KeepAlive: 0,
+    AuthorizationID: "",
+    Request: undefined,
+  };
 }
 
 export const RportFwdStartListenerReq: MessageFns<RportFwdStartListenerReq> = {
@@ -19286,6 +19426,9 @@ export const RportFwdStartListenerReq: MessageFns<RportFwdStartListenerReq> = {
     }
     if (message.KeepAlive !== 0) {
       writer.uint32(40).int32(message.KeepAlive);
+    }
+    if (message.AuthorizationID !== "") {
+      writer.uint32(50).string(message.AuthorizationID);
     }
     if (message.Request !== undefined) {
       Request.encode(message.Request, writer.uint32(74).fork()).join();
@@ -19346,6 +19489,14 @@ export const RportFwdStartListenerReq: MessageFns<RportFwdStartListenerReq> = {
             message.KeepAlive = reader.int32();
             continue;
           }
+          case 6: {
+            if (tag !== 50) {
+              break;
+            }
+
+            message.AuthorizationID = reader.string();
+            continue;
+          }
           case 9: {
             if (tag !== 74) {
               break;
@@ -19373,6 +19524,7 @@ export const RportFwdStartListenerReq: MessageFns<RportFwdStartListenerReq> = {
       ForwardPort: isSet(object.ForwardPort) ? globalThis.Number(object.ForwardPort) : 0,
       ForwardAddress: isSet(object.ForwardAddress) ? globalThis.String(object.ForwardAddress) : "",
       KeepAlive: isSet(object.KeepAlive) ? globalThis.Number(object.KeepAlive) : 0,
+      AuthorizationID: isSet(object.AuthorizationID) ? globalThis.String(object.AuthorizationID) : "",
       Request: isSet(object.Request) ? Request.fromJSON(object.Request) : undefined,
     };
   },
@@ -19394,6 +19546,9 @@ export const RportFwdStartListenerReq: MessageFns<RportFwdStartListenerReq> = {
     if (message.KeepAlive !== 0) {
       obj.KeepAlive = Math.round(message.KeepAlive);
     }
+    if (message.AuthorizationID !== "") {
+      obj.AuthorizationID = message.AuthorizationID;
+    }
     if (message.Request !== undefined) {
       obj.Request = Request.toJSON(message.Request);
     }
@@ -19410,6 +19565,7 @@ export const RportFwdStartListenerReq: MessageFns<RportFwdStartListenerReq> = {
     message.ForwardPort = object.ForwardPort ?? 0;
     message.ForwardAddress = object.ForwardAddress ?? "";
     message.KeepAlive = object.KeepAlive ?? 0;
+    message.AuthorizationID = object.AuthorizationID ?? "";
     message.Request = (object.Request !== undefined && object.Request !== null)
       ? Request.fromPartial(object.Request)
       : undefined;
@@ -19418,7 +19574,15 @@ export const RportFwdStartListenerReq: MessageFns<RportFwdStartListenerReq> = {
 };
 
 function createBaseRportFwdListener(): RportFwdListener {
-  return { ID: 0, BindAddress: "", BindPort: 0, ForwardAddress: "", ForwardPort: 0, Response: undefined };
+  return {
+    ID: 0,
+    BindAddress: "",
+    BindPort: 0,
+    ForwardAddress: "",
+    ForwardPort: 0,
+    AuthorizationID: "",
+    Response: undefined,
+  };
 }
 
 export const RportFwdListener: MessageFns<RportFwdListener> = {
@@ -19437,6 +19601,9 @@ export const RportFwdListener: MessageFns<RportFwdListener> = {
     }
     if (message.ForwardPort !== 0) {
       writer.uint32(40).uint32(message.ForwardPort);
+    }
+    if (message.AuthorizationID !== "") {
+      writer.uint32(50).string(message.AuthorizationID);
     }
     if (message.Response !== undefined) {
       Response.encode(message.Response, writer.uint32(74).fork()).join();
@@ -19497,6 +19664,14 @@ export const RportFwdListener: MessageFns<RportFwdListener> = {
             message.ForwardPort = reader.uint32();
             continue;
           }
+          case 6: {
+            if (tag !== 50) {
+              break;
+            }
+
+            message.AuthorizationID = reader.string();
+            continue;
+          }
           case 9: {
             if (tag !== 74) {
               break;
@@ -19524,6 +19699,7 @@ export const RportFwdListener: MessageFns<RportFwdListener> = {
       BindPort: isSet(object.BindPort) ? globalThis.Number(object.BindPort) : 0,
       ForwardAddress: isSet(object.ForwardAddress) ? globalThis.String(object.ForwardAddress) : "",
       ForwardPort: isSet(object.ForwardPort) ? globalThis.Number(object.ForwardPort) : 0,
+      AuthorizationID: isSet(object.AuthorizationID) ? globalThis.String(object.AuthorizationID) : "",
       Response: isSet(object.Response) ? Response.fromJSON(object.Response) : undefined,
     };
   },
@@ -19545,6 +19721,9 @@ export const RportFwdListener: MessageFns<RportFwdListener> = {
     if (message.ForwardPort !== 0) {
       obj.ForwardPort = Math.round(message.ForwardPort);
     }
+    if (message.AuthorizationID !== "") {
+      obj.AuthorizationID = message.AuthorizationID;
+    }
     if (message.Response !== undefined) {
       obj.Response = Response.toJSON(message.Response);
     }
@@ -19561,6 +19740,7 @@ export const RportFwdListener: MessageFns<RportFwdListener> = {
     message.BindPort = object.BindPort ?? 0;
     message.ForwardAddress = object.ForwardAddress ?? "";
     message.ForwardPort = object.ForwardPort ?? 0;
+    message.AuthorizationID = object.AuthorizationID ?? "";
     message.Response = (object.Response !== undefined && object.Response !== null)
       ? Response.fromPartial(object.Response)
       : undefined;
@@ -19727,7 +19907,7 @@ export const RportFwdListenersReq: MessageFns<RportFwdListenersReq> = {
 };
 
 function createBaseRPortfwd(): RPortfwd {
-  return { Port: 0, Protocol: 0, Host: "", TunnelID: "0", Response: undefined };
+  return { Port: 0, Protocol: 0, Host: "", AuthorizationID: "", TunnelID: "0", Response: undefined };
 }
 
 export const RPortfwd: MessageFns<RPortfwd> = {
@@ -19740,6 +19920,9 @@ export const RPortfwd: MessageFns<RPortfwd> = {
     }
     if (message.Host !== "") {
       writer.uint32(26).string(message.Host);
+    }
+    if (message.AuthorizationID !== "") {
+      writer.uint32(34).string(message.AuthorizationID);
     }
     if (message.TunnelID !== "0") {
       writer.uint32(64).uint64(message.TunnelID);
@@ -19787,6 +19970,14 @@ export const RPortfwd: MessageFns<RPortfwd> = {
             message.Host = reader.string();
             continue;
           }
+          case 4: {
+            if (tag !== 34) {
+              break;
+            }
+
+            message.AuthorizationID = reader.string();
+            continue;
+          }
           case 8: {
             if (tag !== 64) {
               break;
@@ -19820,6 +20011,7 @@ export const RPortfwd: MessageFns<RPortfwd> = {
       Port: isSet(object.Port) ? globalThis.Number(object.Port) : 0,
       Protocol: isSet(object.Protocol) ? globalThis.Number(object.Protocol) : 0,
       Host: isSet(object.Host) ? globalThis.String(object.Host) : "",
+      AuthorizationID: isSet(object.AuthorizationID) ? globalThis.String(object.AuthorizationID) : "",
       TunnelID: isSet(object.TunnelID) ? globalThis.String(object.TunnelID) : "0",
       Response: isSet(object.Response) ? Response.fromJSON(object.Response) : undefined,
     };
@@ -19835,6 +20027,9 @@ export const RPortfwd: MessageFns<RPortfwd> = {
     }
     if (message.Host !== "") {
       obj.Host = message.Host;
+    }
+    if (message.AuthorizationID !== "") {
+      obj.AuthorizationID = message.AuthorizationID;
     }
     if (message.TunnelID !== "0") {
       obj.TunnelID = message.TunnelID;
@@ -19853,6 +20048,7 @@ export const RPortfwd: MessageFns<RPortfwd> = {
     message.Port = object.Port ?? 0;
     message.Protocol = object.Protocol ?? 0;
     message.Host = object.Host ?? "";
+    message.AuthorizationID = object.AuthorizationID ?? "";
     message.TunnelID = object.TunnelID ?? "0";
     message.Response = (object.Response !== undefined && object.Response !== null)
       ? Response.fromPartial(object.Response)
@@ -22465,6 +22661,91 @@ export const StartServiceByNameReq: MessageFns<StartServiceByNameReq> = {
     message.Request = (object.Request !== undefined && object.Request !== null)
       ? Request.fromPartial(object.Request)
       : undefined;
+    return message;
+  },
+};
+
+function createBaseBOFOutput(): BOFOutput {
+  return { Type: 0, Data: Buffer.alloc(0) };
+}
+
+export const BOFOutput: MessageFns<BOFOutput> = {
+  encode(message: BOFOutput, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
+    if (message.Type !== 0) {
+      writer.uint32(8).int32(message.Type);
+    }
+    if (message.Data.length !== 0) {
+      writer.uint32(18).bytes(message.Data);
+    }
+    return writer;
+  },
+
+  decode(input: BinaryReader | Uint8Array, length?: number): BOFOutput {
+    const reader = input instanceof BinaryReader ? input : new BinaryReader(input);
+    const previousRecursionDepth = (reader as any).__tsProtoDecodeDepth ?? 0;
+    if (previousRecursionDepth >= 100) {
+      throw new globalThis.Error("protobuf decode recursion limit exceeded");
+    }
+    (reader as any).__tsProtoDecodeDepth = previousRecursionDepth + 1;
+    try {
+      const end = length === undefined ? reader.len : reader.pos + length;
+      const message = createBaseBOFOutput();
+      while (reader.pos < end) {
+        const tag = reader.uint32();
+        switch (tag >>> 3) {
+          case 1: {
+            if (tag !== 8) {
+              break;
+            }
+
+            message.Type = reader.int32();
+            continue;
+          }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.Data = Buffer.from(reader.bytes());
+            continue;
+          }
+        }
+        if ((tag & 7) === 4 || tag === 0) {
+          break;
+        }
+        reader.skip(tag & 7);
+      }
+      return message;
+    } finally {
+      (reader as any).__tsProtoDecodeDepth = previousRecursionDepth;
+    }
+  },
+
+  fromJSON(object: any): BOFOutput {
+    return {
+      Type: isSet(object.Type) ? globalThis.Number(object.Type) : 0,
+      Data: isSet(object.Data) ? Buffer.from(bytesFromBase64(object.Data)) : Buffer.alloc(0),
+    };
+  },
+
+  toJSON(message: BOFOutput): unknown {
+    const obj: any = {};
+    if (message.Type !== 0) {
+      obj.Type = Math.round(message.Type);
+    }
+    if (message.Data.length !== 0) {
+      obj.Data = base64FromBytes(message.Data);
+    }
+    return obj;
+  },
+
+  create(base?: DeepPartial<BOFOutput>): BOFOutput {
+    return BOFOutput.fromPartial(base ?? {});
+  },
+  fromPartial(object: DeepPartial<BOFOutput>): BOFOutput {
+    const message = createBaseBOFOutput();
+    message.Type = object.Type ?? 0;
+    message.Data = object.Data ?? Buffer.alloc(0);
     return message;
   },
 };
