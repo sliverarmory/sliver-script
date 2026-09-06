@@ -9,7 +9,7 @@ This library targets modern Sliver protobuf/gRPC APIs and provides a strongly-ty
 [![npm version](https://img.shields.io/npm/v/sliver-script.svg)](https://www.npmjs.com/package/sliver-script)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
-The integrated wrapper provenance is pinned in `integration.lock.json`: standalone base `01f1029cc17898da681e52b64af4a708ff82c3d3`, authoritative Sliver GUI source `f0fa15af24365c9fdab1a2cdff769c88c1ad7cf6`, and Sliver/protobuf source `ca685f5eed64c3327c0e57504928cfd2d2e96bea`. The package exposes explicit typed convenience methods and no method-name/request-object dispatcher. For compatibility it still exports the generated `rpcpb` namespace and the existing statically typed `SliverClient.rpc` getter; trusted applications must impose their own narrower capability boundary, as Sliver GUI does in its main-process adapter.
+The standalone package lineage and generic adaptations are pinned in `integration.lock.json`. The canonical Sliver/protobuf source and generated artifacts are pinned in `protobuf.lock.json`, which the integration lock cross-references. Both locks describe only this package and its upstream protocol inputs. The package exposes explicit typed convenience methods and no method-name/request-object dispatcher. For compatibility it still exports the generated `rpcpb` namespace and the existing statically typed `SliverClient.rpc` getter; trusted applications must impose their own narrower capability boundary.
 
 ### Install
 

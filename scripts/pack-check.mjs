@@ -1,10 +1,12 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, open, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, mkdtemp, open, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { validateIntegrationLock } from "./integration-lock.mjs";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputArgument = parseArguments(process.argv.slice(2));
@@ -26,6 +28,7 @@ const requiredFiles = [
   "protobuf.sh",
   "tsconfig.json",
   "scripts/clean.mjs",
+  "scripts/integration-lock.mjs",
   "scripts/pack-check.mjs",
   "scripts/pack-dry-run.mjs",
   "scripts/protobuf.mjs",
@@ -81,8 +84,13 @@ try {
     || file.includes("/__snapshots__/")
     || file.endsWith(".snap")
   );
-  if (missing.length !== 0 || forbidden.length !== 0) {
-    throw new Error(JSON.stringify({ missing, forbidden }, null, 2));
+  const allowedMetadataFiles = new Set(["integration.lock.json", "protobuf.lock.json"]);
+  const unexpectedMetadata = [...files].filter((file) =>
+    (file.endsWith(".lock.json") || file.endsWith(".provenance.json"))
+    && !allowedMetadataFiles.has(file)
+  );
+  if (missing.length !== 0 || forbidden.length !== 0 || unexpectedMetadata.length !== 0) {
+    throw new Error(JSON.stringify({ missing, forbidden, unexpectedMetadata }, null, 2));
   }
 
   if (typeof entry.filename !== "string" || basename(entry.filename) !== entry.filename
@@ -215,6 +223,53 @@ try {
 
   const installedPackage = join(consumer, "node_modules/sliver-script");
   const installedManifest = JSON.parse(await readFile(join(installedPackage, "package.json"), "utf8"));
+  const expectedRuntimePins = new Map([
+    ["@protobufjs/utf8", "1.1.2"],
+    ["protobufjs", "7.6.6"],
+  ]);
+  for (const [dependency, version] of expectedRuntimePins) {
+    if (installedManifest.dependencies?.[dependency] !== version) {
+      throw new Error(`Packed manifest does not enforce ${dependency}@${version}`);
+    }
+  }
+  const installedDependencyTree = JSON.parse(execFileSync(
+    process.execPath,
+    [npmCli, "ls", ...expectedRuntimePins.keys(), "--all", "--json"],
+    {
+      cwd: consumer,
+      encoding: "utf8",
+      env: npmEnvironment(join(temporary, "npm-cache")),
+      stdio: ["ignore", "pipe", "inherit"],
+      timeout: 30_000,
+    },
+  ));
+  const resolvedRuntimeVersions = collectDependencyVersions(installedDependencyTree, expectedRuntimePins.keys());
+  for (const [dependency, version] of expectedRuntimePins) {
+    const resolved = [...(resolvedRuntimeVersions.get(dependency) ?? [])].sort();
+    if (resolved.length !== 1 || resolved[0] !== version) {
+      throw new Error(`Clean packed consumer resolved unexpected ${dependency} versions: ${resolved.join(", ")}`);
+    }
+  }
+  const installedIntegrationLock = JSON.parse(
+    await readFile(join(installedPackage, "integration.lock.json"), "utf8"),
+  );
+  const installedProtobufLock = JSON.parse(
+    await readFile(join(installedPackage, "protobuf.lock.json"), "utf8"),
+  );
+  const { referencedPaths } = validateIntegrationLock(installedIntegrationLock, installedProtobufLock);
+  const resolvedRepositoryRoot = await realpath(repositoryRoot);
+  for (const referencedPath of referencedPaths) {
+    const sourcePath = resolve(repositoryRoot, referencedPath);
+    const sourceStat = await lstat(sourcePath).catch(() => undefined);
+    if (!sourceStat || (!sourceStat.isFile() && !sourceStat.isDirectory()) || sourceStat.isSymbolicLink()) {
+      throw new Error(`Integration lock references a missing or unsupported source path: ${referencedPath}`);
+    }
+    const resolvedSourcePath = await realpath(sourcePath);
+    const fromRepository = relative(resolvedRepositoryRoot, resolvedSourcePath);
+    if (fromRepository === ".." || fromRepository.startsWith(`..${sep}`) || isAbsolute(fromRepository)) {
+      throw new Error(`Integration lock source path escapes the repository: ${referencedPath}`);
+    }
+  }
   if (installedManifest.dependencies?.["nice-grpc-common"] !== "^2.0.4") {
     throw new Error("Packed manifest does not declare the generated nice-grpc-common import");
   }
@@ -343,4 +398,19 @@ async function listFiles(root, current = root) {
     }
   }
   return files;
+}
+
+function collectDependencyVersions(tree, dependencyNames) {
+  const names = new Set(dependencyNames);
+  const versions = new Map([...names].map((name) => [name, new Set()]));
+  function visit(node) {
+    for (const [name, dependency] of Object.entries(node?.dependencies ?? {})) {
+      if (names.has(name) && typeof dependency?.version === "string") {
+        versions.get(name).add(dependency.version);
+      }
+      visit(dependency);
+    }
+  }
+  visit(tree);
+  return versions;
 }

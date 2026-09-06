@@ -1,6 +1,6 @@
 {
   "name": "sliver-script",
-  "version": "2.0.0-rc.1",
+  "version": "2.0.0-rc.2",
   "description": "TypeScript/JavaScript Sliver client library",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -16,12 +16,13 @@
     "protobuf:check": "node ./scripts/protobuf.mjs --check",
     "docs": "typedoc --out ./docs/ ./src",
     "test": "jest --config jestconfig.json",
+    "test:scripts": "node --test scripts/npm-release/*.test.mjs",
     "test:e2e": "npm run build:e2e && node ./e2e/run.mjs",
     "audit:all": "npm audit",
     "audit:production": "npm audit --omit=dev",
     "pack:dry-run": "node ./scripts/pack-dry-run.mjs",
     "pack:check": "node ./scripts/pack-check.mjs",
-    "verify": "npm test && npm run protobuf:check && npm run build && npm run pack:dry-run && npm run pack:check",
+    "verify": "npm test && npm run test:scripts && npm run protobuf:check && npm run build && npm run pack:dry-run && npm run pack:check",
     "prepack": "npm run build",
     "prepublishOnly": "npm run audit:all && npm run verify"
   },
@@ -60,13 +61,13 @@
   "dependencies": {
     "@bufbuild/protobuf": "^2.14.1",
     "@grpc/grpc-js": "1.14.4",
+    "@protobufjs/utf8": "1.1.2",
     "nice-grpc": "^2.1.17",
     "nice-grpc-common": "^2.0.4",
+    "protobufjs": "7.6.6",
     "rxjs": "^7.8.2"
   },
   "overrides": {
-    "protobufjs": "7.6.6",
-    "@protobufjs/utf8": "1.1.2",
     "dprint-node": "1.0.8",
     "ts-poet": "6.12.0"
   }
