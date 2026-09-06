@@ -7,7 +7,7 @@
   },
   "toolchain": {
     "protoc": "35.1",
-    "tsProto": "2.11.4"
+    "tsProto": "2.12.1"
   },
   "protobuf": {
     "descriptorSetSha256": "3494d2caef3f8dedf17c05d3f1d7eb246b162e282e98dca3f759b3d29abe616d",
@@ -36,23 +36,23 @@
     "outputs": [
       {
         "path": "commonpb/common.ts",
-        "sha256": "ac46d0ede448a5d7cdfdc3ad4699da32f1ebf7f6566e074eebb7476f65655189"
+        "sha256": "4dfd151e83eeaaa0ce0ac9ba7ace3666e4031b767b850d5cdca62de6ff9508c9"
       },
       {
         "path": "clientpb/client.ts",
-        "sha256": "eaf9b3fefacc227a729a82a5735a73dd01019cc2d5ea5953d5e4fe1760e04882"
+        "sha256": "9efd78c49b3103a12029b43ee0824042390bc535646c5961bc634fe468a02010"
       },
       {
         "path": "sliverpb/sliver.ts",
-        "sha256": "844a9c73939361e29ee27ca9af0fa3949c5fcb6ef89f94d372dd35379d8854fe"
+        "sha256": "1777f029dcba538a1daf85993518a1736349530fae288a0d1cc0c74d69f68133"
       },
       {
         "path": "rpcpb/services.ts",
-        "sha256": "64829545f3902c671c394b6404c735ec78a5bd33f5da9575fc5bdbe85fc0cd25"
+        "sha256": "b750a857dbf0c37dc13ff443f127a1fbda8e95da6b3cfb0bb4098fbe4adfefff"
       },
       {
         "path": "dnspb/dns.ts",
-        "sha256": "09e4c0a09a2535d9d6ad0795b0dafc669aee4efe0274afdd04d854c3d5d0e372"
+        "sha256": "5c7362c6a66f38ef1101e53333e1d76a68ed66bc3cf7965e1cf4b9734dd9a898"
       }
     ],
     "pluginOptions": [

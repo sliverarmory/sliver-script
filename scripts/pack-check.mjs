@@ -201,7 +201,7 @@ try {
 
   const installedPackage = join(consumer, "node_modules/sliver-script");
   const installedManifest = JSON.parse(await readFile(join(installedPackage, "package.json"), "utf8"));
-  if (installedManifest.dependencies?.["nice-grpc-common"] !== "^2.0.2") {
+  if (installedManifest.dependencies?.["nice-grpc-common"] !== "^2.0.4") {
     throw new Error("Packed manifest does not declare the generated nice-grpc-common import");
   }
   const tarballShasum = createHash("sha1").update(await readFile(tarball)).digest("hex");

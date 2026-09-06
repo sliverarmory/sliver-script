@@ -2140,8 +2140,8 @@ export class SliverClient {
     }
 
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
-      let ownedPrivateKey = Buffer.alloc(0);
-      let ownedKeytab = Buffer.alloc(0);
+      let ownedPrivateKey: Buffer = Buffer.alloc(0);
+      let ownedKeytab: Buffer = Buffer.alloc(0);
       try {
         ownedPrivateKey = m4SecretCopy(options.privateKey, "SSH private key");
         ownedKeytab = m4SecretCopy(options.kerberosKeytab, "Kerberos keytab");
@@ -2415,8 +2415,8 @@ export class SliverClient {
     }
 
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
-      let ownedReferenceDll = Buffer.alloc(0);
-      let ownedTargetDll = Buffer.alloc(0);
+      let ownedReferenceDll: Buffer = Buffer.alloc(0);
+      let ownedTargetDll: Buffer = Buffer.alloc(0);
       try {
         ownedReferenceDll = m4ArtifactCopy(options.referenceDll, "Reference DLL");
         ownedTargetDll = m4ArtifactCopy(options.targetDll, "Target DLL");
