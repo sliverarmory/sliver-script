@@ -56,7 +56,7 @@
     "ts-jest": "^29.4.12",
     "ts-proto": "2.12.1",
     "typedoc": "^0.28.20",
-    "typescript": "5.9.3"
+    "typescript": "7.0.2"
   },
   "dependencies": {
     "@bufbuild/protobuf": "^2.14.1",
