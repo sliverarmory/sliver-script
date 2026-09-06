@@ -1,18 +1,9 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "wrapper": {
     "repository": "https://github.com/sliverarmory/sliver-script.git",
     "publishedBase": "837fb21c5291eef6285c2e168eef0620b99a5394",
     "integrationBase": "01f1029cc17898da681e52b64af4a708ff82c3d3"
-  },
-  "authoritativeGui": {
-    "repository": "https://github.com/sliverarmory/sliver-gui.git",
-    "commit": "f0fa15af24365c9fdab1a2cdff769c88c1ad7cf6",
-    "vendoredRoot": "vendor/sliver-script",
-    "provenanceManifest": "protocol/sliver-script-provenance.json",
-    "provenanceManifestSha256": "9607e5a36c39361b626e52e601180c131ba59b01ae69e019f2d3cd7b186e3572",
-    "handwrittenOverlay": "protocol/sliver-script-handwritten-overlay.patch",
-    "handwrittenOverlaySha256": "a0a286d9717ea8349f4494606fa8719ebe115b30b46202786fdaca37a8057f1b"
   },
   "sliver": {
     "repository": "https://github.com/BishopFox/sliver.git",
@@ -62,11 +53,5 @@
   ],
   "standaloneOmissions": [
     "Operator-to-server WireGuard proxy and bundled helper; standalone operator connections use direct mTLS"
-  ],
-  "guiOnlyOmissions": [
-    "Electron main-process adapter and operation registry",
-    "renderer IPC and native-dialog ownership",
-    "GUI state stores, capability records, and form normalization",
-    "archival snapshot bundle and historical patch copies"
   ]
 }
