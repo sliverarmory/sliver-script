@@ -1,17 +1,15 @@
 import assert from "node:assert/strict";
 
-import {
-  loadE2EEnvironment,
-  waitForOnlineOperator,
-  withConnectedClient,
-} from "../support";
+import type { clientpb, SliverEventStreamState } from "../../lib";
+import type { E2ESuiteContext } from "../context";
+import { waitForOnlineOperator } from "../support";
+
+const sliverScript = require("../../../lib") as typeof import("../../lib");
 
 export const name = "00-connectivity";
 
-export async function run(): Promise<void> {
-  const environment = loadE2EEnvironment();
-
-  await withConnectedClient(environment, async ({ client }) => {
+export async function run(context: E2ESuiteContext): Promise<void> {
+    const { client, environment } = context;
     const version = await client.getVersion();
     assert.equal(version.Commit, environment.sliverSha, "server commit");
     assert.equal(version.OS, environment.expectedOS, "server operating system");
@@ -37,10 +35,55 @@ export async function run(): Promise<void> {
       "operators helper identity",
     );
     assert.equal(operators[0].Online, true, "operators helper online state");
-  });
+
+    await verifySecondaryClientLifecycle(context);
 }
 
-void run().catch((error: unknown) => {
-  console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
-  process.exitCode = 1;
-});
+async function verifySecondaryClientLifecycle(context: E2ESuiteContext): Promise<void> {
+  const secondary = new sliverScript.SliverClient(context.config);
+  const derivedClientEvents: clientpb.Event[] = [];
+  const streamStates: SliverEventStreamState[] = [];
+  const subscription = context.client.client$.subscribe((event) => derivedClientEvents.push(event));
+  const streamSubscription = context.client.eventStreamState$.subscribe((state) => streamStates.push(state));
+  let joinedClientId: number | undefined;
+  try {
+    const joinCursor = context.eventCursor();
+    assert.equal(await secondary.connect(), secondary, "secondary client connect result");
+    assert.equal(await secondary.connect(), secondary, "secondary idempotent connect result");
+    const joined = await context.waitForEvent(
+      joinCursor,
+      (event) => event.EventType === "client-joined"
+        && event.Client?.Operator?.Name === context.environment.operator,
+      30_000,
+      "secondary operator client-joined event",
+    );
+    assert.ok(joined.Client && joined.Client.ID > 0, "secondary joined client ID");
+    joinedClientId = joined.Client.ID;
+    assert.ok(streamStates.some((state) => state.status === "connected"), "primary event stream connected state");
+    assert.ok(
+      derivedClientEvents.some((event) => event.EventType === "client-joined"
+        && event.Client?.ID === joinedClientId),
+      "derived client observable must emit the exact join event",
+    );
+
+    const leaveCursor = context.eventCursor();
+    await secondary.disconnect();
+    await secondary.disconnect();
+    const left = await context.waitForEvent(
+      leaveCursor,
+      (event) => event.EventType === "client-left" && event.Client?.ID === joinedClientId,
+      30_000,
+      "secondary operator client-left event",
+    );
+    assert.equal(left.Client?.Operator?.Name, context.environment.operator, "secondary left operator name");
+    assert.ok(
+      derivedClientEvents.some((event) => event.EventType === "client-left"
+        && event.Client?.ID === joinedClientId),
+      "derived client observable must emit the exact leave event",
+    );
+  } finally {
+    subscription.unsubscribe();
+    streamSubscription.unsubscribe();
+    await secondary.disconnect();
+  }
+}

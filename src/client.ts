@@ -9,6 +9,7 @@ import { createSliverRpcCredentials } from "./internal/credentials";
 import { timeoutSecondsToNanoseconds, validateTimeoutSeconds, withTimeoutSignal } from "./internal/timeout";
 import { TunnelManager } from "./internal/tunnelManager";
 import {
+  BEACON_TASK_MAX_PAYLOAD_BYTES,
   RPC_MESSAGE_BUDGETS,
   RPC_MESSAGE_DOMAINS,
   TUNNEL_STREAM_MAX_PAYLOAD_BYTES,
@@ -44,7 +45,7 @@ import type {
 import type { Empty, Request as CommonRequest } from "./pb/commonpb/common";
 import { SliverRPCDefinition } from "./pb/rpcpb/services";
 import type { SliverRPCClient } from "./pb/rpcpb/services";
-import { Ls, RegistryType } from "./pb/sliverpb/sliver";
+import { Download, Ls, RegistryType } from "./pb/sliverpb/sliver";
 import type {
   EnvInfo,
   OpenSession,
@@ -653,9 +654,11 @@ export class InteractiveBeacon extends BaseCommands {
     return {
       id: taskId,
       wait: async (waitTimeoutSeconds = timeoutSeconds) => {
-        const beaconTask = await waitForBeaconTask(this.taskResult$, taskId, waitTimeoutSeconds);
-        const taskContent = await this.unary(waitTimeoutSeconds, (signal) =>
-          this.taskContentRpc.getBeaconTaskContent({ ID: beaconTask.ID }, { signal }),
+        const taskContent = await waitForBeaconTaskContent(
+          this.taskResult$,
+          this.taskContentRpc,
+          taskId,
+          waitTimeoutSeconds,
         );
         return Ls.decode(taskContent.Response);
       },
@@ -665,6 +668,51 @@ export class InteractiveBeacon extends BaseCommands {
   async ls(path = ".", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
     const task = await this.lsTask(path, timeoutSeconds);
     return task.wait(timeoutSeconds);
+  }
+
+  override async download(path: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Buffer> {
+    const queued = await this.unary(timeoutSeconds, (signal) =>
+      this.artifactRpc.download(
+        {
+          Path: path,
+          MaxBytes: String(BEACON_TASK_MAX_PAYLOAD_BYTES + 1),
+          RestrictedToFile: true,
+          Request: this.request(timeoutSeconds),
+        },
+        { signal },
+      ),
+    );
+    if (queued.Response?.Err) throw new Error(queued.Response.Err);
+    const taskId = queued.Response?.TaskID;
+    if (!taskId) throw new Error("Missing beacon task id");
+
+    const task = await waitForBeaconTaskContent(
+      this.taskResult$,
+      this.taskContentRpc,
+      taskId,
+      timeoutSeconds,
+    );
+    let download: Download;
+    try {
+      download = Download.decode(task.Response);
+    } finally {
+      task.Response.fill(0);
+    }
+    try {
+      assertImplantResponse(download.Response?.Err, "Download");
+      if (!download.Exists || download.IsDir) {
+        throw new Error("Download is unavailable or is not a single file");
+      }
+      return await decodeBoundedEncodedBytes(
+        download.Data,
+        download.Encoder,
+        BEACON_TASK_MAX_PAYLOAD_BYTES,
+        "Download",
+      );
+    } catch (error) {
+      download.Data.fill(0);
+      throw error;
+    }
   }
 }
 
@@ -3581,13 +3629,22 @@ function abortableDelay(delayMs: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-async function waitForBeaconTask(taskResult$: Observable<Event>, taskId: string, timeoutSeconds: number) {
+async function waitForBeaconTaskContent(
+  taskResult$: Observable<Event>,
+  taskContentRpc: SliverRPCClient,
+  taskId: string,
+  timeoutSeconds: number,
+): Promise<BeaconTask> {
   const validatedTimeoutSeconds = validateTimeoutSeconds(timeoutSeconds);
   return new Promise<BeaconTask>((resolve, reject) => {
     let settled = false;
     let unsubscribePending = false;
     let sub: { unsubscribe(): void } | undefined;
-    const timer = validatedTimeoutSeconds === 0
+    let refreshPending = true;
+    let refreshing = false;
+    let pollTimer: ReturnType<typeof setInterval> | undefined;
+    const controller = new AbortController();
+    const deadlineTimer = validatedTimeoutSeconds === 0
       ? undefined
       : setTimeout(() => {
           finish(() => reject(new Error(`Timeout waiting for beacon task result: ${taskId}`)));
@@ -3596,7 +3653,9 @@ async function waitForBeaconTask(taskResult$: Observable<Event>, taskId: string,
     const finish = (settle: () => void) => {
       if (settled) return;
       settled = true;
-      if (timer !== undefined) clearTimeout(timer);
+      if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
+      if (pollTimer !== undefined) clearInterval(pollTimer);
+      controller.abort();
       if (sub) {
         sub.unsubscribe();
       } else {
@@ -3605,12 +3664,45 @@ async function waitForBeaconTask(taskResult$: Observable<Event>, taskId: string,
       settle();
     };
 
+    const refresh = async () => {
+      if (settled || refreshing) return;
+      refreshing = true;
+      try {
+        while (refreshPending && !settled) {
+          refreshPending = false;
+          const task = await taskContentRpc.getBeaconTaskContent(
+            { ID: taskId },
+            { signal: controller.signal },
+          );
+          const state = task.State.toLowerCase();
+          if (state === "canceled" || state === "failed") {
+            finish(() => reject(new Error(`Beacon task ${taskId} ended in state ${state}`)));
+          } else if (state === "completed" && task.Response.length === 0) {
+            finish(() => reject(new Error(`Beacon task ${taskId} returned an empty response`)));
+          } else if (state === "completed" || (state === "" && task.Response.length > 0)) {
+            finish(() => resolve(task));
+          }
+        }
+      } catch (error) {
+        finish(() => reject(error));
+      } finally {
+        refreshing = false;
+        if (refreshPending && !settled) void refresh();
+      }
+    };
+
+    const requestRefresh = () => {
+      if (settled) return;
+      refreshPending = true;
+      if (!refreshing) void refresh();
+    };
+
     sub = taskResult$.subscribe({
       next: (event) => {
         try {
           const task = BeaconTask.decode(event.Data);
           if (task.ID !== taskId) return;
-          finish(() => resolve(task));
+          requestRefresh();
         } catch (err) {
           finish(() => reject(err));
         }
@@ -3620,5 +3712,8 @@ async function waitForBeaconTask(taskResult$: Observable<Event>, taskId: string,
       },
     });
     if (unsubscribePending) sub.unsubscribe();
+    if (settled) return;
+    pollTimer = setInterval(requestRefresh, 1_000);
+    requestRefresh();
   });
 }

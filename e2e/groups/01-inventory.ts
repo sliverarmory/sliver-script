@@ -1,15 +1,11 @@
 import assert from "node:assert/strict";
 
 import type { clientpb } from "../../lib";
-
-import { loadE2EEnvironment, withConnectedClient } from "../support";
+import type { E2ESuiteContext } from "../context";
 
 export const name = "01-inventory";
 
-export async function run(): Promise<void> {
-  const environment = loadE2EEnvironment();
-
-  await withConnectedClient(environment, async ({ client }) => {
+export async function run({ client }: E2ESuiteContext): Promise<void> {
     const sessionInventory: clientpb.Sessions = await client.getSessions();
     assert.ok(Array.isArray(sessionInventory.Sessions), "GetSessions response must contain an array");
     assert.deepEqual(sessionInventory.Sessions, [], "fresh server session inventory");
@@ -33,10 +29,4 @@ export async function run(): Promise<void> {
     const jobs: clientpb.Job[] = await client.jobs();
     assert.ok(Array.isArray(jobs), "jobs helper must return an array");
     assert.deepEqual(jobs, jobInventory.Active, "jobs helper response");
-  });
 }
-
-void run().catch((error: unknown) => {
-  console.error(error instanceof Error ? (error.stack ?? error.message) : String(error));
-  process.exitCode = 1;
-});

@@ -15,7 +15,7 @@ jobs:
   sliver-e2e:
     name: sliver-script e2e (${{ matrix.platform }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 180
+    timeout-minutes: 360
     strategy:
       fail-fast: false
       matrix:
@@ -63,7 +63,7 @@ jobs:
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: sliver/server/assets/fs
-          key: sliver-assets-${{ runner.os }}-${{ runner.arch }}-${{ steps.sliver-source.outputs.sha }}
+          key: sliver-assets-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.sliver-source.outputs.sha }}
 
       - name: Verify exact bundled npm
         run: |

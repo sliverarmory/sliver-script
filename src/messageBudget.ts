@@ -16,6 +16,10 @@ export const WORKBENCH_ARTIFACT_RPC_MESSAGE_BYTES = 66 * MiB;
 export const TUNNEL_STREAM_MAX_PAYLOAD_BYTES = 64 * KiB;
 /** Room for the bounded payload plus tunnel identifiers and protobuf framing. */
 export const TUNNEL_STREAM_RPC_MESSAGE_BYTES = 66 * KiB;
+/** Maximum decoded response returned by an interactive beacon task helper. */
+export const BEACON_TASK_MAX_PAYLOAD_BYTES = 64 * KiB;
+/** Room for the bounded beacon response plus task and protobuf framing. */
+export const BEACON_TASK_RPC_MESSAGE_BYTES = 80 * KiB;
 
 export const RPC_MESSAGE_DOMAINS = [
   "control",
@@ -47,7 +51,7 @@ export const RPC_MESSAGE_BUDGETS = Object.freeze({
   // on a separate channel so this path can never inherit artifact allocations.
   "task-content": Object.freeze({
     maxSendBytes: 1 * MiB,
-    maxReceiveBytes: 80 * KiB,
+    maxReceiveBytes: BEACON_TASK_RPC_MESSAGE_BYTES,
   }),
   // M3 interactive streams use small, independently bounded frames. Never
   // grant a long-lived duplex tunnel an inventory or artifact-sized decoder.

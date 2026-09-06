@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, opendir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import net from "node:net";
 import os from "node:os";
@@ -21,7 +21,9 @@ const shutdownTimeoutMilliseconds = 10_000;
 const forcedShutdownTimeoutMilliseconds = 5_000;
 const defaultCommandTimeoutMilliseconds = 2 * 60_000;
 const buildCommandTimeoutMilliseconds = 45 * 60_000;
-const groupTimeoutMilliseconds = 10 * 60_000;
+// Match Sliver's comprehensive native E2E allowance. Implant generation can
+// legitimately take several minutes per mode on a cold hosted runner.
+const suiteTimeoutMilliseconds = 3.5 * 60 * 60_000;
 const commandOutputLimit = 2_000_000;
 const activeCommands = new Map();
 let cancellationSignal;
@@ -45,10 +47,29 @@ function mergedEnv(overrides = {}) {
   return { ...process.env, ...overrides };
 }
 
+function isolatedServerEnv(overrides = {}) {
+  const env = {};
+  for (const key of [
+    "PATH",
+    "Path",
+    "COMSPEC",
+    "PATHEXT",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "WINDIR",
+    "LANG",
+    "LC_ALL",
+  ]) {
+    if (process.env[key]) env[key] = process.env[key];
+  }
+  return { ...env, ...overrides };
+}
+
 async function runCommand(command, args, options = {}) {
   const {
     cwd = repoRoot,
     env = {},
+    inheritEnv = true,
     quiet = false,
     timeoutMilliseconds = defaultCommandTimeoutMilliseconds,
   } = options;
@@ -58,7 +79,7 @@ async function runCommand(command, args, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       cwd,
-      env: mergedEnv(env),
+      env: inheritEnv ? mergedEnv(env) : env,
       detached: process.platform !== "win32",
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
@@ -210,6 +231,31 @@ function nativeAssetPaths(goos, goarch) {
   ];
 }
 
+function nativeAssetStampPath(goos, goarch) {
+  // Platform asset directories are intentionally ignored by the Sliver
+  // submodule, so the cache marker never dirties the pinned source checkout.
+  return path.join(
+    sliverDir,
+    "server",
+    "assets",
+    "fs",
+    goos,
+    goarch,
+    ".sliver-script-e2e-assets.json",
+  );
+}
+
+async function nativeAssetsAreCurrent(assetPaths, stampPath, sliverSha, goVersion) {
+  if ((await Promise.all(assetPaths.map(fileHasContent))).some((present) => !present)) return false;
+  try {
+    const stamp = JSON.parse(await readFile(stampPath, "utf8"));
+    return stamp.sliverSha === sliverSha && stamp.goVersion === goVersion && stamp.schema === 1;
+  } catch (error) {
+    if (error?.code === "ENOENT" || error instanceof SyntaxError) return false;
+    throw error;
+  }
+}
+
 async function nativeGoPlatform(buildEnv) {
   const { stdout } = await runCommand("go", ["env", "GOOS", "GOARCH"], {
     cwd: sliverDir,
@@ -241,7 +287,7 @@ async function resolveSliverSource() {
   const [submoduleRevision, gitlinkRevision, trackedStatus] = await Promise.all([
     runCommand("git", ["rev-parse", "HEAD"], { cwd: sliverDir, quiet: true }),
     runCommand("git", ["rev-parse", "HEAD:sliver"], { cwd: repoRoot, quiet: true }),
-    runCommand("git", ["status", "--porcelain=v1", "--untracked-files=no"], {
+    runCommand("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
       cwd: sliverDir,
       quiet: true,
     }),
@@ -252,7 +298,7 @@ async function resolveSliverSource() {
     throw new Error(`Sliver submodule mismatch: checkout ${sliverSha}, gitlink ${gitlinkSha}`);
   }
   if (trackedStatus.stdout.trim()) {
-    throw new Error("Sliver submodule has tracked modifications; refusing an ambiguous E2E build");
+    throw new Error("Sliver submodule has source modifications; refusing an ambiguous E2E build");
   }
 
   const integrationLock = JSON.parse(await readFile(path.join(repoRoot, "integration.lock.json"), "utf8"));
@@ -285,8 +331,8 @@ async function buildSliverServer(testRoot, sliverSha) {
   validateNativePlatform(goos, goarch);
 
   const assetPaths = nativeAssetPaths(goos, goarch);
-  const assetState = await Promise.all(assetPaths.map(fileHasContent));
-  if (assetState.some((present) => !present)) {
+  const assetStampPath = nativeAssetStampPath(goos, goarch);
+  if (!await nativeAssetsAreCurrent(assetPaths, assetStampPath, sliverSha, requiredGoVersion)) {
     log("Downloading the Sliver build assets required by the pinned submodule");
     await runCommand("go", [
       "run",
@@ -299,6 +345,11 @@ async function buildSliverServer(testRoot, sliverSha) {
       env: buildEnv,
       timeoutMilliseconds: buildCommandTimeoutMilliseconds,
     });
+    await writeFile(
+      assetStampPath,
+      `${JSON.stringify({ schema: 1, sliverSha, goVersion: requiredGoVersion })}\n`,
+      "utf8",
+    );
   } else {
     log("Using cached Sliver build assets");
   }
@@ -533,6 +584,9 @@ async function collectGroups() {
   if (requested.length === 0) return files;
 
   const requestedSet = new Set(requested);
+  if (requested.some((name) => /^(?:0[4-9]|1[01])-/.test(name))) {
+    requestedSet.add("03-listener-generation-callbacks");
+  }
   const selected = files.filter((group) => requestedSet.has(group.name));
   const unknown = requested.filter((name) => !files.some((group) => group.name === name));
   if (unknown.length > 0) throw new Error(`Unknown E2E group(s): ${unknown.join(", ")}`);
@@ -540,30 +594,36 @@ async function collectGroups() {
 }
 
 async function runGroups(groups, env, resultsDir, results) {
-  for (const group of groups) {
-    log(`Running group ${group.name}`);
-    const started = Date.now();
-    try {
-      const output = await runCommand(process.execPath, [group.path], {
-        env,
-        timeoutMilliseconds: groupTimeoutMilliseconds,
-      });
-      await writeFile(
-        path.join(resultsDir, `${group.name}.log`),
-        `${output.stdout}${output.stderr}`,
-        "utf8",
-      );
-      results.push({ name: group.name, status: "passed", durationMilliseconds: Date.now() - started });
-    } catch (error) {
-      await writeFile(
-        path.join(resultsDir, `${group.name}.log`),
-        `${error?.stdout || ""}${error?.stderr || ""}`,
-        "utf8",
-      );
-      results.push({ name: group.name, status: "failed", durationMilliseconds: Date.now() - started });
-      throw error;
-    }
+  log(`Running ${groups.length} logical groups in one stateful suite`);
+  let commandError;
+  try {
+    const output = await runCommand(process.execPath, [path.join(repoRoot, "e2e", "dist", "suite.js")], {
+      env: {
+        ...env,
+        SLIVER_E2E_GROUPS: groups.map((group) => group.name).join(","),
+        SLIVER_E2E_RESULTS_DIR: resultsDir,
+      },
+      inheritEnv: false,
+      timeoutMilliseconds: suiteTimeoutMilliseconds,
+    });
+    await writeFile(path.join(resultsDir, "suite.log"), `${output.stdout}${output.stderr}`, "utf8");
+  } catch (error) {
+    commandError = error;
+    await writeFile(
+      path.join(resultsDir, "suite.log"),
+      `${error?.stdout || ""}${error?.stderr || ""}`,
+      "utf8",
+    );
   }
+
+  try {
+    const recorded = JSON.parse(await readFile(path.join(resultsDir, "group-results.json"), "utf8"));
+    if (!Array.isArray(recorded)) throw new Error("group-results.json must contain an array");
+    results.push(...recorded);
+  } catch (error) {
+    if (!commandError) throw error;
+  }
+  if (commandError) throw commandError;
 }
 
 async function preserveSliverLog(serverRoot, resultsDir, testRoot) {
@@ -571,8 +631,28 @@ async function preserveSliverLog(serverRoot, resultsDir, testRoot) {
   const source = path.join(serverRoot, "logs", "sliver.log");
   try {
     const raw = await readFile(source, "utf8");
-    const bounded = raw.slice(-500_000).replaceAll(testRoot, "<isolated-e2e-root>");
+    const bounded = raw
+      .slice(-500_000)
+      .replaceAll(testRoot, "<isolated-e2e-root>")
+      .replaceAll("sliver-script-e2e-password", "<e2e-credential-fixture>");
     await writeFile(path.join(resultsDir, "sliver.log"), bounded, "utf8");
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+}
+
+async function makeTreeRemovable(directory) {
+  try {
+    await chmod(directory, 0o700);
+    const entries = await opendir(directory);
+    for await (const entry of entries) {
+      const entryPath = path.join(directory, entry.name);
+      if (entry.isDirectory() && !entry.isSymbolicLink()) {
+        await makeTreeRemovable(entryPath);
+      } else if (!entry.isSymbolicLink()) {
+        await chmod(entryPath, 0o600);
+      }
+    }
   } catch (error) {
     if (error?.code !== "ENOENT") throw error;
   }
@@ -623,7 +703,10 @@ async function main() {
     };
     serverRoot = runtimeDirs.server;
     await Promise.all(Object.values(runtimeDirs).map((directory) => mkdir(directory, { recursive: true })));
-    const runtimeEnv = mergedEnv({
+    // Sliver's implant compiler logs its inherited environment after a failed
+    // build. Give the daemon only platform essentials and isolated paths so
+    // uploaded diagnostics cannot contain CI tokens or unrelated credentials.
+    const runtimeEnv = isolatedServerEnv({
       HOME: runtimeDirs.home,
       USERPROFILE: runtimeDirs.home,
       TMPDIR: runtimeDirs.tmp,
@@ -631,6 +714,10 @@ async function main() {
       TEMP: runtimeDirs.tmp,
       SLIVER_ROOT_DIR: runtimeDirs.server,
       SLIVER_CLIENT_ROOT_DIR: runtimeDirs.client,
+      // The embedded toolchain intentionally omits its VERSION file to reduce
+      // assets. Prevent Go's auto mode from trying to redownload that same
+      // toolchain while the server validates implant compiler targets.
+      GOTOOLCHAIN: "local",
     });
 
     const port = await allocateLoopbackPort();
@@ -652,7 +739,7 @@ async function main() {
       "all",
       "--save",
       configPath,
-    ], { cwd: sliverDir, env: runtimeEnv, quiet: true });
+    ], { cwd: sliverDir, env: runtimeEnv, inheritEnv: false, quiet: true });
     if (!(await fileHasContent(configPath))) {
       throw new Error(
         `Sliver operator CLI did not create the profile${operatorResult.stdout || operatorResult.stderr
@@ -690,6 +777,7 @@ async function main() {
       SLIVER_E2E_EXPECTED_ARCH: built.goarch,
       SLIVER_E2E_OPERATOR: operatorName,
       SLIVER_E2E_PLATFORM: process.env.SLIVER_E2E_PLATFORM || `${built.goos}-${built.goarch}`,
+      SLIVER_E2E_WORK_DIR: path.join(testRoot, "targets"),
     };
     await runGroups(groups, groupEnv, resultsDir, groupResults);
     log(`All ${groupResults.length} E2E groups passed`);
@@ -737,6 +825,7 @@ async function main() {
       failure = mergeFailure(failure, error, "E2E summary capture failed");
     } finally {
       try {
+        await makeTreeRemovable(testRoot);
         await rm(testRoot, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
       } catch (error) {
         failure = mergeFailure(failure, error, "isolated E2E secret cleanup failed");

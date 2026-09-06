@@ -1,4 +1,4 @@
-import { of, Subject } from "rxjs";
+import { of, Subject, throwError } from "rxjs";
 
 import { SliverClient, InteractiveBeacon, InteractiveSession } from "../client";
 import type { SliverClientConfig } from "../config";
@@ -15,8 +15,8 @@ import {
   WebContent,
 } from "../pb/clientpb/client";
 import { Empty } from "../pb/commonpb/common";
-import { Ls } from "../pb/sliverpb/sliver";
-import { RPC_MESSAGE_BUDGETS } from "../messageBudget";
+import { Download, Ls } from "../pb/sliverpb/sliver";
+import { BEACON_TASK_MAX_PAYLOAD_BYTES, RPC_MESSAGE_BUDGETS } from "../messageBudget";
 
 function dummyConfig(): SliverClientConfig {
   return {
@@ -228,6 +228,199 @@ test("InteractiveBeacon.lsTask().wait() decodes beacon task results", async () =
     { ID: taskId },
     expect.objectContaining({ signal: expect.any(AbortSignal) }),
   );
+});
+
+test("InteractiveBeacon.download fetches a completed queued task after an early result event", async () => {
+  const taskId = "download-task";
+  const beaconId = "beacon-download";
+  const payload = Buffer.from("bounded beacon download\n");
+  const taskResponse = Buffer.from(Download.encode(Download.create({
+    Path: "/tmp/fixture.txt",
+    Exists: true,
+    IsDir: false,
+    Data: Buffer.from(payload),
+    Response: { Err: "" },
+  })).finish());
+  const events$ = new Subject<Event>();
+  const rpc = {
+    download: jest.fn(async () => {
+      events$.next(Event.create({
+        EventType: SliverClient.EVENT_BEACON_TASKRESULT,
+        Data: Buffer.from(BeaconTask.encode(BeaconTask.create({ ID: taskId })).finish()),
+      }));
+      return Download.create({
+        Response: { Err: "", Async: true, BeaconID: beaconId, TaskID: taskId },
+      });
+    }),
+    getBeaconTaskContent: jest.fn(async () => BeaconTask.create({
+      ID: taskId,
+      BeaconID: beaconId,
+      State: "completed",
+      Response: taskResponse,
+    })),
+  };
+  const beacon = new InteractiveBeacon(rpc as any, events$.asObservable(), beaconId);
+
+  await expect(beacon.download("/tmp/fixture.txt", 5)).resolves.toEqual(payload);
+  expect(rpc.download).toHaveBeenCalledWith(
+    expect.objectContaining({
+      Path: "/tmp/fixture.txt",
+      MaxBytes: String(BEACON_TASK_MAX_PAYLOAD_BYTES + 1),
+      RestrictedToFile: true,
+      Request: expect.objectContaining({ Async: true, BeaconID: beaconId }),
+    }),
+    expect.objectContaining({ signal: expect.any(AbortSignal) }),
+  );
+  expect(rpc.getBeaconTaskContent).toHaveBeenCalledWith(
+    { ID: taskId },
+    expect.objectContaining({ signal: expect.any(AbortSignal) }),
+  );
+  expect(taskResponse.every((byte) => byte === 0)).toBe(true);
+});
+
+test("InteractiveBeacon.download rejects over-limit task content and wipes its serialized response", async () => {
+  const taskId = "oversized-download-task";
+  const taskResponse = Buffer.from(Download.encode(Download.create({
+    Path: "/tmp/oversized.bin",
+    Exists: true,
+    Data: Buffer.alloc(BEACON_TASK_MAX_PAYLOAD_BYTES + 1, 0x41),
+    Response: { Err: "" },
+  })).finish());
+  const rpc = {
+    download: jest.fn(async () => Download.create({
+      Response: { Async: true, BeaconID: "beacon", TaskID: taskId },
+    })),
+    getBeaconTaskContent: jest.fn(async () => BeaconTask.create({
+      ID: taskId,
+      State: "completed",
+      Response: taskResponse,
+    })),
+  };
+  const beacon = new InteractiveBeacon(rpc as any, new Subject<Event>(), "beacon");
+
+  await expect(beacon.download("/tmp/oversized.bin", 5)).rejects.toThrow(
+    `Download exceeds the ${BEACON_TASK_MAX_PAYLOAD_BYTES}-byte decoded limit`,
+  );
+  expect(taskResponse.every((byte) => byte === 0)).toBe(true);
+});
+
+test("InteractiveBeacon rejects canceled task content instead of decoding an empty result", async () => {
+  const rpc = {
+    ls: jest.fn(async () => Ls.create({
+      Response: { Async: true, BeaconID: "beacon", TaskID: "canceled-task" },
+    })),
+    getBeaconTaskContent: jest.fn(async () => BeaconTask.create({
+      ID: "canceled-task",
+      State: "canceled",
+    })),
+  };
+  const beacon = new InteractiveBeacon(rpc as any, new Subject<Event>(), "beacon");
+  const task = await beacon.lsTask(".", 5);
+
+  await expect(task.wait(5)).rejects.toThrow("Beacon task canceled-task ended in state canceled");
+});
+
+test("InteractiveBeacon rejects a completed task with an empty response", async () => {
+  const rpc = {
+    ls: jest.fn(async () => Ls.create({
+      Response: { Async: true, BeaconID: "beacon", TaskID: "empty-task" },
+    })),
+    getBeaconTaskContent: jest.fn(async () => BeaconTask.create({
+      ID: "empty-task",
+      State: "completed",
+    })),
+  };
+  const beacon = new InteractiveBeacon(rpc as any, new Subject<Event>(), "beacon");
+  const task = await beacon.lsTask(".", 5);
+
+  await expect(task.wait(5)).rejects.toThrow("Beacon task empty-task returned an empty response");
+});
+
+test("InteractiveBeacon clears its timers after a synchronous event-stream error", async () => {
+  jest.useFakeTimers();
+  try {
+    const rpc = {
+      ls: jest.fn(async () => Ls.create({
+        Response: { Async: true, BeaconID: "beacon", TaskID: "stream-error-task" },
+      })),
+      getBeaconTaskContent: jest.fn(),
+    };
+    const beacon = new InteractiveBeacon(
+      rpc as any,
+      throwError(() => new Error("event stream failed")),
+      "beacon",
+    );
+    const task = await beacon.lsTask(".", 5);
+
+    await expect(task.wait(5)).rejects.toThrow("event stream failed");
+    expect(jest.getTimerCount()).toBe(0);
+    expect(rpc.getBeaconTaskContent).not.toHaveBeenCalled();
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("InteractiveBeacon polls task content when no result event arrives", async () => {
+  jest.useFakeTimers();
+  try {
+    const response = Buffer.from(Ls.encode(Ls.create({ Path: "/polled", Exists: true })).finish());
+    const rpc = {
+      ls: jest.fn(async () => Ls.create({
+        Response: { Async: true, BeaconID: "beacon", TaskID: "polled-task" },
+      })),
+      getBeaconTaskContent: jest
+        .fn()
+        .mockResolvedValueOnce(BeaconTask.create({ ID: "polled-task", State: "sent" }))
+        .mockResolvedValueOnce(BeaconTask.create({
+          ID: "polled-task",
+          State: "completed",
+          Response: response,
+        })),
+    };
+    const beacon = new InteractiveBeacon(rpc as any, new Subject<Event>(), "beacon");
+    const task = await beacon.lsTask(".", 5);
+    const wait = task.wait(5);
+
+    await jest.advanceTimersByTimeAsync(0);
+    expect(rpc.getBeaconTaskContent).toHaveBeenCalledTimes(1);
+    await jest.advanceTimersByTimeAsync(1_000);
+    await expect(wait).resolves.toMatchObject({ Path: "/polled" });
+    expect(rpc.getBeaconTaskContent).toHaveBeenCalledTimes(2);
+  } finally {
+    jest.useRealTimers();
+  }
+});
+
+test("InteractiveBeacon aborts an in-flight task fetch at the overall wait deadline", async () => {
+  jest.useFakeTimers();
+  try {
+    let fetchSignal: AbortSignal | undefined;
+    const rpc = {
+      ls: jest.fn(async () => Ls.create({
+        Response: { Async: true, BeaconID: "beacon", TaskID: "stalled-task" },
+      })),
+      getBeaconTaskContent: jest.fn((_request: unknown, options: { signal: AbortSignal }) => {
+        fetchSignal = options.signal;
+        return new Promise<BeaconTask>((_resolve, reject) => {
+          options.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        });
+      }),
+    };
+    const beacon = new InteractiveBeacon(rpc as any, new Subject<Event>(), "beacon");
+    const task = await beacon.lsTask(".", 1);
+    const wait = task.wait(1);
+    const timedOut = expect(wait).rejects.toThrow(
+      "Timeout waiting for beacon task result: stalled-task",
+    );
+
+    await jest.advanceTimersByTimeAsync(0);
+    expect(fetchSignal?.aborted).toBe(false);
+    await jest.advanceTimersByTimeAsync(1_000);
+    await timedOut;
+    expect(fetchSignal?.aborted).toBe(true);
+  } finally {
+    jest.useRealTimers();
+  }
 });
 
 test("SliverClient-created beacons fetch results only through the task-content channel", async () => {
