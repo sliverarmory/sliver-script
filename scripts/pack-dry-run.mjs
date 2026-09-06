@@ -5,11 +5,14 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const npmCli = process.env.npm_execpath;
+if (!npmCli) {
+  throw new Error("Missing npm_execpath; run this check through npm");
+}
 const temporary = await mkdtemp(join(tmpdir(), "sliver-script-pack-dry-run-"));
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 
 try {
-  execFileSync(npm, ["pack", ".", "--dry-run"], {
+  execFileSync(process.execPath, [npmCli, "pack", ".", "--dry-run"], {
     cwd: repositoryRoot,
     env: {
       ...process.env,

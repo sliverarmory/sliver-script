@@ -7,8 +7,11 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const npmCli = process.env.npm_execpath;
+if (!npmCli) {
+  throw new Error("Missing npm_execpath; run this check through npm");
+}
 const temporary = await mkdtemp(join(tmpdir(), "sliver-script-pack-check-"));
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 
 const requiredFiles = [
   "LICENSE",
@@ -46,8 +49,8 @@ const forbiddenFiles = [
 
 try {
   const packOutput = execFileSync(
-    npm,
-    ["pack", ".", "--json", "--ignore-scripts", "--pack-destination", temporary],
+    process.execPath,
+    [npmCli, "pack", ".", "--json", "--ignore-scripts", "--pack-destination", temporary],
     {
       cwd: repositoryRoot,
       encoding: "utf8",
@@ -105,8 +108,9 @@ try {
   );
 
   execFileSync(
-    npm,
+    process.execPath,
     [
+      npmCli,
       "install",
       tarball,
       "--ignore-scripts",
@@ -131,7 +135,7 @@ try {
       `Clean consumer locked unexpected package integrity: ${String(lockedPackage?.integrity)}`,
     );
   }
-  execFileSync(npm, ["audit", "--omit=dev"], {
+  execFileSync(process.execPath, [npmCli, "audit", "--omit=dev"], {
     cwd: consumer,
     env: npmEnvironment(join(temporary, "npm-cache")),
     stdio: "inherit",
