@@ -1,12 +1,16 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readdir, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const outputArgument = parseArguments(process.argv.slice(2));
+const outputDirectory = outputArgument === undefined
+  ? undefined
+  : await validateOutputDirectory(outputArgument);
 const npmCli = process.env.npm_execpath;
 if (!npmCli) {
   throw new Error("Missing npm_execpath; run this check through npm");
@@ -34,6 +38,7 @@ const forbiddenPrefixes = [
   "examples/",
   "lib/tests/",
   "node_modules/",
+  "scripts/npm-release/",
   "sliver/",
   "src/tests/",
   "wireguard-proxy/",
@@ -80,12 +85,17 @@ try {
     throw new Error(JSON.stringify({ missing, forbidden }, null, 2));
   }
 
+  if (typeof entry.filename !== "string" || basename(entry.filename) !== entry.filename
+      || !entry.filename.endsWith(".tgz")) {
+    throw new Error(`Unexpected packed tarball filename: ${String(entry.filename)}`);
+  }
   const tarball = join(temporary, entry.filename);
   if (!existsSync(tarball)) {
     throw new Error(`npm pack did not create ${tarball}`);
   }
+  const tarballContents = await readFile(tarball);
   const tarballIntegrity = `sha512-${createHash("sha512")
-    .update(await readFile(tarball))
+    .update(tarballContents)
     .digest("base64")}`;
   if (entry.integrity !== tarballIntegrity) {
     throw new Error(`Packed tarball integrity mismatch: ${entry.integrity} != ${tarballIntegrity}`);
@@ -208,9 +218,34 @@ try {
   if (installedManifest.dependencies?.["nice-grpc-common"] !== "^2.0.4") {
     throw new Error("Packed manifest does not declare the generated nice-grpc-common import");
   }
-  const tarballShasum = createHash("sha1").update(await readFile(tarball)).digest("hex");
+  const checkedTarballContents = await readFile(tarball);
+  if (!checkedTarballContents.equals(tarballContents)) {
+    throw new Error("Packed tarball changed during consumer validation");
+  }
+  const tarballShasum = createHash("sha1").update(checkedTarballContents).digest("hex");
   if (entry.shasum !== tarballShasum) {
     throw new Error(`Packed tarball shasum mismatch: ${entry.shasum} != ${tarballShasum}`);
+  }
+  if (outputDirectory !== undefined) {
+    const sourceSha = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repositoryRoot,
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "inherit"],
+      timeout: 10_000,
+    }).trim();
+    if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(sourceSha)) {
+      throw new Error(`Unexpected source commit: ${sourceSha}`);
+    }
+    await retainArtifact(outputDirectory, checkedTarballContents, {
+      schemaVersion: 1,
+      name: installedManifest.name,
+      version: installedManifest.version,
+      filename: entry.filename,
+      integrity: tarballIntegrity,
+      shasum: tarballShasum,
+      sourceSha,
+    });
+    console.log(`Retained validated release artifact and metadata in ${outputDirectory}`);
   }
   console.log(
     `Packed and loaded ${installedManifest.name}@${installedManifest.version} from a clean consumer ` +
@@ -219,6 +254,74 @@ try {
   );
 } finally {
   await rm(temporary, { recursive: true, force: true });
+}
+
+function parseArguments(args) {
+  if (args.length === 0) return undefined;
+  if (args.length !== 2 || args[0] !== "--output-dir" || !args[1]
+      || args[1].startsWith("--")) {
+    throw new Error("Usage: npm run pack:check -- [--output-dir <directory>]");
+  }
+  return args[1];
+}
+
+async function validateOutputDirectory(requested) {
+  const absolute = resolve(requested);
+  let ancestor = absolute;
+  const missingComponents = [];
+  let resolvedAncestor;
+  for (;;) {
+    try {
+      resolvedAncestor = await realpath(ancestor);
+      break;
+    } catch (error) {
+      if (error.code !== "ENOENT" || dirname(ancestor) === ancestor) throw error;
+      missingComponents.unshift(basename(ancestor));
+      ancestor = dirname(ancestor);
+    }
+  }
+  const destination = resolve(resolvedAncestor, ...missingComponents);
+  const fromRepository = relative(await realpath(repositoryRoot), destination);
+  if (fromRepository === ""
+      || (fromRepository !== ".." && !fromRepository.startsWith(`..${sep}`)
+        && !isAbsolute(fromRepository))) {
+    throw new Error("Release output directory must be outside the repository");
+  }
+  await requireEmptyDirectory(destination);
+  return destination;
+}
+
+async function requireEmptyDirectory(directory) {
+  try {
+    if ((await readdir(directory)).length !== 0) {
+      throw new Error(`Release output directory must be empty: ${directory}`);
+    }
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+}
+
+async function retainArtifact(directory, tarballContents, metadata) {
+  await mkdir(directory, { recursive: true });
+  await requireEmptyDirectory(directory);
+  const tarballPath = join(directory, metadata.filename);
+  const createdFiles = [];
+  async function writeExclusive(path, contents) {
+    const handle = await open(path, "wx");
+    createdFiles.push(path);
+    try {
+      await handle.writeFile(contents);
+    } finally {
+      await handle.close();
+    }
+  }
+  try {
+    await writeExclusive(tarballPath, tarballContents);
+    await writeExclusive(join(directory, "release.json"), `${JSON.stringify(metadata, null, 2)}\n`);
+  } catch (error) {
+    await Promise.allSettled(createdFiles.map((path) => rm(path, { force: true })));
+    throw error;
+  }
 }
 
 function npmEnvironment(cache) {

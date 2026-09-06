@@ -1,0 +1,226 @@
+name: Publish npm
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      source-ref:
+        description: Source branch, tag, or commit to validate (dry-run only)
+        required: true
+        default: master
+        type: string
+      tag:
+        description: Expected version tag, such as v2.0.0 or v2.0.0-rc.1
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  RELEASE_DRY_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+
+jobs:
+  prepare:
+    name: Validate release source
+    if: >-
+      github.repository == 'sliverarmory/sliver-script' &&
+      ((github.event_name == 'push' && !github.event.deleted) ||
+       (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.release.outputs.sha }}
+      version: ${{ steps.release.outputs.version }}
+      dist_tag: ${{ steps.release.outputs.dist_tag }}
+    steps:
+      - name: Check out release source and history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.source-ref || github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up exact Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.20.0
+          package-manager-cache: false
+
+      - name: Resolve source commit
+        id: source
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Validate tag, versions, and master ancestry
+        id: release
+        run: node scripts/npm-release/release.mjs prepare
+        env:
+          RELEASE_SHA: ${{ github.event_name == 'push' && github.sha || steps.source.outputs.sha }}
+
+  build:
+    name: Required package checks
+    needs: prepare
+    uses: ./.github/workflows/build-check.yml
+    with:
+      source-ref: ${{ needs.prepare.outputs.sha }}
+      release-artifact: true
+
+  e2e:
+    name: Required end-to-end checks
+    needs: prepare
+    uses: ./.github/workflows/e2e.yml
+    with:
+      source-ref: ${{ needs.prepare.outputs.sha }}
+
+  dry-run:
+    name: Validate publication without uploading
+    needs: [prepare, build, e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+    steps:
+      - name: Set artifact directory
+        run: echo "RELEASE_DIR=$RUNNER_TEMP/npm-release" >> "$GITHUB_ENV"
+
+      - name: Check out release validation helpers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up exact Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.20.0
+          package-manager-cache: false
+
+      - name: Verify exact bundled npm
+        run: test "$(npm --version)" = "11.19.0"
+
+      - name: Download the checked tarball from this run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-release
+          path: ${{ env.RELEASE_DIR }}
+
+      - name: Revalidate release source
+        run: node scripts/npm-release/release.mjs prepare
+
+      - name: Verify artifact identity and integrity
+        id: artifact
+        run: node scripts/npm-release/release.mjs check-artifact
+
+      - name: Check registry version and release channel
+        id: registry
+        run: node scripts/npm-release/release.mjs registry-check
+
+      - name: Dry-run the exact tarball without lifecycle scripts
+        if: steps.registry.outputs.already_published != 'true'
+        env:
+          TARBALL: ${{ steps.artifact.outputs.tarball }}
+          DIST_TAG: ${{ needs.prepare.outputs.dist_tag }}
+        run: npm publish "$TARBALL" --dry-run --ignore-scripts --access public --tag "$DIST_TAG" --registry https://registry.npmjs.org
+
+      - name: Verify an existing identical publication
+        if: steps.registry.outputs.already_published == 'true'
+        run: node scripts/npm-release/release.mjs verify-published
+
+      - name: Record dry-run result
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          DIST_TAG: ${{ needs.prepare.outputs.dist_tag }}
+          INTEGRITY: ${{ steps.artifact.outputs.integrity }}
+        run: |
+          {
+            echo "### npm publication dry-run"
+            echo "- Package: sliver-script@$VERSION"
+            echo "- Source: $RELEASE_SHA"
+            echo "- Channel: $DIST_TAG"
+            echo "- Integrity: $INTEGRITY"
+            echo "- Package and E2E gates passed; tarball validated without uploading."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    name: Publish validated tarball
+    needs: [prepare, build, e2e, dry-run]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm
+    concurrency:
+      group: npm-publish-sliver-script
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      RELEASE_SHA: ${{ needs.prepare.outputs.sha }}
+    steps:
+      - name: Set artifact directory
+        run: echo "RELEASE_DIR=$RUNNER_TEMP/npm-release" >> "$GITHUB_ENV"
+
+      - name: Check out release validation helpers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up exact Node.js and npm registry
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.20.0
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+
+      - name: Verify exact bundled npm
+        run: test "$(npm --version)" = "11.19.0"
+
+      - name: Download the checked tarball from this run
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: npm-release
+          path: ${{ env.RELEASE_DIR }}
+
+      - name: Refresh release tag and master immediately before publishing
+        run: git fetch --force --no-recurse-submodules origin "+refs/heads/master:refs/remotes/origin/master" "+refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+
+      - name: Revalidate release source
+        run: node scripts/npm-release/release.mjs prepare
+
+      - name: Verify artifact identity and integrity
+        id: artifact
+        run: node scripts/npm-release/release.mjs check-artifact
+
+      - name: Check for an existing identical publication
+        id: registry
+        run: node scripts/npm-release/release.mjs registry-check
+
+      - name: Publish through npm trusted publishing
+        if: steps.registry.outputs.already_published != 'true'
+        env:
+          TARBALL: ${{ steps.artifact.outputs.tarball }}
+          DIST_TAG: ${{ needs.prepare.outputs.dist_tag }}
+        run: npm publish "$TARBALL" --ignore-scripts --access public --tag "$DIST_TAG" --provenance --registry https://registry.npmjs.org
+
+      - name: Verify registry, downloaded bytes, and provenance metadata
+        run: node scripts/npm-release/release.mjs verify-published
+
+      - name: Record verified publication
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          DIST_TAG: ${{ needs.prepare.outputs.dist_tag }}
+          INTEGRITY: ${{ steps.artifact.outputs.integrity }}
+        run: |
+          {
+            echo "### Verified npm publication"
+            echo "- Package: https://www.npmjs.com/package/sliver-script/v/$VERSION"
+            echo "- Source: $RELEASE_SHA"
+            echo "- Channel: $DIST_TAG"
+            echo "- Downloaded tarball integrity: $INTEGRITY"
+            echo "- npm provenance metadata is present."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -48,6 +48,17 @@ The npm tarball carries those generated TypeScript modules and their provenance 
 
 Before preparing a package, run `npm run audit:all` and `npm run verify`. Verification audits the exact packed runtime dependency graph, then executes unit tests, protobuf checks, a clean TypeScript build, `npm pack --dry-run`, and CommonJS, ESM, and TypeScript NodeNext smoke tests against the packed tarball in a temporary consumer. The packed tarball includes the TypeScript source and locked protobuf provenance in addition to compiled JavaScript and declarations.
 
+### Publishing releases
+
+Pushing a version tag such as `v2.0.0` starts the npm publishing workflow. Both
+Build Check and the full native E2E matrix must pass for that commit before the
+validated tarball can be published. Stable versions use npm's `latest` channel;
+prereleases such as `v2.0.0-rc.1` use `next`.
+
+The workflow also supports a manual dry-run before creating a tag. See
+[`RELEASING.md`](https://github.com/sliverarmory/sliver-script/blob/master/RELEASING.md)
+for npm trusted publisher setup, dry-runs, release steps, and retry behavior.
+
 
 ### TypeScript Example
 

@@ -7,6 +7,11 @@ on:
     branches: [master, v2]
   workflow_dispatch:
   workflow_call:
+    inputs:
+      source-ref:
+        description: Immutable source commit selected by the release workflow
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -40,6 +45,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          ref: ${{ inputs.source-ref }}
           submodules: recursive
 
       - name: Set up exact Node.js
