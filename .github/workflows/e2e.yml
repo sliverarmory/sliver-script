@@ -1,0 +1,95 @@
+name: Sliver End-to-End
+
+on:
+  push:
+    branches: [master, v2]
+  pull_request:
+    branches: [master, v2]
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  sliver-e2e:
+    name: sliver-script e2e (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-amd64
+            runner: ubuntu-24.04
+            goos: linux
+            goarch: amd64
+          - platform: windows-amd64
+            runner: windows-2025
+            goos: windows
+            goarch: amd64
+          - platform: macos-arm64
+            runner: macos-15
+            goos: darwin
+            goarch: arm64
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out source and pinned Sliver input
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Set up exact Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.20.0
+          cache: npm
+
+      - name: Set up Go from the pinned Sliver module
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version-file: sliver/go.mod
+          cache: true
+          cache-dependency-path: sliver/go.sum
+
+      - name: Resolve pinned Sliver commit
+        id: sliver-source
+        run: echo "sha=$(git -C sliver rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Sliver build assets
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: sliver/server/assets/fs
+          key: sliver-assets-${{ runner.os }}-${{ runner.arch }}-${{ steps.sliver-source.outputs.sha }}
+
+      - name: Verify exact bundled npm
+        run: |
+          actual="$(npm --version)"
+          if [[ "$actual" != "11.19.0" ]]; then
+            echo "::error title=Wrong bundled npm::Node.js 24.20.0 must provide npm 11.19.0 (found ${actual})."
+            exit 1
+          fi
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: Build native Sliver and run grouped TypeScript E2E tests
+        run: npm run test:e2e
+        env:
+          SLIVER_E2E_EXPECTED_OS: ${{ matrix.goos }}
+          SLIVER_E2E_EXPECTED_ARCH: ${{ matrix.goarch }}
+          SLIVER_E2E_PLATFORM: ${{ matrix.platform }}
+          SLIVER_E2E_RESULTS_DIR: e2e-results/${{ matrix.platform }}
+
+      - name: Upload safe E2E diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sliver-script-e2e-${{ matrix.platform }}
+          path: e2e-results/${{ matrix.platform }}
+          if-no-files-found: warn
+          overwrite: true
+          retention-days: 14

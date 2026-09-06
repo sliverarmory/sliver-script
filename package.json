@@ -10,11 +10,13 @@
   },
   "scripts": {
     "build": "node ./scripts/clean.mjs lib && tsc -p tsconfig.json",
+    "build:e2e": "npm run build && node ./scripts/clean.mjs e2e/dist && tsc -p tsconfig.e2e.json",
     "pb": "npm run protobuf:generate",
     "protobuf:generate": "node ./scripts/protobuf.mjs --write",
     "protobuf:check": "node ./scripts/protobuf.mjs --check",
     "docs": "typedoc --out ./docs/ ./src",
     "test": "jest --config jestconfig.json",
+    "test:e2e": "npm run build:e2e && node ./e2e/run.mjs",
     "audit:all": "npm audit",
     "audit:production": "npm audit --omit=dev",
     "pack:dry-run": "node ./scripts/pack-dry-run.mjs",

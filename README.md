@@ -5,6 +5,7 @@ Sliver-script is a TypeScript/JavaScript client library for Sliver, it can be us
 This library targets modern Sliver protobuf/gRPC APIs and provides a strongly-typed TypeScript-first client.
 
 [![Build Check](https://github.com/sliverarmory/sliver-script/actions/workflows/build-check.yml/badge.svg)](https://github.com/sliverarmory/sliver-script/actions/workflows/build-check.yml)
+[![Sliver End-to-End](https://github.com/sliverarmory/sliver-script/actions/workflows/e2e.yml/badge.svg)](https://github.com/sliverarmory/sliver-script/actions/workflows/e2e.yml)
 [![npm version](https://img.shields.io/npm/v/sliver-script.svg)](https://www.npmjs.com/package/sliver-script)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
@@ -15,6 +16,14 @@ The integrated wrapper provenance is pinned in `integration.lock.json`: standalo
 Node v24 or later is required for this package, and it can be installed via npm:
 
 `npm install sliver-script`
+
+### End-to-end tests
+
+`npm run test:e2e` compiles the server from the pinned Sliver submodule, creates
+an isolated multiplayer profile with the server CLI, starts the native server,
+and runs the grouped TypeScript client tests against it. GitHub Actions runs the
+same path on Linux/amd64, Windows/amd64, and macOS/arm64. See
+[`e2e/README.md`](e2e/README.md) for the implemented groups and expansion plan.
 
 ### Operator transport
 
