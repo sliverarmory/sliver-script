@@ -22,7 +22,7 @@ Operator connections use direct mTLS. Configurations containing a WireGuard oper
 
 ### Reproducible protobuf generation
 
-Generated TypeScript under `src/pb` is locked to Sliver commit `ca685f5eed64c3327c0e57504928cfd2d2e96bea`, protoc 35.1, and ts-proto 2.11.4. The generator reads only the pinned `sliver` submodule; it never selects a neighboring checkout.
+Generated TypeScript under `src/pb` is locked to Sliver commit `ca685f5eed64c3327c0e57504928cfd2d2e96bea`, protoc 35.1, and ts-proto 2.12.1. The generator reads only the pinned `sliver` submodule; it never selects a neighboring checkout.
 
 From a Git source checkout, install protoc 35.1 after `npm ci`, initialize the pinned submodule, and run:
 
