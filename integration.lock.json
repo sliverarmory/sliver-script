@@ -7,7 +7,7 @@
   },
   "sliver": {
     "repository": "https://github.com/BishopFox/sliver.git",
-    "sourceCommit": "c3e8a97f66e10b63e0d2f37c3656013a4f8aadf4",
+    "sourceCommit": "a89c03bb8793882fe528f7922b652fe4be89d77f",
     "protobufLock": "protobuf.lock.json"
   },
   "importedPaths": [
@@ -42,6 +42,15 @@
         "src/internal/tunnelManager.ts"
       ],
       "reason": "Retain bounded fair queues with secure overflow disposal and legacy RxJS compatibility while opening the TunnelData stream only for an actual managed tunnel."
+    },
+    {
+      "paths": [
+        "src/forwarding.ts",
+        "src/internal/portForward.ts",
+        "src/internal/reversePortForward.ts",
+        "src/internal/socks5Proxy.ts"
+      ],
+      "reason": "Provide stateful TCP, reverse TCP, and SOCKS5 forwarding handles with bounded queues, exact tunnel ownership, reconnect reconciliation, and observable lifecycle accounting."
     },
     {
       "paths": [

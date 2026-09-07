@@ -23,6 +23,7 @@ keeping each area of client behavior independently identifiable in diagnostics.
 | `08-beacon-filesystem` | Queued working-directory, mkdir, cd, upload/download, list, and recursive removal calls with completed-task verification |
 | `09-beacon-process-network` | Queued process, interface, socket, and environment calls plus synchronous/background execution, child tracking, termination, and task-history verification |
 | `10-beacon-session-transition` | Opening an mTLS session from the live beacon, callback correlation, ping/close, and confirmation that the beacon remains registered |
+| `10-forwarding` | Stateful TCP port forwards carrying HTTP and multi-frame binary traffic, SOCKS5 no-auth and username/password negotiation with IPv4 and domain targets, and server-owned reverse port forwards carrying runner-hosted HTTP and binary traffic |
 | `11-lifecycle-cleanup` | Session and beacon kill semantics, disconnect/job-stop events, process exit, beacon removal, generated-build deletion, listener stop, and terminal empty inventories |
 
 Run the full suite from the repository root:
@@ -30,6 +31,25 @@ Run the full suite from the repository root:
 ```sh
 npm run test:e2e
 ```
+
+The default `pinned` source mode requires the Sliver submodule to be clean and
+requires its `HEAD` to match both the parent repository gitlink and
+`integration.lock.json`. For an intentional, uncommitted Sliver patch, a local
+developer can opt into the fail-closed working-tree mode explicitly:
+
+```sh
+SLIVER_E2E_SLIVER_SOURCE=working-tree npm run test:e2e
+```
+
+Working-tree mode still requires the submodule `HEAD` to match both pins and
+requires at least one non-ignored modification. It fingerprints the complete
+binary/full-index tracked diff plus sorted untracked path, mode, and content
+with SHA-256, keys compiler assets to that fingerprint, marks the built server
+dirty, and verifies that the fingerprint has not changed after the build. The
+digest and expected dirty state appear in authenticated-readiness output and
+`summary.json`. This mode refuses to run when `CI=true` or
+`GITHUB_ACTIONS=true`; hosted workflows leave it unset and therefore retain the
+strict clean-pin check.
 
 Select a comma-separated subset with `SLIVER_E2E_GROUPS`:
 
@@ -51,9 +71,10 @@ through 02 can run independently. An unknown group name fails before server
 startup.
 
 The first run may download Sliver's compiler assets and can take substantially
-longer than a warm run. The asset stamp ties cached files to both the pinned
-Sliver commit and required Go version. The harness rejects non-ignored source
-changes in the submodule or a native OS/architecture mismatch.
+longer than a warm run. The asset stamp ties cached files to the exact Sliver
+source identity and required Go version. In default mode, the harness rejects
+non-ignored source changes in the submodule. Both modes reject a native
+OS/architecture mismatch.
 
 Set `SLIVER_E2E_RESULTS_DIR` to retain local diagnostics outside the temporary
 test root:
@@ -76,10 +97,12 @@ so diagnostic logs do not inherit unrelated CI secrets. Generated binary bytes
 are cleared after being written, and failure cleanup removes profiles, builds,
 listeners, sessions, beacons, processes, and the temporary root.
 
-The suite does not run shell/tunnel interaction, screenshots, process dumps,
+The suite does not run interactive shell tunnels, screenshots, process dumps,
 service mutation, token mutation, registry-hive export, injection, or arbitrary
-payload execution. Those calls require separate fixtures or privileges and are
-kept outside this portable localhost matrix.
+payload execution. Forwarding coverage uses deterministic, bounded loopback TCP
+fixtures only. In particular, hosted CI does not install an RDP client, use RDP
+credentials, or connect to port 3389; RDP interoperability is validated in the
+separate Proxmox/GOAD range.
 
 GitHub Actions runs the full suite with a recursive submodule checkout, Node.js
 24.20.0/npm 11.19.0, and the Go version declared by `sliver/go.mod` on:

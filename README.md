@@ -29,9 +29,57 @@ same path on Linux/amd64, Windows/amd64, and macOS/arm64. See
 
 Operator connections use direct mTLS. Configurations containing a WireGuard operator profile are rejected before credentials or channels are created. WireGuard listener and implant C2 APIs remain available.
 
+### Stateful forwarding
+
+The client provides stateful TCP port-forward, reverse-port-forward, and SOCKS5
+handles. Local port forwards and SOCKS5 listeners are owned by the
+`SliverClient` and close when it disconnects. Reverse port forwards are owned by
+the teamserver: their handles become `detached` on disconnect and reconcile with
+the authoritative server inventory after the client reconnects.
+
+```typescript
+const portForward = await client.startPortForward(sessionId, {
+  bind: { host: "127.0.0.1", port: 0 }, // zero selects a free local port
+  target: { host: "intranet.example", port: 443 },
+})
+
+const socks = await client.startSocks5Proxy(sessionId, {
+  bind: { host: "127.0.0.1", port: 0 },
+  authentication: { username: "operator", password: process.env.SOCKS_PASSWORD! },
+})
+
+const reverse = await client.startReversePortForward(sessionId, {
+  bind: { host: "127.0.0.1", port: 8080 }, // opened by the implant
+  target: { host: "127.0.0.1", port: 3000 }, // opened by the teamserver
+})
+
+portForward.connection$.subscribe((connection) => {
+  console.log(connection.status, connection.bytesToTarget, connection.bytesFromTarget)
+})
+
+await Promise.all([portForward.close(), socks.close(), reverse.close()])
+```
+
+Local listeners expose their actual bound address, immutable state snapshots,
+state and per-connection observables, bounded connection/buffer controls, and
+idempotent `close()`. Use `listPortForwards()` / `stopPortForward(id)` and
+`listSocks5Proxies()` / `stopSocks5Proxy(id)` for client-owned inventory. Use
+`listReversePortForwards()` / `stopReversePortForward()` for server-owned
+inventory, including safe cleanup of legacy listeners whose target metadata is
+not trusted. Sliver's generic forwarding protocol currently supports TCP; the
+application traffic carried over it can be HTTP, RDP, or any other TCP protocol.
+These tunnels use full-close TCP semantics: a local FIN retires both directions,
+so protocols that send a delayed response only after the client half-closes are
+not supported. A SOCKS connection's `open` event means its Sliver lifecycle
+stream is established; SOCKS authentication and the target `CONNECT` exchange
+still occur afterward. Authentication and `CONNECT` rejections are returned in
+the SOCKS wire replies and follow the ordinary connection-close lifecycle; the
+handle does not parse these negotiation results. A `protocol-error` event means
+malformed Sliver SOCKS framing, such as invalid sequence or acknowledgement data.
+
 ### Reproducible protobuf generation
 
-Generated TypeScript under `src/pb` is locked to Sliver commit `ca685f5eed64c3327c0e57504928cfd2d2e96bea`, protoc 35.1, and ts-proto 2.12.1. The generator reads only the pinned `sliver` submodule; it never selects a neighboring checkout.
+Generated TypeScript under `src/pb` is locked to Sliver commit `a89c03bb8793882fe528f7922b652fe4be89d77f`, protoc 35.1, and ts-proto 2.12.1. The generator reads only the pinned `sliver` submodule; it never selects a neighboring checkout.
 
 From a Git source checkout, install protoc 35.1 after `npm ci`, initialize the pinned submodule, and run:
 

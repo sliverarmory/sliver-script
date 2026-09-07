@@ -21,7 +21,13 @@ export async function run(context: E2ESuiteContext): Promise<void> {
       Number.isSafeInteger(Number(version.CompiledAt)) && Number(version.CompiledAt) > 0,
       "server compilation timestamp",
     );
-    assert.equal(version.Dirty, false, "server must report a clean source build");
+    assert.equal(
+      version.Dirty,
+      environment.expectedSliverDirty,
+      environment.expectedSliverDirty
+        ? `server must report dirty working-tree source ${environment.sliverPatchSha256}`
+        : "server must report a clean pinned source build",
+    );
 
     const operator = await waitForOnlineOperator(client, environment.operator);
     assert.equal(operator.Name, environment.operator, "server operator identity");

@@ -33,6 +33,16 @@ interface TunnelState {
   output?: AsyncQueue<Uint8Array>;
   onClosed?: () => void;
   onFailure?: (reason: "cancelled" | "overflow" | "transport") => void;
+  bind?: TunnelBindState;
+}
+
+interface TunnelBindState {
+  readonly sessionId: string;
+  readonly promise: Promise<void>;
+  readonly resolve: () => void;
+  readonly reject: (error: Error) => void;
+  started: boolean;
+  settled: boolean;
 }
 
 interface PendingFrame {
@@ -173,11 +183,10 @@ class FairTunnelSendQueue implements AsyncIterable<DeepPartial<TunnelData>> {
   }
 
   private next(): Promise<IteratorResult<DeepPartial<TunnelData>>> {
-    // The transport asking for another item is the async-iterator signal that
-    // it has finished serializing the previously yielded frame. Retain at most
-    // that one frame until this point, then clear its operation-owned bytes and
-    // acknowledge the sender. A pull alone is not enough: its Promise may
-    // resume the sender before the iterator consumer observes the yielded data.
+    // A successor pull proves nice-grpc accepted the previous object with
+    // call.write(), but grpc-js may still serialize that object later from its
+    // bounded Writable queue. Acknowledge the sender and release our reference
+    // without ever mutating an object after it has been yielded.
     this.completeDeliveredFrame();
     if (this.failure) return Promise.reject(this.failure);
     const frame = this.takeNextFrame();
@@ -235,7 +244,6 @@ class FairTunnelSendQueue implements AsyncIterable<DeepPartial<TunnelData>> {
     const frame = this.deliveredFrame;
     if (!frame) return;
     this.deliveredFrame = null;
-    frame.message.Data?.fill(0);
     frame.resolve();
   }
 
@@ -243,7 +251,6 @@ class FairTunnelSendQueue implements AsyncIterable<DeepPartial<TunnelData>> {
     const frame = this.deliveredFrame;
     if (!frame) return;
     this.deliveredFrame = null;
-    frame.message.Data?.fill(0);
     frame.reject(error);
   }
 }
@@ -252,9 +259,11 @@ export class TunnelManager {
   private readonly outgoing = new FairTunnelSendQueue();
   private readonly byTunnelId = new Map<string, TunnelState>();
   private readonly abort = new AbortController();
+  private readonly transportFailureListeners = new Set<() => void>();
 
   private rpc: SliverRPCClient | null = null;
   private running: Promise<void> | null = null;
+  private transportFailed = false;
 
   start(rpc: SliverRPCClient): void {
     if (this.rpc) return;
@@ -273,13 +282,25 @@ export class TunnelManager {
         if (!this.abort.signal.aborted) throw new Error(SAFE_TUNNEL_TRANSPORT_ERROR);
       } catch {
         if (!this.abort.signal.aborted) {
+          this.transportFailed = true;
           this.outgoing.fail();
           for (const tunnelId of [...this.byTunnelId.keys()]) {
             this.failTunnel(tunnelId, "transport");
           }
+          for (const listener of [...this.transportFailureListeners]) invokeClosed(listener);
         }
       }
     })();
+  }
+
+  /** Registers a listener for an unexpected terminal TunnelData failure. */
+  onTransportFailure(listener: () => void): () => void {
+    if (this.transportFailed) {
+      invokeClosed(listener);
+      return () => undefined;
+    }
+    this.transportFailureListeners.add(listener);
+    return () => this.transportFailureListeners.delete(listener);
   }
 
   /** Legacy RxJS compatibility. New main-process callers use openOutput(). */
@@ -292,8 +313,11 @@ export class TunnelManager {
       throw new Error("Tunnel output budget must be a positive safe integer");
     }
 
-    const state = this.ensureTunnel(tunnelId);
-    if (state.output) throw new Error("Tunnel output is already registered");
+    // A managed output is the exclusive first owner of a tunnel id. Legacy
+    // subscribe() callers may observe an already-managed tunnel, but a managed
+    // caller must never overlay callbacks or cancellation authority onto state
+    // that an earlier legacy subscriber created.
+    const state = this.ensureTunnel(tunnelId, true);
 
     state.onClosed = options.onClosed;
     state.onFailure = options.onFailure;
@@ -315,11 +339,54 @@ export class TunnelManager {
     return this.outgoing.enqueue(msg);
   }
 
+  /**
+   * Binds a newly-created server tunnel to this manager's TunnelData stream and
+   * waits for the server's exact zero-data acknowledgement. Sliver routes the
+   * bind and the subsequent Portfwd/Shell unary RPC over independent HTTP/2
+   * streams, so waiting only for local serialization leaves a real race.
+   */
+  async bind(tunnelId: string, sessionId: string, signal?: AbortSignal): Promise<void> {
+    const normalizedSessionId = sessionId.trim();
+    if (!normalizedSessionId) throw new Error("Session id is required");
+    if (signal?.aborted) throw new Error("Tunnel bind was cancelled");
+
+    const state = this.ensureTunnel(tunnelId);
+    if (!state.bind) state.bind = createTunnelBindState(normalizedSessionId);
+    const bind = state.bind;
+    if (bind.sessionId !== normalizedSessionId) {
+      throw new Error("Tunnel belongs to another session");
+    }
+
+    // Only the caller that created the bind state emits the ownership frame.
+    // Concurrent callers share the same acknowledgement rather than racing a
+    // duplicate bind onto the stream.
+    if (!bind.started) {
+      bind.started = true;
+      try {
+        await waitForTunnelBind(this.send({
+          TunnelID: tunnelId.trim(),
+          SessionID: normalizedSessionId,
+          Data: Buffer.alloc(0),
+        }), signal);
+      } catch (error) {
+        if (signal?.aborted) throw error;
+        settleTunnelBind(bind, "reject", safeTunnelError(error, SAFE_TUNNEL_TRANSPORT_ERROR));
+        // Observe the shared promise on this path too. Throwing the send error
+        // directly would leave the rejected acknowledgement promise without a
+        // consumer and can surface later as an unhandled rejection.
+        return await bind.promise;
+      }
+    }
+
+    await waitForTunnelBind(bind.promise, signal);
+  }
+
   cancelTunnel(tunnelId: string): void {
     const state = this.byTunnelId.get(tunnelId);
     if (!state) return;
     this.byTunnelId.delete(tunnelId);
     this.outgoing.unregister(tunnelId);
+    if (state.bind) settleTunnelBind(state.bind, "reject", new Error(SAFE_TUNNEL_CLOSED_ERROR));
     state.output?.cancel();
     state.subject.complete();
   }
@@ -338,9 +405,10 @@ export class TunnelManager {
     this.running = null;
     this.rpc = null;
     for (const tunnelId of [...this.byTunnelId.keys()]) this.failTunnel(tunnelId, "transport");
+    this.transportFailureListeners.clear();
   }
 
-  private ensureTunnel(tunnelId: string): TunnelState {
+  private ensureTunnel(tunnelId: string, exclusive = false): TunnelState {
     const normalized = tunnelId.trim();
     if (!normalized) throw new Error("Tunnel id is required");
 
@@ -349,7 +417,10 @@ export class TunnelManager {
     this.ensureRunning();
 
     let state = this.byTunnelId.get(normalized);
-    if (state) return state;
+    if (state) {
+      if (exclusive) throw new Error("Tunnel output is already registered");
+      return state;
+    }
     if (this.byTunnelId.size >= TUNNEL_MANAGER_MAX_ACTIVE_TUNNELS) {
       throw new Error("Tunnel capacity is exhausted");
     }
@@ -370,10 +441,24 @@ export class TunnelManager {
     const state = this.byTunnelId.get(tunnelId);
     if (!state) return;
 
+    // Once bind() establishes an owner, TunnelID alone is no longer a valid
+    // routing capability. Ignore foreign-session frames before overflow,
+    // observer, output, or terminal processing so they cannot disclose bytes
+    // or tear down the owner's tunnel. Legacy subscribe()-only tunnels remain
+    // intentionally unbound and retain their historical routing behavior.
+    if (state.bind && msg.SessionID !== state.bind.sessionId) {
+      msg.Data.fill(0);
+      return;
+    }
+
     if (msg.Data.length > TUNNEL_STREAM_MAX_PAYLOAD_BYTES) {
       msg.Data.fill(0);
       this.failTunnel(tunnelId, "overflow");
       return;
+    }
+
+    if (state.bind && msg.SessionID === state.bind.sessionId && msg.Data.length === 0 && !msg.Closed) {
+      settleTunnelBind(state.bind, "resolve");
     }
 
     state.subject.next(msg);
@@ -388,6 +473,7 @@ export class TunnelManager {
     if (msg.Closed) {
       this.byTunnelId.delete(tunnelId);
       this.outgoing.unregister(tunnelId);
+      if (state.bind) settleTunnelBind(state.bind, "reject", new Error(SAFE_TUNNEL_CLOSED_ERROR));
       state.output?.close();
       state.subject.complete();
       invokeClosed(state.onClosed);
@@ -400,10 +486,63 @@ export class TunnelManager {
     this.byTunnelId.delete(tunnelId);
     const error = new Error(reason === "overflow" ? SAFE_TUNNEL_OVERFLOW_ERROR : SAFE_TUNNEL_TRANSPORT_ERROR);
     this.outgoing.unregister(tunnelId, error);
+    if (state.bind) settleTunnelBind(state.bind, "reject", error);
     state.output?.fail(error);
     state.subject.error(error);
     invokeFailure(state.onFailure, reason);
   }
+}
+
+function createTunnelBindState(sessionId: string): TunnelBindState {
+  let resolve!: () => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<void>((onResolve, onReject) => {
+    resolve = onResolve;
+    reject = onReject;
+  });
+  // A caller may cancel after the ownership frame is serialized but before it
+  // begins waiting for the shared acknowledgement. Keep the shared rejection
+  // observed even if that caller then retires the tunnel.
+  void promise.catch(() => undefined);
+  return { sessionId, promise, resolve, reject, started: false, settled: false };
+}
+
+function settleTunnelBind(
+  bind: TunnelBindState,
+  outcome: "resolve" | "reject",
+  error?: Error,
+): void {
+  if (bind.settled) return;
+  bind.settled = true;
+  if (outcome === "resolve") {
+    bind.resolve();
+  } else {
+    bind.reject(error ?? new Error(SAFE_TUNNEL_CLOSED_ERROR));
+  }
+}
+
+async function waitForTunnelBind(promise: Promise<void>, signal?: AbortSignal): Promise<void> {
+  if (!signal) return promise;
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const finish = (error?: unknown): void => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener("abort", abort);
+      if (error) reject(error);
+      else resolve();
+    };
+    const abort = (): void => finish(new Error("Tunnel bind was cancelled"));
+    // Attach to the underlying promise before inspecting an already-aborted
+    // signal so a later queue/tunnel cancellation cannot become unhandled.
+    promise.then(() => finish(), (error: unknown) => finish(error));
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) abort();
+  });
+}
+
+function safeTunnelError(value: unknown, fallback: string): Error {
+  return value instanceof Error ? value : new Error(fallback);
 }
 
 function clearBytes(value: Uint8Array): void {

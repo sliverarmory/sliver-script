@@ -76,6 +76,48 @@ describe("bounded managed session shell", () => {
     await handle.close();
   });
 
+  test("does not close a legacy tunnel when CreateTunnel returns its id", async () => {
+    const harness = new TunnelHarness();
+    const received: TunnelData[] = [];
+    const completed = jest.fn();
+    harness.manager.subscribe("legacy-shell-owner").subscribe({
+      next: (message) => received.push(message),
+      complete: completed,
+    });
+    const shell = jest.fn(async () => shellResponse("legacy-shell-owner", "/bin/sh", 42, true));
+    const closeTunnel = jest.fn(async () => ({}));
+    const client = clientWithShellRpc(harness.manager, {
+      createTunnel: jest.fn(async () => ({
+        TunnelID: " legacy-shell-owner ",
+        SessionID: "session-duplicate",
+      })),
+      shell,
+      closeTunnel,
+    });
+
+    await expect(client.startShellSession("session-duplicate", {
+      path: "/bin/sh", pty: true, rows: 24, cols: 80,
+    }, 0)).rejects.toThrow("Unable to start shell session");
+
+    expect(shell).not.toHaveBeenCalled();
+    expect(closeTunnel).not.toHaveBeenCalled();
+    expect(harness.outbound).toEqual([]);
+    expect(harness.manager.stats().activeTunnels).toBe(1);
+
+    const legacyData = tunnelMessage(
+      "legacy-shell-owner", "legacy-session", Buffer.from("still-owned"),
+    );
+    harness.incoming.push(legacyData);
+    await waitFor(() => received.length === 1);
+    expect(received).toEqual([legacyData]);
+    expect(completed).not.toHaveBeenCalled();
+
+    harness.incoming.push(tunnelMessage(
+      "legacy-shell-owner", "legacy-session", Buffer.alloc(0), true,
+    ));
+    await waitFor(() => completed.mock.calls.length === 1);
+  });
+
   test.each([
     ["target rejection", async () => shellResponse(
       "tunnel-failure", "/bin/sh", 0, true, "TOP-SECRET-TARGET-DETAIL",
@@ -418,6 +460,44 @@ describe("bounded fair tunnel manager", () => {
     expect(harness.streamStarted).toBe(true);
   });
 
+  test("rejects a managed-output overlay without mutating a legacy subscription", async () => {
+    const harness = new TunnelHarness();
+    const received: TunnelData[] = [];
+    const completed = jest.fn();
+    const outputClosed = jest.fn();
+    const outputFailed = jest.fn();
+    harness.manager.subscribe("legacy-overlay").subscribe({
+      next: (message) => received.push(message),
+      complete: completed,
+    });
+
+    expect(() => harness.manager.openOutput(" legacy-overlay ", {
+      maxBufferedBytes: 64,
+      onClosed: outputClosed,
+      onFailure: outputFailed,
+    })).toThrow("Tunnel output is already registered");
+    expect(harness.manager.stats().activeTunnels).toBe(1);
+    expect(outputClosed).not.toHaveBeenCalled();
+    expect(outputFailed).not.toHaveBeenCalled();
+
+    const legacyData = tunnelMessage(
+      "legacy-overlay", "legacy-session", Buffer.from("legacy-data"),
+    );
+    harness.incoming.push(legacyData);
+    await waitFor(() => received.length === 1);
+    expect(received).toEqual([legacyData]);
+    expect(completed).not.toHaveBeenCalled();
+    expect(outputClosed).not.toHaveBeenCalled();
+    expect(outputFailed).not.toHaveBeenCalled();
+
+    harness.incoming.push(tunnelMessage(
+      "legacy-overlay", "legacy-session", Buffer.alloc(0), true,
+    ));
+    await waitFor(() => completed.mock.calls.length === 1);
+    expect(outputClosed).not.toHaveBeenCalled();
+    expect(outputFailed).not.toHaveBeenCalled();
+  });
+
   test("round-robins tunnels and rejects frames beyond per-tunnel caps", async () => {
     const harness = new TunnelHarness(false);
     harness.manager.openOutput("tunnel-a", { maxBufferedBytes: 64 });
@@ -449,7 +529,7 @@ describe("bounded fair tunnel manager", () => {
     await completionPull;
   });
 
-  test("clears each delivered frame after the transport requests its successor", async () => {
+  test("keeps a yielded frame intact when gRPC serializes it after the successor pull", async () => {
     const harness = new TunnelHarness(false);
     harness.manager.openOutput("tunnel-clear", { maxBufferedBytes: 64 });
 
@@ -466,14 +546,14 @@ describe("bounded fair tunnel manager", () => {
 
     const next = harness.pullOutgoing();
     await firstSend;
-    expect(first.Data?.every((byte) => byte === 0)).toBe(true);
+    expect(Buffer.from(first.Data ?? []).toString()).toBe("first-secret");
     const secondSend = harness.manager.send(tunnelSend("tunnel-clear", "second-secret"));
     const second = await next;
     expect(Buffer.from(second.Data ?? []).toString()).toBe("second-secret");
 
     const completionPull = harness.pullOutgoing().catch(() => undefined);
     await secondSend;
-    expect(second.Data?.every((byte) => byte === 0)).toBe(true);
+    expect(Buffer.from(second.Data ?? []).toString()).toBe("second-secret");
     await harness.stop();
     await completionPull;
   });
@@ -488,10 +568,10 @@ describe("bounded fair tunnel manager", () => {
 
     await harness.stop();
     await expect(send).rejects.toThrow("Tunnel is closed");
-    expect(delivered.Data?.every((byte) => byte === 0)).toBe(true);
+    expect(Buffer.from(delivered.Data ?? []).toString()).toBe("stop-secret");
   });
 
-  test("rejects and clears only the delivered frame owned by a cancelled tunnel", async () => {
+  test("rejects without mutating the transport-owned frame of a cancelled tunnel", async () => {
     const harness = new TunnelHarness(false);
     harness.manager.openOutput("tunnel-cancel", { maxBufferedBytes: 64 });
 
@@ -501,7 +581,7 @@ describe("bounded fair tunnel manager", () => {
     harness.manager.cancelTunnel("tunnel-cancel");
 
     await rejection;
-    expect(delivered.Data?.every((byte) => byte === 0)).toBe(true);
+    expect(Buffer.from(delivered.Data ?? []).toString()).toBe("cancel-secret");
   });
 
   test("does not clear another tunnel's delivered frame during cancellation", async () => {
@@ -523,12 +603,12 @@ describe("bounded fair tunnel manager", () => {
     expect(Buffer.from(delivered.Data ?? []).toString()).toBe("live-secret");
     const completionPull = harness.pullOutgoing().catch(() => undefined);
     await send;
-    expect(delivered.Data?.every((byte) => byte === 0)).toBe(true);
+    expect(Buffer.from(delivered.Data ?? []).toString()).toBe("live-secret");
     await harness.stop();
     await completionPull;
   });
 
-  test("rejects and clears a delivered frame when the transport iterator returns", async () => {
+  test("rejects without mutating a delivered frame when the transport iterator returns", async () => {
     const harness = new TunnelHarness(false);
     harness.manager.openOutput("tunnel-return", { maxBufferedBytes: 64 });
 
@@ -538,7 +618,7 @@ describe("bounded fair tunnel manager", () => {
     await harness.returnOutgoing();
 
     await rejection;
-    expect(delivered.Data?.every((byte) => byte === 0)).toBe(true);
+    expect(Buffer.from(delivered.Data ?? []).toString()).toBe("return-secret");
   });
 
   test("caps active tunnels and fails output overflow without retaining data", async () => {
@@ -605,6 +685,214 @@ describe("bounded fair tunnel manager", () => {
     expect(errors[0]?.message).toBe("Tunnel transport disconnected");
     expect(errors[0]?.message).not.toMatch(/TOP-SECRET/u);
     expect(completed).not.toHaveBeenCalled();
+  });
+
+  test("notifies current and late lifecycle observers of terminal transport failure", async () => {
+    const harness = new TunnelHarness();
+    const current = jest.fn();
+    const removeCurrent = harness.manager.onTransportFailure(current);
+    harness.manager.openOutput("transport-lifecycle", { maxBufferedBytes: 64 });
+
+    harness.incoming.fail(new Error("TOP-SECRET-TRANSPORT-DETAIL"));
+    await waitFor(() => current.mock.calls.length === 1);
+
+    const late = jest.fn();
+    const removeLate = harness.manager.onTransportFailure(late);
+    expect(current).toHaveBeenCalledTimes(1);
+    expect(late).toHaveBeenCalledTimes(1);
+    removeCurrent();
+    removeLate();
+  });
+
+  test("waits for the server bind acknowledgement before resolving", async () => {
+    const harness = new TunnelHarness();
+    harness.manager.openOutput("bind-ack", { maxBufferedBytes: 64 });
+
+    let settled = false;
+    const binding = harness.manager.bind("bind-ack", "session-bind");
+    void binding.finally(() => { settled = true; });
+    await waitFor(() => harness.outbound.length === 1);
+
+    expect(harness.outbound[0]).toEqual({
+      TunnelID: "bind-ack",
+      SessionID: "session-bind",
+      Data: Buffer.alloc(0),
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    harness.incoming.push(tunnelMessage("bind-ack", "session-bind", Buffer.alloc(0)));
+    await expect(binding).resolves.toBeUndefined();
+    expect(settled).toBe(true);
+  });
+
+  test("coalesces concurrent binds and rejects a pending bind on tunnel close", async () => {
+    const harness = new TunnelHarness();
+    harness.manager.openOutput("bind-shared", { maxBufferedBytes: 64 });
+
+    const first = harness.manager.bind("bind-shared", "session-bind");
+    const second = harness.manager.bind("bind-shared", "session-bind");
+    await waitFor(() => harness.outbound.length === 1);
+    expect(harness.outbound).toHaveLength(1);
+
+    harness.manager.cancelTunnel("bind-shared");
+    await expect(first).rejects.toThrow("Tunnel is closed");
+    await expect(second).rejects.toThrow("Tunnel is closed");
+  });
+
+  test("allows one coalesced bind waiter to abort without poisoning another", async () => {
+    const harness = new TunnelHarness();
+    const controller = new AbortController();
+    harness.manager.openOutput("bind-independent", { maxBufferedBytes: 64 });
+
+    const first = harness.manager.bind("bind-independent", "session-bind", controller.signal);
+    const second = harness.manager.bind("bind-independent", "session-bind");
+    await waitFor(() => harness.outbound.length === 1);
+    controller.abort();
+    await expect(first).rejects.toThrow("Tunnel bind was cancelled");
+
+    harness.incoming.push(tunnelMessage("bind-independent", "session-bind", Buffer.alloc(0)));
+    await expect(second).resolves.toBeUndefined();
+  });
+
+  test("does not accept an ownership acknowledgement from another session", async () => {
+    const harness = new TunnelHarness();
+    harness.manager.openOutput("bind-owner", { maxBufferedBytes: 64 });
+
+    let settled = false;
+    const binding = harness.manager.bind("bind-owner", "expected-session");
+    void binding.then(() => { settled = true; }, () => { settled = true; });
+    await waitFor(() => harness.outbound.length === 1);
+
+    harness.incoming.push(tunnelMessage("bind-owner", "other-session", Buffer.alloc(0)));
+    await Promise.resolve();
+    expect(settled).toBe(false);
+
+    harness.incoming.push(tunnelMessage("bind-owner", "expected-session", Buffer.alloc(0)));
+    await expect(binding).resolves.toBeUndefined();
+  });
+
+  test("ignores and clears wrong-session data and close frames on a bound tunnel", async () => {
+    const harness = new TunnelHarness();
+    const onClosed = jest.fn();
+    const completed = jest.fn();
+    const received: TunnelData[] = [];
+    const output = harness.manager.openOutput("bound-routing", {
+      maxBufferedBytes: 64,
+      onClosed,
+    });
+    harness.manager.subscribe("bound-routing").subscribe({
+      next: (message) => received.push(message),
+      complete: completed,
+    });
+
+    const binding = harness.manager.bind("bound-routing", "owner-session");
+    await waitFor(() => harness.outbound.length === 1);
+    harness.incoming.push(tunnelMessage("bound-routing", "owner-session", Buffer.alloc(0)));
+    await expect(binding).resolves.toBeUndefined();
+    received.splice(0, received.length);
+
+    const foreignData = tunnelMessage(
+      "bound-routing",
+      "foreign-session",
+      Buffer.from("foreign-data"),
+    );
+    const foreignClose = tunnelMessage(
+      "bound-routing",
+      "foreign-session",
+      Buffer.from("foreign-close"),
+      true,
+    );
+    harness.incoming.push(foreignData);
+    harness.incoming.push(foreignClose);
+    await waitFor(() => foreignData.Data.every((byte) => byte === 0)
+      && foreignClose.Data.every((byte) => byte === 0));
+
+    expect(received).toEqual([]);
+    expect(onClosed).not.toHaveBeenCalled();
+    expect(completed).not.toHaveBeenCalled();
+    expect(harness.manager.stats().activeTunnels).toBe(1);
+
+    const ownedData = tunnelMessage("bound-routing", "owner-session", Buffer.from("owned"));
+    harness.incoming.push(ownedData);
+    await expect(output[Symbol.asyncIterator]().next()).resolves.toEqual({
+      value: Uint8Array.from(Buffer.from("owned")),
+      done: false,
+    });
+    expect(received).toEqual([ownedData]);
+
+    harness.incoming.push(tunnelMessage("bound-routing", "owner-session", Buffer.alloc(0), true));
+    await waitFor(() => onClosed.mock.calls.length === 1);
+    expect(completed).toHaveBeenCalledTimes(1);
+    expect(harness.manager.stats().activeTunnels).toBe(0);
+  });
+
+  test("preserves session-agnostic delivery for an unbound legacy subscription", async () => {
+    const harness = new TunnelHarness();
+    const received: TunnelData[] = [];
+    const completed = jest.fn();
+    harness.manager.subscribe("legacy-unbound").subscribe({
+      next: (message) => received.push(message),
+      complete: completed,
+    });
+
+    const data = tunnelMessage("legacy-unbound", "legacy-session-a", Buffer.from("legacy"));
+    const closed = tunnelMessage("legacy-unbound", "legacy-session-b", Buffer.alloc(0), true);
+    harness.incoming.push(data);
+    harness.incoming.push(closed);
+    await waitFor(() => completed.mock.calls.length === 1);
+
+    expect(received).toEqual([data, closed]);
+    expect(Buffer.from(received[0]!.Data).toString()).toBe("legacy");
+    expect(harness.manager.stats().activeTunnels).toBe(0);
+  });
+
+  test("observes the shared bind rejection when the outgoing stream closes", async () => {
+    const harness = new TunnelHarness(false);
+    harness.manager.openOutput("bind-send-failure", { maxBufferedBytes: 64 });
+
+    const binding = harness.manager.bind("bind-send-failure", "session-bind");
+    await waitFor(() => harness.streamStarted);
+    await harness.returnOutgoing();
+
+    await expect(binding).rejects.toThrow("Tunnel is closed");
+  });
+
+  test("cancels a bind stalled in ownership-frame delivery without orphaning its acknowledgement", async () => {
+    const harness = new TunnelHarness(false);
+    const controller = new AbortController();
+    harness.manager.openOutput("bind-abort-send", { maxBufferedBytes: 64 });
+
+    const unhandled: unknown[] = [];
+    const onUnhandled = (error: unknown): void => { unhandled.push(error); };
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      const binding = harness.manager.bind("bind-abort-send", "session-bind", controller.signal);
+      const delivered = await harness.pullOutgoing();
+      controller.abort();
+      await expect(binding).rejects.toThrow("Tunnel bind was cancelled");
+
+      harness.manager.cancelTunnel("bind-abort-send");
+      expect(delivered.Data?.every((byte) => byte === 0)).toBe(true);
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  });
+
+  test("does not enqueue or orphan a bind whose signal was already aborted", async () => {
+    const harness = new TunnelHarness();
+    const controller = new AbortController();
+    harness.manager.openOutput("bind-pre-abort", { maxBufferedBytes: 64 });
+    controller.abort();
+
+    await expect(harness.manager.bind("bind-pre-abort", "session-bind", controller.signal))
+      .rejects.toThrow("Tunnel bind was cancelled");
+    harness.manager.cancelTunnel("bind-pre-abort");
+    await new Promise((resolve) => setImmediate(resolve));
+    expect(harness.outbound).toEqual([]);
+    expect(harness.manager.stats()).toEqual({ activeTunnels: 0, queuedFrames: 0, queuedBytes: 0 });
   });
 });
 

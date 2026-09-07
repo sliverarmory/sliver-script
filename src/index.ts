@@ -1,5 +1,6 @@
 export * from './client';
 export * from './config';
+export * from './forwarding';
 export { timeoutSecondsToNanoseconds, withTimeoutSignal } from "./internal/timeout";
 export * from './messageBudget';
 export * as commonpb from "./pb/commonpb/common";

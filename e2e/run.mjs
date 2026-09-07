@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
-import { chmod, mkdir, mkdtemp, opendir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { chmod, lstat, mkdir, mkdtemp, opendir, readFile, readdir, readlink, rm, stat, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import net from "node:net";
 import os from "node:os";
@@ -283,22 +285,163 @@ function validateNativePlatform(goos, goarch) {
   }
 }
 
-async function resolveSliverSource() {
-  const [submoduleRevision, gitlinkRevision, trackedStatus] = await Promise.all([
+function resolveSliverSourceMode() {
+  const mode = process.env.SLIVER_E2E_SLIVER_SOURCE?.trim() || "pinned";
+  if (mode !== "pinned" && mode !== "working-tree") {
+    throw new Error(
+      `Unsupported SLIVER_E2E_SLIVER_SOURCE=${JSON.stringify(mode)}; expected pinned or working-tree`,
+    );
+  }
+  if (mode === "working-tree") {
+    const ciVariables = ["CI", "GITHUB_ACTIONS"].filter(
+      (name) => process.env[name]?.trim().toLowerCase() === "true",
+    );
+    if (ciVariables.length > 0) {
+      throw new Error(
+        `SLIVER_E2E_SLIVER_SOURCE=working-tree is local-only and cannot run when ${ciVariables.join("/")} is true`,
+      );
+    }
+  }
+  return mode;
+}
+
+function hashRecord(hash, value) {
+  const bytes = Buffer.isBuffer(value) ? value : Buffer.from(String(value));
+  const length = Buffer.alloc(8);
+  length.writeBigUInt64BE(BigInt(bytes.length));
+  hash.update(length);
+  hash.update(bytes);
+}
+
+function parseNullTerminatedPaths(output) {
+  if (output.length === 0) return [];
+  if (!output.endsWith("\0")) {
+    throw new Error("git ls-files returned a non-NUL-terminated untracked path list");
+  }
+  const paths = output.slice(0, -1).split("\0");
+  if (paths.some((entry) => entry.length === 0)) {
+    throw new Error("git ls-files returned an empty untracked path");
+  }
+  return paths.sort((left, right) => Buffer.compare(Buffer.from(left), Buffer.from(right)));
+}
+
+function checkedUntrackedPath(relativePath) {
+  const components = relativePath.split(/[\\/]/u);
+  if (
+    relativePath.length === 0
+    || path.isAbsolute(relativePath)
+    || components.includes("")
+    || components.includes(".")
+    || components.includes("..")
+  ) {
+    throw new Error(`Cannot fingerprint unsafe Sliver untracked path ${JSON.stringify(relativePath)}`);
+  }
+  const absolutePath = path.resolve(sliverDir, relativePath);
+  const containedPath = path.relative(sliverDir, absolutePath);
+  if (containedPath.startsWith("..") || path.isAbsolute(containedPath)) {
+    throw new Error(`Sliver untracked path escapes the source tree: ${JSON.stringify(relativePath)}`);
+  }
+  return { absolutePath, relativePath };
+}
+
+function statIdentity(fileStat) {
+  return [
+    fileStat.dev,
+    fileStat.ino,
+    fileStat.mode,
+    fileStat.size,
+    fileStat.mtimeNs,
+    fileStat.ctimeNs,
+  ].join(":");
+}
+
+async function hashUntrackedEntry(hash, untrackedPath) {
+  const { absolutePath, relativePath } = checkedUntrackedPath(untrackedPath);
+  const before = await lstat(absolutePath, { bigint: true });
+  const mode = Number(before.mode & 0o7777n).toString(8).padStart(4, "0");
+  hashRecord(hash, relativePath);
+  hashRecord(hash, mode);
+
+  if (before.isFile()) {
+    hashRecord(hash, "file");
+    hashRecord(hash, before.size.toString());
+    let bytesRead = 0n;
+    for await (const chunk of createReadStream(absolutePath)) {
+      if (cancellationSignal) throw new Error(`E2E run cancelled by ${cancellationSignal}`);
+      bytesRead += BigInt(chunk.length);
+      hash.update(chunk);
+    }
+    if (bytesRead !== before.size) {
+      throw new Error(`Sliver untracked file changed while fingerprinting: ${relativePath}`);
+    }
+  } else if (before.isSymbolicLink()) {
+    const rawTarget = await readlink(absolutePath, { encoding: "buffer" });
+    const target = Buffer.isBuffer(rawTarget) ? rawTarget : Buffer.from(rawTarget);
+    hashRecord(hash, "symlink");
+    hashRecord(hash, target);
+  } else {
+    throw new Error(
+      `Cannot fingerprint non-file Sliver untracked entry ${JSON.stringify(relativePath)}`,
+    );
+  }
+
+  const after = await lstat(absolutePath, { bigint: true });
+  if (statIdentity(after) !== statIdentity(before)) {
+    throw new Error(`Sliver untracked entry changed while fingerprinting: ${relativePath}`);
+  }
+}
+
+async function fingerprintSliverWorkingTree(testRoot) {
+  const hash = createHash("sha256");
+  hashRecord(hash, "sliver-script-e2e-working-tree-v1");
+
+  const diffPath = path.join(testRoot, "sliver-working-tree.patch");
+  try {
+    await runCommand("git", [
+      "diff",
+      "--binary",
+      "--full-index",
+      "--no-ext-diff",
+      "--no-textconv",
+      `--output=${diffPath}`,
+      "HEAD",
+      "--",
+    ], { cwd: sliverDir, quiet: true });
+    const diffStat = await stat(diffPath, { bigint: true });
+    hashRecord(hash, "tracked-diff");
+    hashRecord(hash, diffStat.size.toString());
+    for await (const chunk of createReadStream(diffPath)) hash.update(chunk);
+  } finally {
+    await rm(diffPath, { force: true });
+  }
+
+  const { stdout: untrackedOutput } = await runCommand(
+    "git",
+    ["ls-files", "--others", "--exclude-standard", "-z"],
+    { cwd: sliverDir, quiet: true },
+  );
+  if (untrackedOutput.length >= commandOutputLimit) {
+    throw new Error("Sliver untracked path metadata exceeds the E2E fingerprint limit");
+  }
+  const untrackedPaths = parseNullTerminatedPaths(untrackedOutput);
+  hashRecord(hash, "untracked-entry-count");
+  hashRecord(hash, untrackedPaths.length);
+  for (const untrackedPath of untrackedPaths) {
+    await hashUntrackedEntry(hash, untrackedPath);
+  }
+  return hash.digest("hex");
+}
+
+async function resolveSliverSource(testRoot) {
+  const mode = resolveSliverSourceMode();
+  const [submoduleRevision, gitlinkRevision] = await Promise.all([
     runCommand("git", ["rev-parse", "HEAD"], { cwd: sliverDir, quiet: true }),
     runCommand("git", ["rev-parse", "HEAD:sliver"], { cwd: repoRoot, quiet: true }),
-    runCommand("git", ["status", "--porcelain=v1", "--untracked-files=all"], {
-      cwd: sliverDir,
-      quiet: true,
-    }),
   ]);
   const sliverSha = submoduleRevision.stdout.trim();
   const gitlinkSha = gitlinkRevision.stdout.trim();
   if (sliverSha !== gitlinkSha) {
     throw new Error(`Sliver submodule mismatch: checkout ${sliverSha}, gitlink ${gitlinkSha}`);
-  }
-  if (trackedStatus.stdout.trim()) {
-    throw new Error("Sliver submodule has source modifications; refusing an ambiguous E2E build");
   }
 
   const integrationLock = JSON.parse(await readFile(path.join(repoRoot, "integration.lock.json"), "utf8"));
@@ -307,10 +450,69 @@ async function resolveSliverSource() {
       `Sliver integration lock mismatch: ${String(integrationLock.sliver?.sourceCommit)} != ${sliverSha}`,
     );
   }
-  return sliverSha;
+
+  const { stdout: status } = await runCommand(
+    "git",
+    ["status", "--porcelain=v1", "--untracked-files=all"],
+    { cwd: sliverDir, quiet: true },
+  );
+  const dirty = status.length > 0;
+  if (mode === "pinned") {
+    if (dirty) {
+      throw new Error("Sliver submodule has source modifications; refusing an ambiguous E2E build");
+    }
+    return { sha: sliverSha, mode, dirty: false };
+  }
+  if (!dirty) {
+    throw new Error(
+      "SLIVER_E2E_SLIVER_SOURCE=working-tree requires Sliver source modifications; use the default pinned mode for a clean checkout",
+    );
+  }
+
+  const patchSha256 = await fingerprintSliverWorkingTree(testRoot);
+  log(
+    `Using local-only Sliver working tree at ${sliverSha}; expected dirty=true; patch sha256=${patchSha256}`,
+  );
+  return { sha: sliverSha, mode, dirty: true, patchSha256 };
 }
 
-async function buildSliverServer(testRoot, sliverSha) {
+async function verifySliverSourceUnchanged(source, testRoot) {
+  const { stdout: revision } = await runCommand("git", ["rev-parse", "HEAD"], {
+    cwd: sliverDir,
+    quiet: true,
+  });
+  if (revision.trim() !== source.sha) {
+    throw new Error(
+      `Sliver source changed during the E2E build: checkout ${revision.trim()}, expected ${source.sha}`,
+    );
+  }
+  const { stdout: status } = await runCommand(
+    "git",
+    ["status", "--porcelain=v1", "--untracked-files=all"],
+    { cwd: sliverDir, quiet: true },
+  );
+  if (!source.dirty) {
+    if (status.length > 0) {
+      throw new Error("Sliver source changed during the E2E build; the pinned checkout is now dirty");
+    }
+    return;
+  }
+  if (status.length === 0) {
+    throw new Error("Sliver source changed during the E2E build; the working tree is now clean");
+  }
+  const patchSha256 = await fingerprintSliverWorkingTree(testRoot);
+  if (patchSha256 !== source.patchSha256) {
+    throw new Error(
+      `Sliver source changed during the E2E build: patch sha256 ${patchSha256} != ${source.patchSha256}`,
+    );
+  }
+}
+
+async function buildSliverServer(testRoot, source) {
+  const sliverSha = source.sha;
+  const assetSourceKey = source.dirty
+    ? `${sliverSha}-working-tree-${source.patchSha256}`
+    : sliverSha;
   const goTmp = path.join(testRoot, "go-tmp");
   await mkdir(goTmp, { recursive: true });
   const goMod = await readFile(path.join(sliverDir, "go.mod"), "utf8");
@@ -332,8 +534,8 @@ async function buildSliverServer(testRoot, sliverSha) {
 
   const assetPaths = nativeAssetPaths(goos, goarch);
   const assetStampPath = nativeAssetStampPath(goos, goarch);
-  if (!await nativeAssetsAreCurrent(assetPaths, assetStampPath, sliverSha, requiredGoVersion)) {
-    log("Downloading the Sliver build assets required by the pinned submodule");
+  if (!await nativeAssetsAreCurrent(assetPaths, assetStampPath, assetSourceKey, requiredGoVersion)) {
+    log(`Downloading Sliver build assets for ${source.dirty ? "the fingerprinted working tree" : "the pinned submodule"}`);
     await runCommand("go", [
       "run",
       "-buildvcs=false",
@@ -347,7 +549,7 @@ async function buildSliverServer(testRoot, sliverSha) {
     });
     await writeFile(
       assetStampPath,
-      `${JSON.stringify({ schema: 1, sliverSha, goVersion: requiredGoVersion })}\n`,
+      `${JSON.stringify({ schema: 1, sliverSha: assetSourceKey, goVersion: requiredGoVersion })}\n`,
       "utf8",
     );
   } else {
@@ -359,7 +561,12 @@ async function buildSliverServer(testRoot, sliverSha) {
   const binaryName = goos === "windows" ? "sliver-server.exe" : "sliver-server";
   const binaryPath = path.join(binDir, binaryName);
   const compiledAt = String(Math.floor(Date.now() / 1_000));
-  log(`Compiling native Sliver server ${sliverSha} for ${goos}/${goarch}`);
+  log(
+    `Compiling native Sliver server ${sliverSha}${source.dirty ? ` (working tree ${source.patchSha256})` : ""} for ${goos}/${goarch}`,
+  );
+  const dirtyLdflag = source.dirty
+    ? " -X github.com/bishopfox/sliver/server/version.GitDirty=Dirty"
+    : "";
   await runCommand("go", [
     "build",
     "-buildvcs=false",
@@ -369,7 +576,8 @@ async function buildSliverServer(testRoot, sliverSha) {
     "go_sqlite,server",
     "-ldflags",
     `-X github.com/bishopfox/sliver/server/version.GitCommit=${sliverSha} `
-      + `-X github.com/bishopfox/sliver/server/version.CompiledAt=${compiledAt}`,
+      + `-X github.com/bishopfox/sliver/server/version.CompiledAt=${compiledAt}`
+      + dirtyLdflag,
     "-o",
     binaryPath,
     "./server",
@@ -557,7 +765,11 @@ async function proveAuthenticatedReadiness(configPath, expected, daemon) {
           `Sliver server platform mismatch: got ${version.OS}/${version.Arch}, expected ${expected.goos}/${expected.goarch}`,
         );
       }
-      if (version.Dirty) throw new Error("Sliver server unexpectedly reports a dirty source build");
+      if (version.Dirty !== expected.dirty) {
+        throw new Error(
+          `Sliver dirty-state mismatch: got ${version.Dirty}, expected ${expected.dirty}`,
+        );
+      }
       return;
     }
     await sleep(500);
@@ -670,7 +882,7 @@ async function main() {
   let daemon;
   let groupResults = [];
   let platform = {};
-  let sliverSha = "";
+  let sliverSource;
   let serverRoot = "";
   let failure;
   let signalHandler;
@@ -691,8 +903,26 @@ async function main() {
     groups = await collectGroups();
     if (groups.length === 0) throw new Error("No compiled E2E groups were found");
 
-    sliverSha = await resolveSliverSource();
-    const built = await buildSliverServer(testRoot, sliverSha);
+    sliverSource = await resolveSliverSource(testRoot);
+    let built;
+    let buildFailure;
+    try {
+      built = await buildSliverServer(testRoot, sliverSource);
+    } catch (error) {
+      buildFailure = error;
+    }
+    try {
+      await verifySliverSourceUnchanged(sliverSource, testRoot);
+    } catch (error) {
+      if (buildFailure) {
+        throw new AggregateError(
+          [buildFailure, error],
+          "Sliver build failed and its source changed during the build",
+        );
+      }
+      throw error;
+    }
+    if (buildFailure) throw buildFailure;
     platform = { os: built.goos, arch: built.goarch };
 
     const runtimeDirs = {
@@ -763,22 +993,30 @@ async function main() {
     }
 
     await proveAuthenticatedReadiness(configPath, {
-      sha: sliverSha,
+      sha: sliverSource.sha,
       goos: built.goos,
       goarch: built.goarch,
+      dirty: sliverSource.dirty,
     }, daemon);
-    log("Authenticated sliver-script readiness check passed");
+    log(
+      `Authenticated sliver-script readiness check passed; expected dirty=${sliverSource.dirty}`
+        + (sliverSource.patchSha256 ? `; patch sha256=${sliverSource.patchSha256}` : ""),
+    );
 
     const groupEnv = {
       ...runtimeEnv,
       SLIVER_E2E_CONFIG_FILE: configPath,
-      SLIVER_E2E_SLIVER_SHA: sliverSha,
+      SLIVER_E2E_SLIVER_SHA: sliverSource.sha,
+      SLIVER_E2E_EXPECTED_SLIVER_DIRTY: String(sliverSource.dirty),
       SLIVER_E2E_EXPECTED_OS: built.goos,
       SLIVER_E2E_EXPECTED_ARCH: built.goarch,
       SLIVER_E2E_OPERATOR: operatorName,
       SLIVER_E2E_PLATFORM: process.env.SLIVER_E2E_PLATFORM || `${built.goos}-${built.goarch}`,
       SLIVER_E2E_WORK_DIR: path.join(testRoot, "targets"),
     };
+    if (sliverSource.patchSha256) {
+      groupEnv.SLIVER_E2E_SLIVER_PATCH_SHA256 = sliverSource.patchSha256;
+    }
     await runGroups(groups, groupEnv, resultsDir, groupResults);
     log(`All ${groupResults.length} E2E groups passed`);
   } catch (error) {
@@ -817,7 +1055,10 @@ async function main() {
         startedAt,
         completedAt: new Date().toISOString(),
         platform,
-        sliverSha,
+        sliverSha: sliverSource?.sha || "",
+        sliverSourceMode: sliverSource?.mode,
+        expectedSliverDirty: sliverSource?.dirty,
+        sliverPatchSha256: sliverSource?.patchSha256,
         groups: groupResults,
         error: failure instanceof Error ? failure.message : failure ? String(failure) : undefined,
       }, null, 2)}\n`, "utf8");

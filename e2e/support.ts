@@ -14,6 +14,8 @@ const sliverScript = require("../../lib") as typeof import("../lib");
 export interface E2EEnvironment {
   readonly configFile: string;
   readonly sliverSha: string;
+  readonly expectedSliverDirty: boolean;
+  readonly sliverPatchSha256?: string;
   readonly expectedOS: "darwin" | "linux" | "windows";
   readonly expectedArch: "amd64" | "arm64";
   readonly operator: string;
@@ -28,6 +30,8 @@ export interface ConnectedE2EClient {
 export function loadE2EEnvironment(): E2EEnvironment {
   const configFile = requiredEnvironmentVariable("SLIVER_E2E_CONFIG_FILE");
   const sliverSha = requiredEnvironmentVariable("SLIVER_E2E_SLIVER_SHA");
+  const expectedSliverDirtyValue = requiredEnvironmentVariable("SLIVER_E2E_EXPECTED_SLIVER_DIRTY");
+  const sliverPatchSha256 = process.env.SLIVER_E2E_SLIVER_PATCH_SHA256?.trim() || undefined;
   const expectedOS = requiredEnvironmentVariable("SLIVER_E2E_EXPECTED_OS");
   const expectedArch = requiredEnvironmentVariable("SLIVER_E2E_EXPECTED_ARCH");
   const operator = requiredEnvironmentVariable("SLIVER_E2E_OPERATOR");
@@ -37,6 +41,24 @@ export function loadE2EEnvironment(): E2EEnvironment {
     /^[0-9a-f]{40}$/u,
     "SLIVER_E2E_SLIVER_SHA must be a full lowercase Git commit SHA",
   );
+  assert.ok(
+    expectedSliverDirtyValue === "true" || expectedSliverDirtyValue === "false",
+    "SLIVER_E2E_EXPECTED_SLIVER_DIRTY must be true or false",
+  );
+  const expectedSliverDirty = expectedSliverDirtyValue === "true";
+  if (expectedSliverDirty) {
+    assert.match(
+      sliverPatchSha256 ?? "",
+      /^[0-9a-f]{64}$/u,
+      "SLIVER_E2E_SLIVER_PATCH_SHA256 must fingerprint a dirty Sliver source build",
+    );
+  } else {
+    assert.equal(
+      sliverPatchSha256,
+      undefined,
+      "SLIVER_E2E_SLIVER_PATCH_SHA256 must be absent for a clean Sliver source build",
+    );
+  }
   assert.ok(
     expectedOS === "darwin" || expectedOS === "linux" || expectedOS === "windows",
     "SLIVER_E2E_EXPECTED_OS must be darwin, linux, or windows",
@@ -54,6 +76,8 @@ export function loadE2EEnvironment(): E2EEnvironment {
   return {
     configFile,
     sliverSha,
+    expectedSliverDirty,
+    sliverPatchSha256,
     expectedOS,
     expectedArch,
     operator,

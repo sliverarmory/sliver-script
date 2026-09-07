@@ -5,7 +5,25 @@ import { createChannel, createClient, type Channel } from "nice-grpc";
 import { BehaviorSubject, Subject, filter, map, type Observable } from "rxjs";
 
 import type { SliverClientConfig } from "./config";
+import type {
+  ForwardingOperationOptions,
+  PortForward,
+  PortForwardOptions,
+  ReversePortForward,
+  ReversePortForwardInfo,
+  ReversePortForwardOptions,
+  Socks5Proxy,
+  Socks5ProxyOptions,
+} from "./forwarding";
 import { createSliverRpcCredentials } from "./internal/credentials";
+import { createPortForward, type ManagedPortForward } from "./internal/portForward";
+import {
+  createReversePortForward,
+  type ManagedReversePortForward,
+  requestReversePortForwards,
+  requestStopReversePortForward,
+} from "./internal/reversePortForward";
+import { SocksTunnelLeases, startSocks5Proxy, type ManagedSocks5Proxy } from "./internal/socks5Proxy";
 import { timeoutSecondsToNanoseconds, validateTimeoutSeconds, withTimeoutSignal } from "./internal/timeout";
 import { TunnelManager } from "./internal/tunnelManager";
 import {
@@ -888,6 +906,10 @@ export class SliverClient {
   private eventsAbort: AbortController | null = null;
   private tunnels: TunnelManager | null = null;
   private lifecycleTail: Promise<void> = Promise.resolve();
+  private readonly managedPortForwards = new Set<ManagedPortForward>();
+  private readonly managedSocks5Proxies = new Set<ManagedSocks5Proxy>();
+  private readonly socksTunnelLeases = new SocksTunnelLeases();
+  private readonly managedReversePortForwards = new Map<string, ManagedReversePortForward>();
 
   private readonly eventSubject = new Subject<Event>();
   readonly event$ = this.eventSubject.asObservable();
@@ -1014,6 +1036,7 @@ export class SliverClient {
 
       this.tunnels.start(this.clientFor("tunnel-stream"));
       this.startEventsStream();
+      await this.reconcileManagedReversePortForwards();
       return this;
     } catch (error) {
       await this.disconnectUnlocked();
@@ -1028,6 +1051,14 @@ export class SliverClient {
   private async disconnectUnlocked(): Promise<void> {
     this.eventsAbort?.abort();
     this.eventsAbort = null;
+
+    for (const forward of this.managedReversePortForwards.values()) {
+      forward.markDetached("client-disconnected");
+    }
+    await Promise.allSettled([
+      ...[...this.managedPortForwards].map((forward) => forward.closeForClientDisconnect()),
+      ...[...this.managedSocks5Proxies].map((proxy) => proxy.close("client-disconnected")),
+    ]);
 
     await this.tunnels?.stop();
     this.tunnels = null;
@@ -2900,6 +2931,219 @@ export class SliverClient {
     return res.Active;
   }
 
+  /** Starts a bounded local TCP listener whose connections traverse the selected session. */
+  startPortForward(
+    sessionId: string,
+    options: PortForwardOptions,
+    operation?: ForwardingOperationOptions,
+  ): Promise<PortForward> {
+    const normalizedSessionId = normalizeForwardingIdentifier(sessionId, "Session id");
+    return this.enqueueLifecycle(async () => {
+      const tunnels = this.tunnels;
+      if (!tunnels) throw new Error("SliverClient is not connected");
+      const forward = await createPortForward({
+        rpc: this.clientFor("tunnel-stream"),
+        tunnels,
+        sessionId: normalizedSessionId,
+        options,
+        operation,
+        request: (timeoutSeconds) => this.sessionRequest(normalizedSessionId, timeoutSeconds),
+        onClosed: (closed) => this.managedPortForwards.delete(closed),
+      });
+      this.managedPortForwards.add(forward);
+      if (forward.state.status === "closed" || forward.state.status === "failed") {
+        this.managedPortForwards.delete(forward);
+      }
+      return forward;
+    });
+  }
+
+  /** Returns an immutable snapshot of local port-forward handles owned by this client. */
+  listPortForwards(): readonly PortForward[] {
+    return Object.freeze([...this.managedPortForwards].sort((left, right) => left.id.localeCompare(right.id)));
+  }
+
+  /** Idempotently closes a client-owned local port forward by handle id. */
+  stopPortForward(id: string): Promise<void> {
+    const normalizedId = normalizeForwardingIdentifier(id, "Port forward id");
+    return this.enqueueLifecycle(async () => {
+      const forward = [...this.managedPortForwards].find((candidate) => candidate.id === normalizedId);
+      await forward?.close();
+    });
+  }
+
+  /** Starts a bounded local SOCKS5 listener multiplexed over one Sliver SOCKS stream. */
+  startSocks5Proxy(
+    sessionId: string,
+    options: Socks5ProxyOptions,
+    operation?: ForwardingOperationOptions,
+  ): Promise<Socks5Proxy> {
+    const normalizedSessionId = normalizeForwardingIdentifier(sessionId, "Session id");
+    return this.enqueueLifecycle(async () => {
+      if (!this.tunnels) throw new Error("SliverClient is not connected");
+      const proxy = await startSocks5Proxy(
+        {
+          rpc: this.clientFor("tunnel-stream"),
+          sessionId: normalizedSessionId,
+          tunnelLeases: this.socksTunnelLeases,
+        },
+        options,
+        operation,
+      );
+      this.managedSocks5Proxies.add(proxy);
+      void proxy.closed.finally(() => this.managedSocks5Proxies.delete(proxy));
+      return proxy;
+    });
+  }
+
+  /** Returns an immutable snapshot of local SOCKS5 handles owned by this client. */
+  listSocks5Proxies(): readonly Socks5Proxy[] {
+    return Object.freeze([...this.managedSocks5Proxies].sort((left, right) => left.id.localeCompare(right.id)));
+  }
+
+  /** Idempotently closes a client-owned local SOCKS5 proxy by handle id. */
+  stopSocks5Proxy(id: string): Promise<void> {
+    const normalizedId = normalizeForwardingIdentifier(id, "SOCKS5 proxy id");
+    return this.enqueueLifecycle(async () => {
+      const proxy = [...this.managedSocks5Proxies].find((candidate) => candidate.id === normalizedId);
+      await proxy?.close();
+    });
+  }
+
+  /** Starts a server-owned reverse port forward and returns a reconnect-aware control handle. */
+  startReversePortForward(
+    sessionId: string,
+    options: ReversePortForwardOptions,
+    operation?: ForwardingOperationOptions,
+  ): Promise<ReversePortForward> {
+    const normalizedSessionId = normalizeForwardingIdentifier(sessionId, "Session id");
+    return this.enqueueLifecycle(async () => {
+      if (!this.isConnected) throw new Error("SliverClient is not connected");
+      const forward = await createReversePortForward({
+        rpc: this.rpc,
+        sessionId: normalizedSessionId,
+        options,
+        operation,
+        request: (timeoutSeconds) => this.sessionRequest(normalizedSessionId, timeoutSeconds),
+        authorizeCreatedListenerCleanup: (candidate) =>
+          !this.managedReversePortForwards.has(reversePortForwardKey(candidate)),
+        callbacks: {
+          refresh: (tracked, refreshOptions) => this.refreshManagedReversePortForward(tracked, refreshOptions),
+          stop: (tracked) => this.stopManagedReversePortForward(tracked),
+          onTerminal: (tracked) => {
+            const key = reversePortForwardKey(tracked);
+            if (this.managedReversePortForwards.get(key) === tracked) {
+              this.managedReversePortForwards.delete(key);
+            }
+          },
+        },
+      });
+      this.managedReversePortForwards.set(reversePortForwardKey(forward), forward);
+      return forward;
+    });
+  }
+
+  /** Lists the teamserver's authoritative reverse-port-forward inventory for a session. */
+  listReversePortForwards(
+    sessionId: string,
+    operation?: ForwardingOperationOptions,
+  ): Promise<readonly ReversePortForwardInfo[]> {
+    const normalizedSessionId = normalizeForwardingIdentifier(sessionId, "Session id");
+    return this.enqueueLifecycle(async () => {
+      if (!this.isConnected) throw new Error("SliverClient is not connected");
+      const listeners = await requestReversePortForwards(
+        this.rpc,
+        normalizedSessionId,
+        (timeoutSeconds) => this.sessionRequest(normalizedSessionId, timeoutSeconds),
+        operation,
+      );
+      return Object.freeze(listeners);
+    });
+  }
+
+  /** Idempotently stops one remote listener, including compatibility-only legacy inventory. */
+  stopReversePortForward(
+    sessionId: string,
+    listenerId: number,
+    operation?: ForwardingOperationOptions,
+  ): Promise<void> {
+    const normalizedSessionId = normalizeForwardingIdentifier(sessionId, "Session id");
+    return this.enqueueLifecycle(async () => {
+      if (!this.isConnected) throw new Error("SliverClient is not connected");
+      await requestStopReversePortForward(
+        this.rpc,
+        normalizedSessionId,
+        listenerId,
+        (timeoutSeconds) => this.sessionRequest(normalizedSessionId, timeoutSeconds),
+        operation,
+      );
+      this.managedReversePortForwards.get(reversePortForwardKey({
+        sessionId: normalizedSessionId,
+        id: listenerId,
+      }))?.markStopped();
+    });
+  }
+
+  private refreshManagedReversePortForward(
+    forward: ManagedReversePortForward,
+    operation?: ForwardingOperationOptions,
+  ): Promise<ReversePortForwardInfo | undefined> {
+    return this.enqueueLifecycle(async () => {
+      if (!this.isConnected) throw new Error("SliverClient is not connected");
+      const listeners = await requestReversePortForwards(
+        this.rpc,
+        forward.sessionId,
+        (timeoutSeconds) => this.sessionRequest(forward.sessionId, timeoutSeconds),
+        operation,
+      );
+      const listener = listeners.find((candidate) => candidate.id === forward.id);
+      // Reconcile while still inside the client's lifecycle queue. A close
+      // queued behind this refresh must observe any identity loss before it can
+      // dispatch a numeric listener-ID stop.
+      forward.reconcile(listener);
+      return listener;
+    });
+  }
+
+  private stopManagedReversePortForward(forward: ManagedReversePortForward): Promise<void> {
+    return this.enqueueLifecycle(async () => {
+      if (
+        this.managedReversePortForwards.get(reversePortForwardKey(forward)) !== forward
+        || forward.state.status === "lost"
+        || forward.state.status === "stopped"
+      ) return;
+      if (!this.isConnected) throw new Error("SliverClient is not connected");
+      await requestStopReversePortForward(
+        this.rpc,
+        forward.sessionId,
+        forward.id,
+        (timeoutSeconds) => this.sessionRequest(forward.sessionId, timeoutSeconds),
+      );
+    });
+  }
+
+  private async reconcileManagedReversePortForwards(): Promise<void> {
+    const bySession = new Map<string, ManagedReversePortForward[]>();
+    for (const forward of this.managedReversePortForwards.values()) {
+      const forwards = bySession.get(forward.sessionId) ?? [];
+      forwards.push(forward);
+      bySession.set(forward.sessionId, forwards);
+    }
+    await Promise.all([...bySession].map(async ([sessionId, forwards]) => {
+      try {
+        const listeners = await requestReversePortForwards(
+          this.rpc,
+          sessionId,
+          (timeoutSeconds) => this.sessionRequest(sessionId, timeoutSeconds),
+        );
+        const byId = new Map(listeners.map((listener) => [listener.id, listener]));
+        for (const forward of forwards) forward.reconcile(byId.get(forward.id));
+      } catch {
+        for (const forward of forwards) forward.markDetached("control-error");
+      }
+    }));
+  }
+
   /**
    * Opens a session shell through the bounded tunnel stream. Standalone
    * callers receive this RPC-capable handle directly; applications with an
@@ -2923,6 +3167,7 @@ export class SliverClient {
     if (!tunnels) throw new Error("SliverClient is not connected");
 
     let tunnelId = "";
+    let tunnelManagerOwned = false;
     let lifecycle: "starting" | "open" | "closing" | "closed" = "starting";
     let closePromise: Promise<void> | null = null;
     let writeTail: Promise<void> = Promise.resolve();
@@ -2934,7 +3179,7 @@ export class SliverClient {
     });
 
     const bestEffortRemoteClose = async (): Promise<void> => {
-      if (!tunnelId) return;
+      if (!tunnelManagerOwned || !tunnelId) return;
       await withTimeoutSignal(timeoutSeconds, (signal) =>
         this.rpc.closeTunnel({ TunnelID: tunnelId, SessionID: sessionId }, { signal }),
       ).catch(() => undefined);
@@ -2983,8 +3228,8 @@ export class SliverClient {
       if (closePromise) return closePromise;
       lifecycle = "closing";
       closePromise = (async () => {
-        if (requestGracefulExit && tunnelId) await boundedGracefulExit();
-        if (tunnelId) tunnels.cancelTunnel(tunnelId);
+        if (requestGracefulExit && tunnelManagerOwned && tunnelId) await boundedGracefulExit();
+        if (tunnelManagerOwned && tunnelId) tunnels.cancelTunnel(tunnelId);
         await bestEffortRemoteClose();
       })().finally(() => {
           lifecycle = "closed";
@@ -3010,6 +3255,7 @@ export class SliverClient {
           void closeManagedTunnel();
         },
       });
+      tunnelManagerOwned = true;
 
       // The zero-data bind must be pulled by TunnelData before Shell can race
       // an early prompt back to this process.
@@ -3118,7 +3364,7 @@ export class SliverClient {
       // The Shell RPC can lose its response after the implant has already
       // spawned the child. Once a tunnel exists, mirror the canonical client
       // and attempt a bounded graceful exit before revoking the transport.
-      await closeManagedTunnel(Boolean(tunnelId));
+      await closeManagedTunnel(tunnelManagerOwned && Boolean(tunnelId));
       throw new Error("Unable to start shell session");
     }
   }
@@ -3142,6 +3388,15 @@ export class SliverClient {
 
 function assertNonEmptyString(value: string, label: string): void {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must not be empty`);
+}
+
+function normalizeForwardingIdentifier(value: string, label: string): string {
+  assertNonEmptyString(value, label);
+  return value.trim();
+}
+
+function reversePortForwardKey(value: { readonly sessionId: string; readonly id: number }): string {
+  return `${value.sessionId}\u0000${value.id}`;
 }
 
 function assertBoundedString(value: string, label: string, maxCharacters: number): void {
