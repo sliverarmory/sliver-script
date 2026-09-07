@@ -404,6 +404,7 @@ describe("stateful port forwarding", () => {
     await waitFor(() => forward.state.activeConnections === 1 && rpc.portfwd.mock.calls.length === 1);
 
     await client.disconnect();
+    await waitFor(() => socket.destroyed);
     expect(transport.stop).toHaveBeenCalledTimes(1);
     expect(forward.state).toMatchObject({ status: "closed", activeConnections: 0, reason: "client-disconnected" });
     expect(socket.destroyed).toBe(true);
