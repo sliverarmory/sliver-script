@@ -79,7 +79,7 @@ malformed Sliver SOCKS framing, such as invalid sequence or acknowledgement data
 
 ### Reproducible protobuf generation
 
-Generated TypeScript under `src/pb` is locked to Sliver commit `a89c03bb8793882fe528f7922b652fe4be89d77f`, protoc 35.1, and ts-proto 2.12.1. The generator reads only the pinned `sliver` submodule; it never selects a neighboring checkout.
+Generated TypeScript under `src/pb` is locked to Sliver commit `bbb20155b7a18d4906ec936566bf0dc61fe38f35`, protoc 35.1, and ts-proto 2.12.1. The generator reads only the pinned `sliver` submodule; it never selects a neighboring checkout.
 
 From a Git source checkout, install protoc 35.1 after `npm ci`, initialize the pinned submodule, and run:
 
