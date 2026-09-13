@@ -65,7 +65,7 @@
     "@protobufjs/utf8": "1.1.2",
     "nice-grpc": "^2.1.17",
     "nice-grpc-common": "^2.0.4",
-    "protobufjs": "7.6.6",
+    "protobufjs": "8.8.0",
     "rxjs": "^7.8.2"
   },
   "overrides": {
