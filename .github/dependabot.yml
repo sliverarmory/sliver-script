@@ -14,3 +14,9 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # @grpc/proto-loader 0.8.1 still requires protobufjs ^7.5.5. A direct
+      # 8.x pin would install an unused second major and stop constraining the
+      # gRPC runtime copy to the reviewed exact version.
+      - dependency-name: "protobufjs"
+        update-types: ["version-update:semver-major"]

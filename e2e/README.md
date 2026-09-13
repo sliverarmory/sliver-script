@@ -105,7 +105,7 @@ credentials, or connect to port 3389; RDP interoperability is validated in the
 separate Proxmox/GOAD range.
 
 GitHub Actions runs the full suite with a recursive submodule checkout, Node.js
-24.20.0/npm 11.19.0, and the Go version declared by `sliver/go.mod` on:
+24.21.0/npm 11.19.0, and the Go version declared by `sliver/go.mod` on:
 
 | Platform | Runner |
 | --- | --- |

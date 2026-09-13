@@ -25,7 +25,7 @@ are optional; the workflow does not configure repository or npm settings.
 Package maintainer access is required for npm setup. No `NPM_TOKEN` or
 `NODE_AUTH_TOKEN` secret is needed. Only the publish job has `id-token: write`;
 dependency installation and tests run in jobs without publishing credentials.
-The publish job uses GitHub-hosted Ubuntu with Node 24.20.0 and npm 11.19.0, with
+The publish job uses GitHub-hosted Ubuntu with Node 24.21.0 and npm 11.19.0, with
 package manager caching disabled.
 
 See npm's [trusted publishing documentation](https://docs.npmjs.com/trusted-publishers/).

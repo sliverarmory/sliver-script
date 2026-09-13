@@ -51,7 +51,7 @@ jobs:
       - name: Set up exact Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.20.0
+          node-version: 24.21.0
           cache: npm
 
       - name: Set up Go from the pinned Sliver module
@@ -75,7 +75,7 @@ jobs:
         run: |
           actual="$(npm --version)"
           if [[ "$actual" != "11.19.0" ]]; then
-            echo "::error title=Wrong bundled npm::Node.js 24.20.0 must provide npm 11.19.0 (found ${actual})."
+            echo "::error title=Wrong bundled npm::Node.js 24.21.0 must provide npm 11.19.0 (found ${actual})."
             exit 1
           fi
 
