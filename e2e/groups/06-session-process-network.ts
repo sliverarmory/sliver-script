@@ -7,8 +7,8 @@ import net from "node:net";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
-import { sliverpb, type SessionRegistryWriteValue } from "../../lib";
-import type { E2ESuiteContext, LiveImplant } from "../context";
+import type { SessionRegistryWriteValue, sliverpb } from "../../lib";
+import { SliverRegistryType, type E2ESuiteContext, type LiveImplant } from "../context";
 
 export const name = "06-session-process-network";
 
@@ -324,28 +324,28 @@ async function verifyWindowsRegistry(context: E2ESuiteContext, sessionId: string
     {
       name: "string-value",
       value: { type: "string", value: `sliver-script-e2e-${fixtureName}` },
-      expectedType: sliverpb.RegistryType.String,
+      expectedType: SliverRegistryType.String,
       expectedValue: `sliver-script-e2e-${fixtureName}`,
       expectedBinary: Buffer.alloc(0),
     },
     {
       name: "binary-value",
       value: { type: "binary", value: Buffer.from([0x00, 0x7f, 0x80, 0xff]) },
-      expectedType: sliverpb.RegistryType.Binary,
+      expectedType: SliverRegistryType.Binary,
       expectedValue: "",
       expectedBinary: Buffer.from([0x00, 0x7f, 0x80, 0xff]),
     },
     {
       name: "dword-value",
       value: { type: "dword", value: 0x5a17c0de },
-      expectedType: sliverpb.RegistryType.DWORD,
+      expectedType: SliverRegistryType.DWORD,
       expectedValue: "",
       expectedBinary: Buffer.from([0xde, 0xc0, 0x17, 0x5a]),
     },
     {
       name: "qword-value",
       value: { type: "qword", value: "81985529216486895" },
-      expectedType: sliverpb.RegistryType.QWORD,
+      expectedType: SliverRegistryType.QWORD,
       expectedValue: "",
       expectedBinary: Buffer.from([0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01]),
     },

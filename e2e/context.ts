@@ -21,6 +21,9 @@ import { loadE2EEnvironment, type E2EEnvironment } from "./support";
 // repository root while retaining compile-time checks against its declarations.
 const sliverScript = require("../../lib") as typeof import("../lib");
 
+/** Runtime enum exported by the built package for typed registry-read checks. */
+export const SliverRegistryType = sliverScript.sliverpb.RegistryType;
+
 const commandTimeoutSeconds = 120;
 const callbackTimeoutMilliseconds = 5 * 60_000;
 const processOutputLimit = 512_000;
