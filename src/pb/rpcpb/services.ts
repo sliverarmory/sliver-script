@@ -32,14 +32,18 @@ import {
   ClientLogData,
   Compiler,
   CrackBenchmark,
+  CrackBenchmarkSnapshots,
   CrackCommand,
   CrackFile,
   CrackFileChunk,
   CrackFiles,
+  CrackJob,
+  CrackJobs,
   CrackResponse,
   Crackstation,
   Crackstations,
   CrackTask,
+  CrackTopSnapshot,
   Credential,
   Credentials,
   DeleteReq,
@@ -822,6 +826,62 @@ export const SliverRPCDefinition = {
       requestType: CrackCommand as typeof CrackCommand,
       requestStream: false,
       responseType: CrackResponse as typeof CrackResponse,
+      responseStream: false,
+      options: {},
+    },
+    crackJobs: {
+      name: "CrackJobs",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: CrackJobs as typeof CrackJobs,
+      responseStream: false,
+      options: {},
+    },
+    crackJobByID: {
+      name: "CrackJobByID",
+      requestType: CrackJob as typeof CrackJob,
+      requestStream: false,
+      responseType: CrackJob as typeof CrackJob,
+      responseStream: false,
+      options: {},
+    },
+    crackJobCancel: {
+      name: "CrackJobCancel",
+      requestType: CrackJob as typeof CrackJob,
+      requestStream: false,
+      responseType: CrackJob as typeof CrackJob,
+      responseStream: false,
+      options: {},
+    },
+    crackJobPause: {
+      name: "CrackJobPause",
+      requestType: CrackJob as typeof CrackJob,
+      requestStream: false,
+      responseType: CrackJob as typeof CrackJob,
+      responseStream: false,
+      options: {},
+    },
+    crackJobResume: {
+      name: "CrackJobResume",
+      requestType: CrackJob as typeof CrackJob,
+      requestStream: false,
+      responseType: CrackJob as typeof CrackJob,
+      responseStream: false,
+      options: {},
+    },
+    crackJobDelete: {
+      name: "CrackJobDelete",
+      requestType: CrackJob as typeof CrackJob,
+      requestStream: false,
+      responseType: Empty as typeof Empty,
+      responseStream: false,
+      options: {},
+    },
+    crackTop: {
+      name: "CrackTop",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: CrackTopSnapshot as typeof CrackTopSnapshot,
       responseStream: false,
       options: {},
     },
@@ -1837,6 +1897,15 @@ export const SliverRPCDefinition = {
       responseStream: true,
       options: {},
     },
+    /** ** Cached Crackstation Benchmarks *** */
+    crackstationBenchmarks: {
+      name: "CrackstationBenchmarks",
+      requestType: Empty as typeof Empty,
+      requestStream: false,
+      responseType: CrackBenchmarkSnapshots as typeof CrackBenchmarkSnapshots,
+      responseStream: false,
+      options: {},
+    },
   },
 } as const;
 
@@ -1976,6 +2045,13 @@ export interface SliverRPCServiceImplementation<CallContextExt = {}> {
   ): Promise<DeepPartial<CertificateAuthorityInfo>>;
   /** ** Crackstation *** */
   crack(request: CrackCommand, context: CallContext & CallContextExt): Promise<DeepPartial<CrackResponse>>;
+  crackJobs(request: Empty, context: CallContext & CallContextExt): Promise<DeepPartial<CrackJobs>>;
+  crackJobByID(request: CrackJob, context: CallContext & CallContextExt): Promise<DeepPartial<CrackJob>>;
+  crackJobCancel(request: CrackJob, context: CallContext & CallContextExt): Promise<DeepPartial<CrackJob>>;
+  crackJobPause(request: CrackJob, context: CallContext & CallContextExt): Promise<DeepPartial<CrackJob>>;
+  crackJobResume(request: CrackJob, context: CallContext & CallContextExt): Promise<DeepPartial<CrackJob>>;
+  crackJobDelete(request: CrackJob, context: CallContext & CallContextExt): Promise<DeepPartial<Empty>>;
+  crackTop(request: Empty, context: CallContext & CallContextExt): Promise<DeepPartial<CrackTopSnapshot>>;
   crackstationRegister(
     request: Crackstation,
     context: CallContext & CallContextExt,
@@ -2209,6 +2285,11 @@ export interface SliverRPCServiceImplementation<CallContextExt = {}> {
   ): ServerStreamingMethodResult<DeepPartial<TunnelData>>;
   /** ** Events *** */
   events(request: Empty, context: CallContext & CallContextExt): ServerStreamingMethodResult<DeepPartial<Event>>;
+  /** ** Cached Crackstation Benchmarks *** */
+  crackstationBenchmarks(
+    request: Empty,
+    context: CallContext & CallContextExt,
+  ): Promise<DeepPartial<CrackBenchmarkSnapshots>>;
 }
 
 export interface SliverRPCClient<CallOptionsExt = {}> {
@@ -2350,6 +2431,13 @@ export interface SliverRPCClient<CallOptionsExt = {}> {
   ): Promise<CertificateAuthorityInfo>;
   /** ** Crackstation *** */
   crack(request: DeepPartial<CrackCommand>, options?: CallOptions & CallOptionsExt): Promise<CrackResponse>;
+  crackJobs(request: DeepPartial<Empty>, options?: CallOptions & CallOptionsExt): Promise<CrackJobs>;
+  crackJobByID(request: DeepPartial<CrackJob>, options?: CallOptions & CallOptionsExt): Promise<CrackJob>;
+  crackJobCancel(request: DeepPartial<CrackJob>, options?: CallOptions & CallOptionsExt): Promise<CrackJob>;
+  crackJobPause(request: DeepPartial<CrackJob>, options?: CallOptions & CallOptionsExt): Promise<CrackJob>;
+  crackJobResume(request: DeepPartial<CrackJob>, options?: CallOptions & CallOptionsExt): Promise<CrackJob>;
+  crackJobDelete(request: DeepPartial<CrackJob>, options?: CallOptions & CallOptionsExt): Promise<Empty>;
+  crackTop(request: DeepPartial<Empty>, options?: CallOptions & CallOptionsExt): Promise<CrackTopSnapshot>;
   crackstationRegister(
     request: DeepPartial<Crackstation>,
     options?: CallOptions & CallOptionsExt,
@@ -2586,6 +2674,11 @@ export interface SliverRPCClient<CallOptionsExt = {}> {
   ): AsyncIterable<TunnelData>;
   /** ** Events *** */
   events(request: DeepPartial<Empty>, options?: CallOptions & CallOptionsExt): AsyncIterable<Event>;
+  /** ** Cached Crackstation Benchmarks *** */
+  crackstationBenchmarks(
+    request: DeepPartial<Empty>,
+    options?: CallOptions & CallOptionsExt,
+  ): Promise<CrackBenchmarkSnapshots>;
 }
 
 type Builtin = Date | Function | Uint8Array | string | number | boolean | undefined;

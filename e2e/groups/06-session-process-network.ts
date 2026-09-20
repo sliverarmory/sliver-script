@@ -7,7 +7,7 @@ import net from "node:net";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 
-import type { SessionRegistryWriteValue, sliverpb } from "../../lib";
+import { sliverpb, type SessionRegistryWriteValue } from "../../lib";
 import type { E2ESuiteContext, LiveImplant } from "../context";
 
 export const name = "06-session-process-network";
@@ -317,12 +317,38 @@ async function verifyWindowsRegistry(context: E2ESuiteContext, sessionId: string
   const values: ReadonlyArray<{
     readonly name: string;
     readonly value: SessionRegistryWriteValue;
-    readonly expected: string;
+    readonly expectedType: sliverpb.RegistryType;
+    readonly expectedValue: string;
+    readonly expectedBinary: Buffer;
   }> = [
-    { name: "string-value", value: { type: "string", value: `sliver-script-e2e-${fixtureName}` }, expected: `sliver-script-e2e-${fixtureName}` },
-    { name: "binary-value", value: { type: "binary", value: Buffer.from([0x00, 0x7f, 0x80, 0xff]) }, expected: "[0 127 128 255]" },
-    { name: "dword-value", value: { type: "dword", value: 0x5a17c0de }, expected: "0x5a17c0de" },
-    { name: "qword-value", value: { type: "qword", value: "81985529216486895" }, expected: "0x123456789abcdef" },
+    {
+      name: "string-value",
+      value: { type: "string", value: `sliver-script-e2e-${fixtureName}` },
+      expectedType: sliverpb.RegistryType.String,
+      expectedValue: `sliver-script-e2e-${fixtureName}`,
+      expectedBinary: Buffer.alloc(0),
+    },
+    {
+      name: "binary-value",
+      value: { type: "binary", value: Buffer.from([0x00, 0x7f, 0x80, 0xff]) },
+      expectedType: sliverpb.RegistryType.Binary,
+      expectedValue: "",
+      expectedBinary: Buffer.from([0x00, 0x7f, 0x80, 0xff]),
+    },
+    {
+      name: "dword-value",
+      value: { type: "dword", value: 0x5a17c0de },
+      expectedType: sliverpb.RegistryType.DWORD,
+      expectedValue: "",
+      expectedBinary: Buffer.from([0xde, 0xc0, 0x17, 0x5a]),
+    },
+    {
+      name: "qword-value",
+      value: { type: "qword", value: "81985529216486895" },
+      expectedType: sliverpb.RegistryType.QWORD,
+      expectedValue: "",
+      expectedBinary: Buffer.from([0xef, 0xcd, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01]),
+    },
   ];
 
   try {
@@ -365,7 +391,9 @@ async function verifyWindowsRegistry(context: E2ESuiteContext, sessionId: string
         RPC_TIMEOUT_SECONDS,
       );
       assertImplantSuccess(read, `session registry read ${value.name}`);
-      assert.equal(read.Value, value.expected, `session registry value ${value.name}`);
+      assert.equal(read.Type, value.expectedType, `session registry type ${value.name}`);
+      assert.equal(read.Value, value.expectedValue, `session registry string value ${value.name}`);
+      assert.deepEqual(read.Binary, value.expectedBinary, `session registry binary value ${value.name}`);
     }
 
     const subkeys = await context.client.registryListSubkeysSession(

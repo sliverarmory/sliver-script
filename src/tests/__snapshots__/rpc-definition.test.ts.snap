@@ -143,8 +143,50 @@ exports[`RPC definition includes all methods (snapshot) 1`] = `
       "responseStream": false,
     },
     {
+      "key": "crackJobByID",
+      "name": "CrackJobByID",
+      "requestStream": false,
+      "responseStream": false,
+    },
+    {
+      "key": "crackJobCancel",
+      "name": "CrackJobCancel",
+      "requestStream": false,
+      "responseStream": false,
+    },
+    {
+      "key": "crackJobDelete",
+      "name": "CrackJobDelete",
+      "requestStream": false,
+      "responseStream": false,
+    },
+    {
+      "key": "crackJobPause",
+      "name": "CrackJobPause",
+      "requestStream": false,
+      "responseStream": false,
+    },
+    {
+      "key": "crackJobResume",
+      "name": "CrackJobResume",
+      "requestStream": false,
+      "responseStream": false,
+    },
+    {
+      "key": "crackJobs",
+      "name": "CrackJobs",
+      "requestStream": false,
+      "responseStream": false,
+    },
+    {
       "key": "crackstationBenchmark",
       "name": "CrackstationBenchmark",
+      "requestStream": false,
+      "responseStream": false,
+    },
+    {
+      "key": "crackstationBenchmarks",
+      "name": "CrackstationBenchmarks",
       "requestStream": false,
       "responseStream": false,
     },
@@ -175,6 +217,12 @@ exports[`RPC definition includes all methods (snapshot) 1`] = `
     {
       "key": "crackTaskUpdate",
       "name": "CrackTaskUpdate",
+      "requestStream": false,
+      "responseStream": false,
+    },
+    {
+      "key": "crackTop",
+      "name": "CrackTop",
       "requestStream": false,
       "responseStream": false,
     },

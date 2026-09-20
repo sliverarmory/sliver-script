@@ -2,15 +2,15 @@
   "schemaVersion": 1,
   "source": {
     "repository": "https://github.com/BishopFox/sliver.git",
-    "commit": "bbb20155b7a18d4906ec936566bf0dc61fe38f35",
-    "tree": "29be1ac3a7580b1f0b672d8ade45fd32389e6231"
+    "commit": "e920f2f8ea08536acec20b0eee4d80bf8bd6ae02",
+    "tree": "178df0a333d4223338b74c7e16a85ad534d7bef7"
   },
   "toolchain": {
     "protoc": "35.1",
     "tsProto": "2.12.3"
   },
   "protobuf": {
-    "descriptorSetSha256": "b6bb511affd5a7cf00f99f28aa0450e43856e44ced128c52b57fce89ed3bb8a1",
+    "descriptorSetSha256": "efc0e4a08540f795a38bcaa03e4081c94756ab70e83ca1db3ba3c8e0ac4d80d6",
     "files": [
       {
         "path": "commonpb/common.proto",
@@ -18,15 +18,15 @@
       },
       {
         "path": "clientpb/client.proto",
-        "sha256": "8b0ffbd495e6d80ebfa133d850558d7f4631ade4562e6873eb25a28837d15930"
+        "sha256": "2735e7725118eb80cd158abfbe159a351d76f5907ebd8d63e545640226f0ec5e"
       },
       {
         "path": "sliverpb/sliver.proto",
-        "sha256": "be75c3b184b29c2ea9abb4f899c3d7c58fc99fbf796d8a66305cbe6f6672c349"
+        "sha256": "2b218bf61b12d2ec26611c37a34cef414211f202977fd928f83a14b16e36f5c7"
       },
       {
         "path": "rpcpb/services.proto",
-        "sha256": "67373d58e2cea7f7fb56a5dbc850d03811bf74df1ce37a042ad2d62dd7419656"
+        "sha256": "29110ddbf6d0437e8a48ecb3153a362af9487068f76fe89c3ef5eb3d0481ae78"
       },
       {
         "path": "dnspb/dns.proto",
@@ -40,15 +40,15 @@
       },
       {
         "path": "clientpb/client.ts",
-        "sha256": "4d54829284ca6a4d13c8c8a2ded13b4db2a80c460460d88f14786c39f4a4a34f"
+        "sha256": "2df6ba59a3c630271a992786c4658969c70a522bfa73fee9721098d531d4fa0b"
       },
       {
         "path": "sliverpb/sliver.ts",
-        "sha256": "35a26d2e951598c00a041458d1bf9abfd9851c0f77766767d792b82d38e62317"
+        "sha256": "127ecb82c502908895d71446e3caf13c5676e79477c3499a56686cb544199726"
       },
       {
         "path": "rpcpb/services.ts",
-        "sha256": "be903454a2d81b9035c341b6f9d96260ea34d222d1f16c9eb9281c8716be0963"
+        "sha256": "04e9dae7c7ebccd788db8f86cfd7c5056647ffdec3d84d0de9f830ce4920cada"
       },
       {
         "path": "dnspb/dns.ts",

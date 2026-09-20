@@ -2,12 +2,13 @@ import { gunzipSync, gzipSync } from "node:zlib";
 
 import { SliverClient } from "../client";
 import type { SliverClientConfig } from "../config";
+import { RegistryRead, RegistryType } from "../pb/sliverpb/sliver";
 
 describe("explicit session workbench wrappers", () => {
   test("binds requests to the selected session and excludes remote service hostnames", async () => {
     const services = jest.fn(async () => ({ Services: [] }));
     const currentTokenOwner = jest.fn(async () => ({ Output: "SYSTEM" }));
-    const registryRead = jest.fn(async () => ({ Value: "value" }));
+    const registryRead = jest.fn(async () => RegistryRead.create({ Value: "value" }));
     const client = clientWithRpc({ control: { services, currentTokenOwner, registryRead } });
 
     await client.servicesSession("session-42", 0);
@@ -27,6 +28,41 @@ describe("explicit session workbench wrappers", () => {
       expect.objectContaining({ Hostname: "", Request: target }),
       { signal: expect.any(AbortSignal) },
     );
+  });
+
+  test("preserves typed registry reads and legacy Value-only responses", async () => {
+    const typed = RegistryRead.decode(RegistryRead.encode(RegistryRead.create({
+      Binary: Buffer.from([0x00, 0x7f, 0x80, 0xff]),
+      Type: RegistryType.Binary,
+    })).finish());
+    const registryRead = jest.fn(async () => typed);
+    const client = clientWithRpc({ control: { registryRead } });
+
+    const result = await client.registryReadSession(
+      "session-registry",
+      "HKCU",
+      "Software\\Example",
+      "binary-value",
+      0,
+    );
+
+    expect(result).toBe(typed);
+    expect(result).toMatchObject({
+      Value: "",
+      Binary: Buffer.from([0x00, 0x7f, 0x80, 0xff]),
+      Type: RegistryType.Binary,
+    });
+
+    const legacy = RegistryRead.decode(Buffer.from([
+      0x0a, 0x0c,
+      ...Buffer.from("legacy value"),
+    ]));
+    expect(legacy).toEqual({
+      Value: "legacy value",
+      Binary: Buffer.alloc(0),
+      Type: RegistryType.Unknown,
+      Response: undefined,
+    });
   });
 
   test("routes bounded binary wrappers only through the workbench artifact channel", async () => {

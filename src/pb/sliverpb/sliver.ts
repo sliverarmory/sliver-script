@@ -854,6 +854,8 @@ export interface RegistryReadReq {
 
 export interface RegistryRead {
   Value: string;
+  Binary: Buffer;
+  Type: RegistryType;
   Response?: Response | undefined;
 }
 
@@ -12660,13 +12662,19 @@ export const RegistryReadReq: MessageFns<RegistryReadReq> = {
 };
 
 function createBaseRegistryRead(): RegistryRead {
-  return { Value: "", Response: undefined };
+  return { Value: "", Binary: Buffer.alloc(0), Type: 0, Response: undefined };
 }
 
 export const RegistryRead: MessageFns<RegistryRead> = {
   encode(message: RegistryRead, writer: BinaryWriter = new BinaryWriter()): BinaryWriter {
     if (message.Value !== "") {
       writer.uint32(10).string(message.Value);
+    }
+    if (message.Binary.length !== 0) {
+      writer.uint32(18).bytes(message.Binary);
+    }
+    if (message.Type !== 0) {
+      writer.uint32(64).int32(message.Type);
     }
     if (message.Response !== undefined) {
       Response.encode(message.Response, writer.uint32(74).fork()).join();
@@ -12695,6 +12703,22 @@ export const RegistryRead: MessageFns<RegistryRead> = {
             message.Value = reader.string();
             continue;
           }
+          case 2: {
+            if (tag !== 18) {
+              break;
+            }
+
+            message.Binary = Buffer.from(reader.bytes());
+            continue;
+          }
+          case 8: {
+            if (tag !== 64) {
+              break;
+            }
+
+            message.Type = reader.int32() as any;
+            continue;
+          }
           case 9: {
             if (tag !== 74) {
               break;
@@ -12718,6 +12742,8 @@ export const RegistryRead: MessageFns<RegistryRead> = {
   fromJSON(object: any): RegistryRead {
     return {
       Value: isSet(object.Value) ? globalThis.String(object.Value) : "",
+      Binary: isSet(object.Binary) ? Buffer.from(bytesFromBase64(object.Binary)) : Buffer.alloc(0),
+      Type: isSet(object.Type) ? registryTypeFromJSON(object.Type) : 0,
       Response: isSet(object.Response) ? Response.fromJSON(object.Response) : undefined,
     };
   },
@@ -12726,6 +12752,12 @@ export const RegistryRead: MessageFns<RegistryRead> = {
     const obj: any = {};
     if (message.Value !== "") {
       obj.Value = message.Value;
+    }
+    if (message.Binary.length !== 0) {
+      obj.Binary = base64FromBytes(message.Binary);
+    }
+    if (message.Type !== 0) {
+      obj.Type = registryTypeToJSON(message.Type);
     }
     if (message.Response !== undefined) {
       obj.Response = Response.toJSON(message.Response);
@@ -12739,6 +12771,8 @@ export const RegistryRead: MessageFns<RegistryRead> = {
   fromPartial(object: DeepPartial<RegistryRead>): RegistryRead {
     const message = createBaseRegistryRead();
     message.Value = object.Value ?? "";
+    message.Binary = object.Binary ?? Buffer.alloc(0);
+    message.Type = object.Type ?? 0;
     message.Response = (object.Response !== undefined && object.Response !== null)
       ? Response.fromPartial(object.Response)
       : undefined;
