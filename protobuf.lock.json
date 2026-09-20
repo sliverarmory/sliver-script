@@ -2,8 +2,8 @@
   "schemaVersion": 1,
   "source": {
     "repository": "https://github.com/BishopFox/sliver.git",
-    "commit": "e920f2f8ea08536acec20b0eee4d80bf8bd6ae02",
-    "tree": "178df0a333d4223338b74c7e16a85ad534d7bef7"
+    "commit": "6edea618e922a424a374ecb92441a1a334ed8464",
+    "tree": "e3dd2490886b4051cf6684670ce7eefec8e6cc18"
   },
   "toolchain": {
     "protoc": "35.1",
