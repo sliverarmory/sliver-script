@@ -94,7 +94,7 @@ test("the protobuf lock rejects unknown provenance fields and malformed entries"
   );
 });
 
-test("foreign, escaping, and stale package paths are rejected", () => {
+test("foreign and escaping package paths are rejected", () => {
   for (const sourcePath of ["vendor/client-library", "protocol/downstream-provenance.json", "../outside"]) {
     assert.throws(
       () => validateIntegrationLock(changed((lock) => {

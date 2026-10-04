@@ -75,63 +75,44 @@ describe("grpc-js allocation enforcement", () => {
     expect(clientDecodedResponse).toBe(false);
   });
 
-  test("rejects oversized task content on its dedicated channel before protobuf decode", async () => {
-    let clientDecodedResponse = false;
-    const definition = unaryDefinition();
-    server = new grpc.Server();
-    server.addService(
-      { probe: definition },
-      {
-        probe(
-          _call: grpc.ServerUnaryCall<Buffer, Buffer>,
-          callback: grpc.sendUnaryData<Buffer>,
-        ): void {
-          callback(null, Buffer.alloc(RPC_MESSAGE_BUDGETS["task-content"].maxReceiveBytes + 1));
+  test.each(["task-content", "tunnel-stream"] as const)(
+    "enforces the %s receive limit before decoding unary responses",
+    async (domain) => {
+      const limit = RPC_MESSAGE_BUDGETS[domain].maxReceiveBytes;
+      let response = Buffer.alloc(limit, 0x61);
+      const beforeDecode = jest.fn();
+      server = new grpc.Server();
+      server.addService(
+        { probe: unaryDefinition() },
+        {
+          probe(
+            _call: grpc.ServerUnaryCall<Buffer, Buffer>,
+            callback: grpc.sendUnaryData<Buffer>,
+          ): void {
+            callback(null, response);
+          },
         },
-      },
-    );
-    const port = await bind(server);
-    client = new grpc.Client(
-      `127.0.0.1:${port}`,
-      grpc.credentials.createInsecure(),
-      rpcMessageChannelOptions("task-content"),
-    );
+      );
+      const port = await bind(server);
+      client = new grpc.Client(
+        `127.0.0.1:${port}`,
+        grpc.credentials.createInsecure(),
+        rpcMessageChannelOptions(domain),
+      );
 
-    const inbound = await unary(client, Buffer.alloc(0), () => {
-      clientDecodedResponse = true;
-    });
-    expect(inbound.error?.code).toBe(grpc.status.RESOURCE_EXHAUSTED);
-    expect(clientDecodedResponse).toBe(false);
-  });
+      const accepted = await unary(client, Buffer.alloc(0), beforeDecode);
+      expect(accepted.error).toBeNull();
+      expect(accepted.response).toEqual(response);
+      expect(beforeDecode).toHaveBeenCalledTimes(1);
 
-  test("rejects oversized tunnel frames on the small duplex-stream channel before protobuf decode", async () => {
-    let clientDecodedResponse = false;
-    const definition = unaryDefinition();
-    server = new grpc.Server();
-    server.addService(
-      { probe: definition },
-      {
-        probe(
-          _call: grpc.ServerUnaryCall<Buffer, Buffer>,
-          callback: grpc.sendUnaryData<Buffer>,
-        ): void {
-          callback(null, Buffer.alloc(RPC_MESSAGE_BUDGETS["tunnel-stream"].maxReceiveBytes + 1));
-        },
-      },
-    );
-    const port = await bind(server);
-    client = new grpc.Client(
-      `127.0.0.1:${port}`,
-      grpc.credentials.createInsecure(),
-      rpcMessageChannelOptions("tunnel-stream"),
-    );
-
-    const inbound = await unary(client, Buffer.alloc(0), () => {
-      clientDecodedResponse = true;
-    });
-    expect(inbound.error?.code).toBe(grpc.status.RESOURCE_EXHAUSTED);
-    expect(clientDecodedResponse).toBe(false);
-  });
+      response = Buffer.alloc(limit + 1, 0x61);
+      beforeDecode.mockClear();
+      const rejected = await unary(client, Buffer.alloc(0), beforeDecode);
+      expect(rejected.error?.code).toBe(grpc.status.RESOURCE_EXHAUSTED);
+      expect(rejected.response).toBeUndefined();
+      expect(beforeDecode).not.toHaveBeenCalled();
+    },
+  );
 });
 
 function identity(value: Buffer): Buffer {

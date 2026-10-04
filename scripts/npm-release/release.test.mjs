@@ -166,14 +166,29 @@ test('registry errors never look like an unpublished version', async () => {
   await assert.rejects(registryCheck(artifact, { fetchImpl: async () => new Response('{invalid json') }), SyntaxError);
 });
 
-test('registry requests provide bounded timeout signals and reject redirects', async () => {
-  await registryCheck(artifact, { fetchImpl: async (url, options) => {
-    assert.equal(url, 'https://registry.npmjs.org/sliver-script');
-    assert.ok(options.signal instanceof AbortSignal);
-    assert.equal(options.redirect, 'error');
-    assert.equal(options.cache, 'no-store');
-    return new Response('{}', { status: 404 });
-  } });
+test('registry requests forward deadline signals and redirect policy, and surface timeout failures', async (t) => {
+  for (const [name, options, expectedTimeout] of [
+    ['default deadline', {}, 15_000],
+    ['configured deadline', { timeoutMs: 2_500 }, 2_500],
+  ]) {
+    await t.test(name, async (t) => {
+      const controller = new AbortController();
+      const timeout = t.mock.method(AbortSignal, 'timeout', () => controller.signal);
+      const deadlineError = new DOMException('release request deadline elapsed', 'TimeoutError');
+      await assert.rejects(registryCheck(artifact, { ...options, fetchImpl: async (url, requestOptions) => {
+        assert.equal(url, 'https://registry.npmjs.org/sliver-script');
+        assert.equal(requestOptions.signal, controller.signal);
+        assert.equal(requestOptions.redirect, 'error');
+        assert.equal(requestOptions.cache, 'no-store');
+        return new Promise((_, reject) => {
+          requestOptions.signal.addEventListener('abort', () => reject(requestOptions.signal.reason), { once: true });
+          controller.abort(deadlineError);
+        });
+      } }), /Registry request failed: release request deadline elapsed/);
+      assert.equal(timeout.mock.callCount(), 1);
+      assert.deepEqual(timeout.mock.calls[0].arguments, [expectedTimeout]);
+    });
+  }
 });
 
 test('published verification downloads the artifact and checks provenance metadata', async () => {

@@ -32,11 +32,14 @@ describe("bounded AsyncQueue", () => {
     })).toThrow(/maxWeight must be a positive safe integer/u);
   });
 
-  test("atomically fails on overflow and clears both incoming and buffered bytes", async () => {
+  test.each([
+    { limit: "byte", maxItems: 2, maxWeight: 2 },
+    { limit: "item", maxItems: 1, maxWeight: 4 },
+  ])("accepts the $limit capacity, then atomically fails and clears bytes on overflow", async ({ maxItems, maxWeight }) => {
     const disposed: Uint8Array[] = [];
     const queue = byteQueue({
-      maxItems: 2,
-      maxWeight: 3,
+      maxItems,
+      maxWeight,
       dispose: (value) => {
         disposed.push(value);
         value.fill(0);
@@ -46,6 +49,8 @@ describe("bounded AsyncQueue", () => {
     const overflow = Uint8Array.from([3, 4]);
 
     expect(queue.push(first)).toBe(true);
+    expect(queue.bufferedItems).toBe(1);
+    expect(queue.bufferedWeight).toBe(2);
     expect(queue.push(overflow)).toBe(false);
     expect(queue.bufferedItems).toBe(0);
     expect(queue.bufferedWeight).toBe(0);
@@ -84,7 +89,7 @@ describe("bounded AsyncQueue", () => {
     await expect(iterator.next()).resolves.toEqual({ value: undefined, done: true });
   });
 
-  test("consumer cancellation securely disposes queued data and invokes cleanup once", async () => {
+  test("iterator cancellation securely disposes queued data and invokes cleanup", async () => {
     const cancel = jest.fn();
     const queue = byteQueue({ dispose: (value) => value.fill(0), onConsumerCancel: cancel });
     const first = Uint8Array.from([1, 2]);
