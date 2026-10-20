@@ -32,7 +32,7 @@ const PORT_FORWARD_PROTOCOL_TCP = 1;
 type PortForwardRpc = Pick<SliverRPCClient, "createTunnel" | "closeTunnel" | "portfwd">;
 
 export interface PortForwardTunnelTransport {
-  onTransportFailure(listener: () => void): () => void;
+  onTransportFailure(listener: () => void, options?: { readonly nextGeneration?: boolean }): () => void;
   openOutput(
     tunnelId: string,
     options: {
@@ -160,7 +160,7 @@ export class ManagedPortForward implements PortForward {
       this.publishState("listening");
       this.removeTransportFailureListener = this.tunnels.onTransportFailure(() => {
         void this.closeWithReason("transport-disconnected", true);
-      });
+      }, { nextGeneration: true });
       if (this.closePromise) {
         await this.closePromise;
         throw new Error("Tunnel transport is disconnected");

@@ -15,6 +15,7 @@ import {
   TUNNEL_MANAGER_MAX_QUEUED_FRAMES_PER_TUNNEL,
   TunnelManager,
 } from "../internal/tunnelManager";
+import { OperationAbortedError, OperationTimeoutError } from "../internal/timeout";
 
 const activeHarnesses = new Set<TunnelHarness>();
 afterEach(async () => {
@@ -22,6 +23,65 @@ afterEach(async () => {
 });
 
 describe("bounded managed session shell", () => {
+  test("uses one deadline across creation and a stalled bind acknowledgement", async () => {
+    jest.useFakeTimers();
+    try {
+      const harness = new TunnelHarness();
+      const shell = jest.fn();
+      const closeTunnel = jest.fn(async () => ({}));
+      const client = clientWithShellRpc(harness.manager, {
+        createTunnel: jest.fn(() => new Promise((resolve) => setTimeout(() => resolve({
+          TunnelID: "deadline-shell", SessionID: "deadline-session",
+        }), 700))),
+        shell, closeTunnel,
+      });
+      harness.acknowledgeBinds = false;
+      const started = client.startShellSession("deadline-session", {
+        path: "/bin/sh", pty: true, rows: 24, cols: 80,
+      }, 1);
+      const rejected = expect(started).rejects.toBeInstanceOf(OperationTimeoutError);
+      await jest.advanceTimersByTimeAsync(700);
+      expect(harness.outbound).toHaveLength(1);
+      expect(shell).not.toHaveBeenCalled();
+      await jest.advanceTimersByTimeAsync(300);
+      await rejected;
+      await jest.advanceTimersByTimeAsync(1_100);
+      expect(closeTunnel).toHaveBeenCalledTimes(1);
+      expect(harness.manager.stats().activeTunnels).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test.each(["managed", "legacy"])("cancels %s startup while the transport does not consume the bind", async (kind) => {
+    jest.useFakeTimers();
+    try {
+    const harness = new TunnelHarness(false);
+    const shell = jest.fn();
+    const closeTunnel = jest.fn(async () => ({}));
+    const client = clientWithShellRpc(harness.manager, {
+      createTunnel: jest.fn(async () => ({ TunnelID: `cancel-${kind}`, SessionID: "cancel-session" })),
+      shell, closeTunnel,
+    });
+    const controller = new AbortController();
+    const operation = { timeoutSeconds: 0, signal: controller.signal };
+    const started = kind === "managed"
+      ? client.startShellSession("cancel-session", { path: "/bin/sh", pty: true, rows: 24, cols: 80 }, operation)
+      : client.interactSession("cancel-session").shell("/bin/sh", true, operation);
+    const rejected = expect(started).rejects.toBeInstanceOf(OperationAbortedError);
+    await jest.advanceTimersByTimeAsync(1);
+    expect(harness.manager.stats().queuedFrames).toBe(1);
+    controller.abort();
+    await rejected;
+    expect(shell).not.toHaveBeenCalled();
+    await jest.advanceTimersByTimeAsync(2_100);
+    expect(closeTunnel).toHaveBeenCalledTimes(1);
+    expect(harness.manager.stats().activeTunnels).toBe(0);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
   test("registers early output before the exact bind and shell sequence", async () => {
     const order: string[] = [];
     const harness = new TunnelHarness(true, (message) => {
@@ -248,6 +308,9 @@ describe("bounded managed session shell", () => {
     };
     const tunnels = {
       openOutput: jest.fn(() => output),
+      bind: jest.fn(async (tunnelId: string, sessionId: string) => send({
+        TunnelID: tunnelId, SessionID: sessionId, Data: Buffer.alloc(0),
+      })),
       send,
       cancelTunnel: jest.fn(),
     };
@@ -431,6 +494,7 @@ describe("legacy interactive session shell compatibility", () => {
     });
     const tunnels = {
       subscribe: jest.fn(() => EMPTY),
+      bind: jest.fn(async () => undefined),
       send,
       cancelTunnel: jest.fn(),
     };
@@ -897,6 +961,7 @@ describe("bounded fair tunnel manager", () => {
 });
 
 class TunnelHarness {
+  acknowledgeBinds = false;
   readonly manager = new TunnelManager();
   readonly incoming = new PushAsyncIterable<TunnelData>();
   readonly outbound: Array<DeepPartial<TunnelData>> = [];
@@ -954,6 +1019,9 @@ class TunnelHarness {
         : result.value;
       this.outbound.push(message);
       this.onOutbound?.(message);
+      if (this.acknowledgeBinds && message.Data?.length === 0 && message.SessionID) {
+        this.incoming.push(tunnelMessage(message.TunnelID ?? "", message.SessionID, Buffer.alloc(0)));
+      }
       if (this.echoRemoteClose && Buffer.from(message.Data ?? []).toString("utf8") === "logout\n") {
         this.incoming.push(tunnelMessage(
           message.TunnelID ?? "", message.SessionID ?? "", Buffer.alloc(0), true,
@@ -1022,6 +1090,8 @@ function clientWithShellRpc(
   manager: TunnelManager,
   control: Record<string, unknown>,
 ): SliverClient {
+  const harness = [...activeHarnesses].find((candidate) => candidate.manager === manager);
+  if (harness) harness.acknowledgeBinds = true;
   const client = new SliverClient(baseConfig());
   const internals = client as unknown as { rpcClients: Record<string, unknown>; tunnels: TunnelManager };
   internals.rpcClients.control = control;

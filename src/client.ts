@@ -24,8 +24,10 @@ import {
   requestStopReversePortForward,
 } from "./internal/reversePortForward";
 import { SocksTunnelLeases, startSocks5Proxy, type ManagedSocks5Proxy } from "./internal/socks5Proxy";
-import { timeoutSecondsToNanoseconds, validateTimeoutSeconds, withTimeoutSignal } from "./internal/timeout";
-import { TunnelManager } from "./internal/tunnelManager";
+import { operationOptions, operationTimeoutSeconds, OperationAbortedError, OperationTimeoutError, timeoutSecondsToNanoseconds, withTimeoutSignal } from "./internal/timeout";
+import { TunnelManager, type TunnelTransportState } from "./internal/tunnelManager";
+import type { OperationTimeout } from "./internal/timeout";
+import { createBeaconTaskHandle, type BeaconTaskDecoder, type BeaconTaskHandle } from "./beaconTasks";
 import {
   BEACON_TASK_MAX_PAYLOAD_BYTES,
   RPC_MESSAGE_BUDGETS,
@@ -340,7 +342,7 @@ class BaseCommands {
     protected readonly responseArtifactRpc: SliverRPCClient = artifactRpc,
   ) {}
 
-  protected request(timeoutSeconds: number): CommonRequest {
+  protected request(timeoutSeconds: OperationTimeout): CommonRequest {
     return {
       Async: false,
       Timeout: timeoutSecondsToNanoseconds(timeoutSeconds),
@@ -349,29 +351,29 @@ class BaseCommands {
     };
   }
 
-  protected async unary<T>(timeoutSeconds: number, fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  protected async unary<T>(timeoutSeconds: OperationTimeout, fn: (signal: AbortSignal) => Promise<T>): Promise<T> {
     return withTimeoutSignal(timeoutSeconds, fn);
   }
 
-  ping(nonce: number, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  ping(nonce: number, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
       this.rpc.ping({ Nonce: nonce, Request: this.request(timeoutSeconds) }, { signal }),
     );
   }
 
-  ps(fullInfo = false, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  ps(fullInfo = false, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
       this.rpc.ps({ FullInfo: fullInfo, Request: this.request(timeoutSeconds) }, { signal }),
     );
   }
 
-  ls(path = ".", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  ls(path = ".", timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
       this.rpc.ls({ Path: path, Request: this.request(timeoutSeconds) }, { signal }),
     );
   }
 
-  download(path: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Buffer> {
+  download(path: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Buffer> {
     return this.unary(timeoutSeconds, async (signal) => {
       const download = await this.artifactRpc.download(
         { Path: path, Request: this.request(timeoutSeconds) },
@@ -395,7 +397,7 @@ class BaseCommands {
     });
   }
 
-  upload(path: string, data: Buffer, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  upload(path: string, data: Buffer, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     if (!Buffer.isBuffer(data)) throw new Error("Upload data must be bytes");
     assertBoundedArtifact(data, "Upload");
     const ownedData = Buffer.from(data);
@@ -417,51 +419,51 @@ class BaseCommands {
     }).finally(() => ownedData.fill(0));
   }
 
-  terminate(pid: number, force = false, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  terminate(pid: number, force = false, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
       this.rpc.terminate({ Pid: pid, Force: force, Request: this.request(timeoutSeconds) }, { signal }),
     );
   }
 
-  ifconfig(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  ifconfig(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
       this.rpc.ifconfig({ Request: this.request(timeoutSeconds) }, { signal }),
     );
   }
 
-  netstat(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  netstat(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
       this.rpc.netstat({ Request: this.request(timeoutSeconds) }, { signal }),
     );
   }
 
-  cd(path: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  cd(path: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) => this.rpc.cd({ Path: path, Request: this.request(timeoutSeconds) }, { signal }));
   }
 
-  pwd(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  pwd(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) => this.rpc.pwd({ Request: this.request(timeoutSeconds) }, { signal }));
   }
 
-  rm(path: string, recursive = false, force = false, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  rm(path: string, recursive = false, force = false, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
       this.rpc.rm({ Path: path, Recursive: recursive, Force: force, Request: this.request(timeoutSeconds) }, { signal }),
     );
   }
 
-  mkdir(path: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  mkdir(path: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
       this.rpc.mkdir({ Path: path, Request: this.request(timeoutSeconds) }, { signal }),
     );
   }
 
-  processDump(pid: number, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  processDump(pid: number, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
       this.artifactRpc.processDump({ Pid: pid, Request: this.request(timeoutSeconds) }, { signal }),
     );
   }
 
-  runAs(userName: string, processName: string, args: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  runAs(userName: string, processName: string, args: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
       this.rpc.runAs(
         { Username: userName, ProcessName: processName, Args: args, Request: this.request(timeoutSeconds) },
@@ -470,17 +472,17 @@ class BaseCommands {
     );
   }
 
-  impersonate(userName: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  impersonate(userName: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
       this.rpc.impersonate({ Username: userName, Request: this.request(timeoutSeconds) }, { signal }),
     );
   }
 
-  revToSelf(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  revToSelf(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) => this.rpc.revToSelf({ Request: this.request(timeoutSeconds) }, { signal }));
   }
 
-  getSystem(hostingProcess: string, config: ImplantConfig, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  getSystem(hostingProcess: string, config: ImplantConfig, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
       this.rpc.getSystem(
         { HostingProcess: hostingProcess, Config: config, Request: this.request(timeoutSeconds) },
@@ -500,7 +502,7 @@ class BaseCommands {
     shellcode: Buffer,
     encoder = "",
     rwxPages = false,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return this.unary(timeoutSeconds, (signal) =>
       this.artifactRpc.task(
@@ -522,7 +524,7 @@ class BaseCommands {
     lport: number,
     encoder = "",
     iterations = 0,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return this.unary(timeoutSeconds, (signal) =>
       this.rpc.msf(
@@ -539,7 +541,7 @@ class BaseCommands {
     lport: number,
     encoder = "",
     iterations = 0,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return this.unary(timeoutSeconds, (signal) =>
       this.rpc.msfRemote(
@@ -549,7 +551,7 @@ class BaseCommands {
     );
   }
 
-  executeAssembly(assembly: Buffer, args: string[] = [], process = "", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  executeAssembly(assembly: Buffer, args: string[] = [], process = "", timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
       this.artifactRpc.executeAssembly(
         { Assembly: assembly, Arguments: args, Process: process, Request: this.request(timeoutSeconds) },
@@ -558,13 +560,13 @@ class BaseCommands {
     );
   }
 
-  migrate(pid: number, config: ImplantConfig, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  migrate(pid: number, config: ImplantConfig, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
       this.rpc.migrate({ Pid: pid, Config: config, Request: this.request(timeoutSeconds) }, { signal }),
     );
   }
 
-  execute(exe: string, args: string[] = [], output = true, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  execute(exe: string, args: string[] = [], output = true, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     const request = this.request(timeoutSeconds);
     const rpc = !request.Async && output ? this.responseArtifactRpc : this.rpc;
     return this.unary(timeoutSeconds, (signal) =>
@@ -577,7 +579,7 @@ class BaseCommands {
     processName: string,
     args: string[] = [],
     entryPoint: string,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return this.unary(timeoutSeconds, (signal) =>
       this.artifactRpc.sideload(
@@ -592,7 +594,7 @@ class BaseCommands {
     entrypoint: string,
     processName: string,
     args: string[] = [],
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return this.unary(timeoutSeconds, (signal) =>
       this.artifactRpc.spawnDll(
@@ -602,7 +604,7 @@ class BaseCommands {
     );
   }
 
-  screenshot(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  screenshot(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.unary(timeoutSeconds, (signal) =>
       this.artifactRpc.screenshot({ Request: this.request(timeoutSeconds) }, { signal }),
     );
@@ -651,7 +653,7 @@ export class InteractiveBeacon extends BaseCommands {
       ?? (usingSeparateArtifactClient ? taskResultsOrBeaconId : taskContentRpcOrTaskResultsOrBeaconId) as string;
   }
 
-  protected request(timeoutSeconds: number): CommonRequest {
+  protected request(timeoutSeconds: OperationTimeout): CommonRequest {
     return {
       Async: true,
       Timeout: timeoutSecondsToNanoseconds(timeoutSeconds),
@@ -660,7 +662,23 @@ export class InteractiveBeacon extends BaseCommands {
     };
   }
 
-  async lsTask(path = ".", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  /** Attach to a queued task without queueing another remote operation. */
+  beaconTask<T>(
+    taskId: string,
+    decoder: BeaconTaskDecoder<T>,
+    options: { readonly timeoutSeconds?: number } = {},
+  ): BeaconTaskHandle<T> {
+    return createBeaconTaskHandle({
+      taskId, beaconId: this.beaconId, decoder,
+      getRpc: () => this.taskContentRpc,
+      events: this.taskResult$,
+      defaultTimeoutSeconds: options.timeoutSeconds,
+      cancel: (id, options) => withTimeoutSignal(options, (signal) =>
+        this.artifactRpc.cancelBeaconTask({ ID: id }, { signal })),
+    });
+  }
+
+  async lsTask(path = ".", timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     const lsTask = await super.ls(path, timeoutSeconds);
     if (lsTask.Response?.Err) {
       throw new Error(lsTask.Response.Err);
@@ -670,6 +688,7 @@ export class InteractiveBeacon extends BaseCommands {
       throw new Error("Missing beacon task id");
     }
     return {
+      ...this.beaconTask(taskId, Ls, { timeoutSeconds: operationTimeoutSeconds(timeoutSeconds) }),
       id: taskId,
       wait: async (waitTimeoutSeconds = timeoutSeconds) => {
         const taskContent = await waitForBeaconTaskContent(
@@ -683,12 +702,21 @@ export class InteractiveBeacon extends BaseCommands {
     };
   }
 
-  async ls(path = ".", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
-    const task = await this.lsTask(path, timeoutSeconds);
-    return task.wait(timeoutSeconds);
+  async ls(path = ".", timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      const operation = { timeoutSeconds: operationTimeoutSeconds(timeoutSeconds), signal };
+      const task = await this.lsTask(path, operation);
+      return task.wait(operation);
+    });
   }
 
-  override async download(path: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Buffer> {
+  override async download(path: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Buffer> {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.downloadWithOptions(path, {
+      timeoutSeconds: operationTimeoutSeconds(timeoutSeconds), signal,
+    }));
+  }
+
+  private async downloadWithOptions(path: string, timeoutSeconds: OperationTimeout): Promise<Buffer> {
     const queued = await this.unary(timeoutSeconds, (signal) =>
       this.artifactRpc.download(
         {
@@ -775,7 +803,7 @@ export class InteractiveSession extends BaseCommands {
       ?? (usingSeparateArtifactClient ? tunnelsOrSessionId : responseArtifactRpcOrTunnelsOrSessionId) as string;
   }
 
-  protected request(timeoutSeconds: number): CommonRequest {
+  protected request(timeoutSeconds: OperationTimeout): CommonRequest {
     return {
       Async: false,
       Timeout: timeoutSecondsToNanoseconds(timeoutSeconds),
@@ -784,17 +812,25 @@ export class InteractiveSession extends BaseCommands {
     };
   }
 
-  async shell(path: string, pty = true, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Tunnel> {
-    const tunnel = await this.unary(timeoutSeconds, (signal) =>
-      this.rpc.createTunnel({ SessionID: this.sessionId }, { signal }),
-    );
+  async shell(path: string, pty = true, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Tunnel> {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.openShell(path, pty, {
+      timeoutSeconds: operationTimeoutSeconds(timeoutSeconds), signal,
+    }), (handle) => handle.close());
+  }
+
+  private async openShell(path: string, pty: boolean, timeoutSeconds: OperationTimeout): Promise<Tunnel> {
+    // Keep observing late creation results after the outer deadline settles so
+    // their owned tunnel IDs can still be retired and closed.
+    const signal = operationOptions(timeoutSeconds).signal!;
+    const tunnel = await this.rpc.createTunnel({ SessionID: this.sessionId }, { signal });
     if (!tunnel?.TunnelID) {
       throw new Error("Failed to create tunnel");
     }
+    if (tunnel.SessionID && tunnel.SessionID !== this.sessionId) throw new Error("Mismatched shell session");
     const tunnelId = tunnel.TunnelID;
 
     // Subscribe first so we don't miss early data.
-    const stdout$ = this.tunnels.subscribe(tunnelId).pipe(
+    const stdout$ = this.tunnels.subscribe(tunnelId, { exclusive: true }).pipe(
       filter((msg) => msg.TunnelID === tunnelId),
       filter((msg) => msg.Data.length > 0),
       map((msg) => msg.Data),
@@ -812,11 +848,7 @@ export class InteractiveSession extends BaseCommands {
 
     try {
       // Bind tunnel to the tunnel stream.
-      await this.tunnels.send({
-        TunnelID: tunnelId,
-        SessionID: this.sessionId,
-        Data: Buffer.alloc(0),
-      });
+      await this.tunnels.bind(tunnelId, this.sessionId, operationOptions(timeoutSeconds).signal);
 
       // Ask the implant to open a shell on the bound tunnel.
       const shell = await this.unary(timeoutSeconds, (signal) =>
@@ -834,11 +866,12 @@ export class InteractiveSession extends BaseCommands {
         ),
       );
       if (shell.Response?.Err) throw new Error("Shell was rejected by the target");
-    } catch {
+    } catch (error) {
       this.tunnels.cancelTunnel(tunnelId);
       await this.unary(DEFAULT_TIMEOUT_SECONDS, (signal) =>
         this.rpc.closeTunnel({ TunnelID: tunnelId, SessionID: this.sessionId }, { signal }),
       ).catch(() => undefined);
+      if (error instanceof OperationAbortedError || error instanceof OperationTimeoutError) throw error;
       throw new Error("Unable to start shell session");
     }
 
@@ -905,6 +938,11 @@ export class SliverClient {
 
   private eventsAbort: AbortController | null = null;
   private tunnels: TunnelManager | null = null;
+  private tunnelStateSubscription?: { unsubscribe(): void };
+  private readonly tunnelStreamStateSubject = new BehaviorSubject<TunnelTransportState>({
+    status: "stopped", generation: 0,
+  });
+  readonly tunnelStreamState$ = this.tunnelStreamStateSubject.asObservable();
   private lifecycleTail: Promise<void> = Promise.resolve();
   private readonly managedPortForwards = new Set<ManagedPortForward>();
   private readonly managedSocks5Proxies = new Set<ManagedSocks5Proxy>();
@@ -970,7 +1008,7 @@ export class SliverClient {
     return this.clientFor("task-content");
   }
 
-  private sessionRequest(sessionId: string, timeoutSeconds: number): CommonRequest {
+  private sessionRequest(sessionId: string, timeoutSeconds: OperationTimeout): CommonRequest {
     return {
       Async: false,
       Timeout: timeoutSecondsToNanoseconds(timeoutSeconds),
@@ -979,7 +1017,7 @@ export class SliverClient {
     };
   }
 
-  private beaconRequest(beaconId: string, timeoutSeconds: number): CommonRequest {
+  private beaconRequest(beaconId: string, timeoutSeconds: OperationTimeout): CommonRequest {
     return {
       Async: true,
       Timeout: timeoutSecondsToNanoseconds(timeoutSeconds),
@@ -988,12 +1026,12 @@ export class SliverClient {
     };
   }
 
-  private m4SessionRequest(sessionId: string, timeoutSeconds: number): CommonRequest {
+  private m4SessionRequest(sessionId: string, timeoutSeconds: OperationTimeout): CommonRequest {
     assertNonEmptyString(sessionId, "Session id");
     return this.sessionRequest(sessionId, timeoutSeconds);
   }
 
-  private m4BeaconRequest(beaconId: string, timeoutSeconds: number): CommonRequest {
+  private m4BeaconRequest(beaconId: string, timeoutSeconds: OperationTimeout): CommonRequest {
     assertNonEmptyString(beaconId, "Beacon id");
     return this.beaconRequest(beaconId, timeoutSeconds);
   }
@@ -1008,15 +1046,25 @@ export class SliverClient {
     return result;
   }
 
-  connect(): Promise<this> {
-    return this.enqueueLifecycle(() => this.connectUnlocked());
+  connect(options: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<this> {
+    let owner: AbortController | undefined;
+    return withTimeoutSignal(options, (signal) => this.enqueueLifecycle(() => this.connectUnlocked({
+      timeoutSeconds: operationTimeoutSeconds(options), signal,
+    }, (connection) => { owner = connection; })), () => this.enqueueLifecycle(async () => {
+      if (owner && this.eventsAbort === owner) await this.disconnectUnlocked();
+    }));
   }
 
-  private async connectUnlocked(): Promise<this> {
+  private async connectUnlocked(options: OperationTimeout, onCreated: (owner: AbortController) => void): Promise<this> {
+    operationOptions(options).signal?.throwIfAborted();
     if (this.rpcClients.control) return this;
 
     this.eventsAbort = new AbortController();
+    onCreated(this.eventsAbort);
     this.tunnels = new TunnelManager();
+    this.tunnelStateSubscription = this.tunnels.transportState$.subscribe((state) => {
+      this.tunnelStreamStateSubject.next(state);
+    });
 
     try {
       const credentials = createSliverRpcCredentials(this.config);
@@ -1032,11 +1080,12 @@ export class SliverClient {
       }
 
       // Ensure auth and connectivity are working before we start streams.
-      await this.getVersion();
+      await this.getVersion(options);
 
       this.tunnels.start(this.clientFor("tunnel-stream"));
       this.startEventsStream();
-      await this.reconcileManagedReversePortForwards();
+      await this.reconcileManagedReversePortForwards(operationOptions(options));
+      operationOptions(options).signal?.throwIfAborted();
       return this;
     } catch (error) {
       await this.disconnectUnlocked();
@@ -1062,6 +1111,8 @@ export class SliverClient {
 
     await this.tunnels?.stop();
     this.tunnels = null;
+    this.tunnelStateSubscription?.unsubscribe();
+    this.tunnelStateSubscription = undefined;
 
     for (const domain of RPC_MESSAGE_DOMAINS) {
       delete this.rpcClients[domain];
@@ -1124,35 +1175,35 @@ export class SliverClient {
 
   // --- Convenience APIs (typed, promise-based) ---
 
-  getVersion(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Version> {
+  getVersion(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Version> {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.getVersion(this.empty, { signal }));
   }
 
-  getOperators(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Operators> {
+  getOperators(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Operators> {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.getOperators(this.empty, { signal }));
   }
 
-  getSessions(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Sessions> {
+  getSessions(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Sessions> {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.inventoryRpc.getSessions(this.empty, { signal }));
   }
 
-  getBeacons(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Beacons> {
+  getBeacons(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Beacons> {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.inventoryRpc.getBeacons(this.empty, { signal }));
   }
 
-  renameSession(sessionId: string, name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Empty> {
+  renameSession(sessionId: string, name: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Empty> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.rename({ SessionID: sessionId, BeaconID: "", Name: name }, { signal }),
     );
   }
 
-  renameBeacon(beaconId: string, name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Empty> {
+  renameBeacon(beaconId: string, name: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Empty> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.rename({ SessionID: "", BeaconID: beaconId, Name: name }, { signal }),
     );
   }
 
-  pingSession(sessionId: string, nonce: number, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Ping> {
+  pingSession(sessionId: string, nonce: number, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Ping> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.ping(
         { Nonce: nonce, Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -1161,7 +1212,7 @@ export class SliverClient {
     );
   }
 
-  pingBeacon(beaconId: string, nonce: number, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Ping> {
+  pingBeacon(beaconId: string, nonce: number, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Ping> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.ping(
         { Nonce: nonce, Request: this.beaconRequest(beaconId, timeoutSeconds) },
@@ -1170,7 +1221,7 @@ export class SliverClient {
     );
   }
 
-  getEnvSession(sessionId: string, name = "", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<EnvInfo> {
+  getEnvSession(sessionId: string, name = "", timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<EnvInfo> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.getEnv(
         { Name: name, Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -1179,7 +1230,7 @@ export class SliverClient {
     );
   }
 
-  getEnvBeacon(beaconId: string, name = "", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<EnvInfo> {
+  getEnvBeacon(beaconId: string, name = "", timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<EnvInfo> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.getEnv(
         { Name: name, Request: this.beaconRequest(beaconId, timeoutSeconds) },
@@ -1192,7 +1243,7 @@ export class SliverClient {
     sessionId: string,
     key: string,
     value: string,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ): Promise<SetEnv> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.setEnv(
@@ -1209,7 +1260,7 @@ export class SliverClient {
     beaconId: string,
     key: string,
     value: string,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ): Promise<SetEnv> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.setEnv(
@@ -1222,7 +1273,7 @@ export class SliverClient {
     );
   }
 
-  unsetEnvSession(sessionId: string, name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<UnsetEnv> {
+  unsetEnvSession(sessionId: string, name: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<UnsetEnv> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.unsetEnv(
         { Name: name, Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -1231,7 +1282,7 @@ export class SliverClient {
     );
   }
 
-  unsetEnvBeacon(beaconId: string, name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<UnsetEnv> {
+  unsetEnvBeacon(beaconId: string, name: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<UnsetEnv> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.unsetEnv(
         { Name: name, Request: this.beaconRequest(beaconId, timeoutSeconds) },
@@ -1242,7 +1293,8 @@ export class SliverClient {
 
   // --- Explicit M2 session workbench APIs ---
 
-  currentTokenOwnerSession(sessionId: string, timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+  currentTokenOwnerSession(sessionId: string, timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.currentTokenOwner(
         { Request: this.m4SessionRequest(sessionId, timeoutSeconds) },
@@ -1251,7 +1303,8 @@ export class SliverClient {
     );
   }
 
-  currentTokenOwnerBeacon(beaconId: string, timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+  currentTokenOwnerBeacon(beaconId: string, timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.currentTokenOwner(
         { Request: this.m4BeaconRequest(beaconId, timeoutSeconds) },
@@ -1260,16 +1313,16 @@ export class SliverClient {
     );
   }
 
-  listEnvSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<EnvInfo> {
+  listEnvSession(sessionId: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<EnvInfo> {
     return this.getEnvSession(sessionId, "", timeoutSeconds);
   }
 
-  revealEnvSession(sessionId: string, exactName: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<EnvInfo> {
+  revealEnvSession(sessionId: string, exactName: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<EnvInfo> {
     assertNonEmptyString(exactName, "Environment variable name");
     return this.getEnvSession(sessionId, exactName, timeoutSeconds);
   }
 
-  ifconfigSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  ifconfigSession(sessionId: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.ifconfig(
         { Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -1281,7 +1334,7 @@ export class SliverClient {
   netstatSession(
     sessionId: string,
     options: SessionNetstatOptions,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.netstat(
@@ -1298,7 +1351,7 @@ export class SliverClient {
     );
   }
 
-  pwdSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  pwdSession(sessionId: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.pwd(
         { Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -1307,7 +1360,7 @@ export class SliverClient {
     );
   }
 
-  cdSession(sessionId: string, path: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  cdSession(sessionId: string, path: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.cd(
         { Path: path, Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -1316,7 +1369,7 @@ export class SliverClient {
     );
   }
 
-  lsSession(sessionId: string, path = ".", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  lsSession(sessionId: string, path = ".", timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.ls(
         { Path: path, Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -1329,7 +1382,7 @@ export class SliverClient {
     sessionId: string,
     path: string,
     options: SessionDownloadFileOptions = {},
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     const maxBytes = boundedArtifactByteCount(options.maxBytes);
     const start = boundedNonNegativeInteger(options.start ?? 0, "Download start");
@@ -1373,7 +1426,7 @@ export class SliverClient {
     path: string,
     data: Buffer,
     options: SessionUploadOptions = {},
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     assertBoundedArtifact(data, "Upload");
     const ownedData = Buffer.from(data);
@@ -1410,7 +1463,7 @@ export class SliverClient {
     path: string,
     searchPattern: string,
     options: SessionGrepOptions = {},
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     const linesBefore = boundedNonNegativeInt32(options.linesBefore ?? 0, "Grep lines before");
     const linesAfter = boundedNonNegativeInt32(options.linesAfter ?? 0, "Grep lines after");
@@ -1429,7 +1482,7 @@ export class SliverClient {
     );
   }
 
-  cpSession(sessionId: string, source: string, destination: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  cpSession(sessionId: string, source: string, destination: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.cp(
         { Src: source, Dst: destination, Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -1438,7 +1491,7 @@ export class SliverClient {
     );
   }
 
-  mvSession(sessionId: string, source: string, destination: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  mvSession(sessionId: string, source: string, destination: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.mv(
         { Src: source, Dst: destination, Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -1447,7 +1500,7 @@ export class SliverClient {
     );
   }
 
-  mkdirSession(sessionId: string, path: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  mkdirSession(sessionId: string, path: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.mkdir(
         { Path: path, Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -1461,7 +1514,7 @@ export class SliverClient {
     path: string,
     recursive = false,
     force = false,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.rm(
@@ -1471,7 +1524,7 @@ export class SliverClient {
     );
   }
 
-  mountsSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  mountsSession(sessionId: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.mount(
         { Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -1480,7 +1533,7 @@ export class SliverClient {
     );
   }
 
-  memfilesListSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  memfilesListSession(sessionId: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.memfilesList(
         { Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -1489,7 +1542,7 @@ export class SliverClient {
     );
   }
 
-  memfilesAddSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  memfilesAddSession(sessionId: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.memfilesAdd(
         { Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -1498,7 +1551,7 @@ export class SliverClient {
     );
   }
 
-  memfilesRmSession(sessionId: string, fd: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  memfilesRmSession(sessionId: string, fd: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.memfilesRm(
         { Fd: fd, Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -1512,7 +1565,7 @@ export class SliverClient {
     path: string,
     fileMode: string,
     recursive = false,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.chmod(
@@ -1528,7 +1581,7 @@ export class SliverClient {
     uid: string,
     gid: string,
     recursive = false,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.chown(
@@ -1543,7 +1596,7 @@ export class SliverClient {
     path: string,
     accessTime: string,
     modificationTime: string,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.chtimes(
@@ -1553,7 +1606,7 @@ export class SliverClient {
     );
   }
 
-  psSession(sessionId: string, fullInfo = false, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  psSession(sessionId: string, fullInfo = false, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.ps(
         { FullInfo: fullInfo, Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -1566,7 +1619,7 @@ export class SliverClient {
     sessionId: string,
     pid: number,
     force = false,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.terminate(
@@ -1580,9 +1633,10 @@ export class SliverClient {
     sessionId: string,
     pid: number,
     dumpTimeoutSeconds = 60,
-    timeoutSeconds = dumpTimeoutSeconds + DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = dumpTimeoutSeconds + DEFAULT_TIMEOUT_SECONDS,
   ) {
     const validatedDumpTimeout = boundedPositiveInt32(dumpTimeoutSeconds, "Process dump timeout");
+    timeoutSeconds = operationOptions(timeoutSeconds, validatedDumpTimeout + DEFAULT_TIMEOUT_SECONDS);
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
       const response = await this.workbenchArtifactRpc.processDump(
         {
@@ -1603,7 +1657,7 @@ export class SliverClient {
     });
   }
 
-  screenshotSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  screenshotSession(sessionId: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
       const response = await this.workbenchArtifactRpc.screenshot(
         { Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -1620,7 +1674,7 @@ export class SliverClient {
     });
   }
 
-  servicesSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  servicesSession(sessionId: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.services(
         { Hostname: "", Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -1629,7 +1683,7 @@ export class SliverClient {
     );
   }
 
-  serviceDetailSession(sessionId: string, serviceName: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  serviceDetailSession(sessionId: string, serviceName: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.serviceDetail(
         {
@@ -1641,7 +1695,7 @@ export class SliverClient {
     );
   }
 
-  startServiceSession(sessionId: string, serviceName: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  startServiceSession(sessionId: string, serviceName: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.startServiceByName(
         {
@@ -1653,7 +1707,7 @@ export class SliverClient {
     );
   }
 
-  stopServiceSession(sessionId: string, serviceName: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  stopServiceSession(sessionId: string, serviceName: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.stopService(
         {
@@ -1670,7 +1724,7 @@ export class SliverClient {
     hive: string,
     path: string,
     key: string,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.registryRead(
@@ -1684,7 +1738,7 @@ export class SliverClient {
     sessionId: string,
     hive: string,
     path: string,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.registryListSubKeys(
@@ -1698,7 +1752,7 @@ export class SliverClient {
     sessionId: string,
     hive: string,
     path: string,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.registryListValues(
@@ -1713,7 +1767,7 @@ export class SliverClient {
     rootHive: string,
     requestedHive: string,
     maxBytes = WORKBENCH_ARTIFACT_MAX_PAYLOAD_BYTES,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     const boundedMaxBytes = boundedArtifactByteCount(maxBytes);
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
@@ -1738,7 +1792,7 @@ export class SliverClient {
     path: string,
     key: string,
     value: SessionRegistryWriteValue,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     const fields = registryWriteFields(value);
     const dispose = () => fields.ByteValue.fill(0);
@@ -1766,7 +1820,7 @@ export class SliverClient {
     hive: string,
     path: string,
     key: string,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.registryCreateKey(
@@ -1781,7 +1835,7 @@ export class SliverClient {
     hive: string,
     path: string,
     key: string,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.registryDeleteKey(
@@ -1793,7 +1847,7 @@ export class SliverClient {
 
   // --- Explicit M4 execution and privilege APIs ---
 
-  private executeTarget(request: CommonRequest, options: ExecuteOptions, timeoutSeconds: number) {
+  private executeTarget(request: CommonRequest, options: ExecuteOptions, timeoutSeconds: OperationTimeout) {
     assertNonEmptyString(options.path, "Executable path");
     const args = m4StringArray(options.args);
     const background = options.background ?? false;
@@ -1853,20 +1907,23 @@ export class SliverClient {
   executeSession(
     sessionId: string,
     options: ExecuteOptions,
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.executeTarget(this.m4SessionRequest(sessionId, timeoutSeconds), options, timeoutSeconds);
   }
 
   executeBeacon(
     beaconId: string,
     options: ExecuteOptions,
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.executeTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), options, timeoutSeconds);
   }
 
-  executeChildrenSession(sessionId: string, timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+  executeChildrenSession(sessionId: string, timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.executeChildren(
         { Request: this.m4SessionRequest(sessionId, timeoutSeconds) },
@@ -1875,7 +1932,8 @@ export class SliverClient {
     );
   }
 
-  executeChildrenBeacon(beaconId: string, timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+  executeChildrenBeacon(beaconId: string, timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.executeChildren(
         { Request: this.m4BeaconRequest(beaconId, timeoutSeconds) },
@@ -1888,7 +1946,7 @@ export class SliverClient {
     request: CommonRequest,
     assembly: Buffer,
     options: ExecuteAssemblyOptions,
-    timeoutSeconds: number,
+    timeoutSeconds: OperationTimeout,
   ) {
     const isDll = options.isDll ?? false;
     if (isDll && (!options.className?.trim() || !options.method?.trim())) {
@@ -1931,8 +1989,9 @@ export class SliverClient {
     sessionId: string,
     assembly: Buffer,
     options: ExecuteAssemblyOptions = {},
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.executeAssemblyTarget(
       this.m4SessionRequest(sessionId, timeoutSeconds),
       assembly,
@@ -1945,8 +2004,9 @@ export class SliverClient {
     beaconId: string,
     assembly: Buffer,
     options: ExecuteAssemblyOptions = {},
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.executeAssemblyTarget(
       this.m4BeaconRequest(beaconId, timeoutSeconds),
       assembly,
@@ -1959,7 +2019,7 @@ export class SliverClient {
     request: CommonRequest,
     shellcode: Buffer,
     options: ExecuteShellcodeOptions,
-    timeoutSeconds: number,
+    timeoutSeconds: OperationTimeout,
   ) {
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
       const ownedShellcode = m4ArtifactCopy(shellcode, "Shellcode");
@@ -1984,8 +2044,9 @@ export class SliverClient {
     sessionId: string,
     shellcode: Buffer,
     options: ExecuteShellcodeOptions = {},
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.executeShellcodeTarget(
       this.m4SessionRequest(sessionId, timeoutSeconds),
       shellcode,
@@ -1998,8 +2059,9 @@ export class SliverClient {
     beaconId: string,
     shellcode: Buffer,
     options: ExecuteShellcodeOptions = {},
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.executeShellcodeTarget(
       this.m4BeaconRequest(beaconId, timeoutSeconds),
       shellcode,
@@ -2012,7 +2074,7 @@ export class SliverClient {
     request: CommonRequest,
     data: Buffer,
     options: SideloadOptions,
-    timeoutSeconds: number,
+    timeoutSeconds: OperationTimeout,
   ) {
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
       const ownedData = m4ArtifactCopy(data, "Sideload library");
@@ -2042,8 +2104,9 @@ export class SliverClient {
     sessionId: string,
     data: Buffer,
     options: SideloadOptions = {},
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.sideloadTarget(this.m4SessionRequest(sessionId, timeoutSeconds), data, options, timeoutSeconds);
   }
 
@@ -2051,8 +2114,9 @@ export class SliverClient {
     beaconId: string,
     data: Buffer,
     options: SideloadOptions = {},
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.sideloadTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), data, options, timeoutSeconds);
   }
 
@@ -2060,7 +2124,7 @@ export class SliverClient {
     request: CommonRequest,
     data: Buffer,
     options: SpawnDllOptions,
-    timeoutSeconds: number,
+    timeoutSeconds: OperationTimeout,
   ) {
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
       const ownedData = m4ArtifactCopy(data, "Reflective DLL");
@@ -2088,8 +2152,9 @@ export class SliverClient {
     sessionId: string,
     data: Buffer,
     options: SpawnDllOptions = {},
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.spawnDllTarget(this.m4SessionRequest(sessionId, timeoutSeconds), data, options, timeoutSeconds);
   }
 
@@ -2097,16 +2162,18 @@ export class SliverClient {
     beaconId: string,
     data: Buffer,
     options: SpawnDllOptions = {},
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.spawnDllTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), data, options, timeoutSeconds);
   }
 
-  getShellcodeEncoderMap(timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+  getShellcodeEncoderMap(timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.shellcodeEncoderMap({}, { signal }));
   }
 
-  private migrateTarget(request: CommonRequest, options: MigrateOptions, timeoutSeconds: number) {
+  private migrateTarget(request: CommonRequest, options: MigrateOptions, timeoutSeconds: OperationTimeout) {
     const pid = boundedUint32(options.pid ?? 0, "Migration process id");
     const processName = options.processName?.trim() ?? "";
     if (pid === 0 && processName === "") {
@@ -2135,20 +2202,22 @@ export class SliverClient {
   migrateSession(
     sessionId: string,
     options: MigrateOptions,
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.migrateTarget(this.m4SessionRequest(sessionId, timeoutSeconds), options, timeoutSeconds);
   }
 
   migrateBeacon(
     beaconId: string,
     options: MigrateOptions,
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.migrateTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), options, timeoutSeconds);
   }
 
-  private msfTarget(request: CommonRequest, options: MsfOptions, timeoutSeconds: number) {
+  private msfTarget(request: CommonRequest, options: MsfOptions, timeoutSeconds: OperationTimeout) {
     assertNonEmptyString(options.lhost, "Metasploit listen host");
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.msf(
@@ -2165,15 +2234,17 @@ export class SliverClient {
     );
   }
 
-  msfSession(sessionId: string, options: MsfOptions, timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+  msfSession(sessionId: string, options: MsfOptions, timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.msfTarget(this.m4SessionRequest(sessionId, timeoutSeconds), options, timeoutSeconds);
   }
 
-  msfBeacon(beaconId: string, options: MsfOptions, timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+  msfBeacon(beaconId: string, options: MsfOptions, timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.msfTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), options, timeoutSeconds);
   }
 
-  private msfRemoteTarget(request: CommonRequest, options: MsfRemoteOptions, timeoutSeconds: number) {
+  private msfRemoteTarget(request: CommonRequest, options: MsfRemoteOptions, timeoutSeconds: OperationTimeout) {
     assertNonEmptyString(options.lhost, "Metasploit listen host");
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.msfRemote(
@@ -2194,24 +2265,27 @@ export class SliverClient {
   msfRemoteSession(
     sessionId: string,
     options: MsfRemoteOptions,
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.msfRemoteTarget(this.m4SessionRequest(sessionId, timeoutSeconds), options, timeoutSeconds);
   }
 
   msfRemoteBeacon(
     beaconId: string,
     options: MsfRemoteOptions,
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.msfRemoteTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), options, timeoutSeconds);
   }
 
   runSshSession(
     sessionId: string,
     options: SshCommandOptions,
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     assertNonEmptyString(options.username, "SSH username");
     assertNonEmptyString(options.hostname, "SSH hostname");
     if (options.kerberosRealm && !options.kerberosKeytab) {
@@ -2249,8 +2323,9 @@ export class SliverClient {
   startRemoteServiceSession(
     sessionId: string,
     options: StartRemoteServiceOptions,
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     assertBoundedNonEmptyString(
       options.hostname,
       "Remote service hostname",
@@ -2295,8 +2370,9 @@ export class SliverClient {
   removeRemoteServiceSession(
     sessionId: string,
     options: RemoveRemoteServiceOptions,
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     assertBoundedNonEmptyString(
       options.hostname,
       "Remote service hostname",
@@ -2322,7 +2398,7 @@ export class SliverClient {
     );
   }
 
-  private runAsTarget(request: CommonRequest, options: RunAsOptions, timeoutSeconds: number) {
+  private runAsTarget(request: CommonRequest, options: RunAsOptions, timeoutSeconds: OperationTimeout) {
     assertNonEmptyString(options.username, "Run-as username");
     assertNonEmptyString(options.processName, "Run-as process path");
     return withTimeoutSignal(timeoutSeconds, (signal) =>
@@ -2345,20 +2421,22 @@ export class SliverClient {
   runAsSession(
     sessionId: string,
     options: RunAsOptions,
-    timeoutSeconds = M4_IDENTITY_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_IDENTITY_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_IDENTITY_TIMEOUT_SECONDS);
     return this.runAsTarget(this.m4SessionRequest(sessionId, timeoutSeconds), options, timeoutSeconds);
   }
 
   runAsBeacon(
     beaconId: string,
     options: RunAsOptions,
-    timeoutSeconds = M4_IDENTITY_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_IDENTITY_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_IDENTITY_TIMEOUT_SECONDS);
     return this.runAsTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), options, timeoutSeconds);
   }
 
-  private makeTokenTarget(request: CommonRequest, options: MakeTokenOptions, timeoutSeconds: number) {
+  private makeTokenTarget(request: CommonRequest, options: MakeTokenOptions, timeoutSeconds: OperationTimeout) {
     assertNonEmptyString(options.username, "Token username");
     assertNonEmptyString(options.password, "Token password");
     const logonType = options.logonType ?? 9;
@@ -2380,20 +2458,22 @@ export class SliverClient {
   makeTokenSession(
     sessionId: string,
     options: MakeTokenOptions,
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.makeTokenTarget(this.m4SessionRequest(sessionId, timeoutSeconds), options, timeoutSeconds);
   }
 
   makeTokenBeacon(
     beaconId: string,
     options: MakeTokenOptions,
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return this.makeTokenTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), options, timeoutSeconds);
   }
 
-  private impersonateTarget(request: CommonRequest, username: string, timeoutSeconds: number) {
+  private impersonateTarget(request: CommonRequest, username: string, timeoutSeconds: OperationTimeout) {
     assertNonEmptyString(username, "Impersonation username");
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.impersonate({ Username: username, Request: request }, { signal }),
@@ -2403,26 +2483,30 @@ export class SliverClient {
   impersonateSession(
     sessionId: string,
     username: string,
-    timeoutSeconds = M4_IDENTITY_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_IDENTITY_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_IDENTITY_TIMEOUT_SECONDS);
     return this.impersonateTarget(this.m4SessionRequest(sessionId, timeoutSeconds), username, timeoutSeconds);
   }
 
   impersonateBeacon(
     beaconId: string,
     username: string,
-    timeoutSeconds = M4_IDENTITY_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_IDENTITY_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_IDENTITY_TIMEOUT_SECONDS);
     return this.impersonateTarget(this.m4BeaconRequest(beaconId, timeoutSeconds), username, timeoutSeconds);
   }
 
-  revToSelfSession(sessionId: string, timeoutSeconds = M4_IDENTITY_TIMEOUT_SECONDS) {
+  revToSelfSession(sessionId: string, timeoutSeconds: OperationTimeout = M4_IDENTITY_TIMEOUT_SECONDS) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_IDENTITY_TIMEOUT_SECONDS);
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.revToSelf({ Request: this.m4SessionRequest(sessionId, timeoutSeconds) }, { signal }),
     );
   }
 
-  revToSelfBeacon(beaconId: string, timeoutSeconds = M4_IDENTITY_TIMEOUT_SECONDS) {
+  revToSelfBeacon(beaconId: string, timeoutSeconds: OperationTimeout = M4_IDENTITY_TIMEOUT_SECONDS) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_IDENTITY_TIMEOUT_SECONDS);
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.revToSelf({ Request: this.m4BeaconRequest(beaconId, timeoutSeconds) }, { signal }),
     );
@@ -2431,8 +2515,9 @@ export class SliverClient {
   getSystemSession(
     sessionId: string,
     options: GetSystemOptions,
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     const config = m4ImplantConfig(options.config);
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
       try {
@@ -2451,13 +2536,15 @@ export class SliverClient {
     }).finally(config.dispose);
   }
 
-  getPrivsSession(sessionId: string, timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+  getPrivsSession(sessionId: string, timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.getPrivs({ Request: this.m4SessionRequest(sessionId, timeoutSeconds) }, { signal }),
     );
   }
 
-  getPrivsBeacon(beaconId: string, timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS) {
+  getPrivsBeacon(beaconId: string, timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.getPrivs({ Request: this.m4BeaconRequest(beaconId, timeoutSeconds) }, { signal }),
     );
@@ -2466,8 +2553,9 @@ export class SliverClient {
   backdoorSession(
     sessionId: string,
     options: BackdoorOptions,
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     assertNonEmptyString(options.filePath, "Backdoor remote file path");
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.backdoor(
@@ -2485,8 +2573,9 @@ export class SliverClient {
   hijackDllSession(
     sessionId: string,
     options: HijackDllOptions,
-    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = M4_DEFAULT_TIMEOUT_SECONDS,
   ) {
+    timeoutSeconds = operationOptions(timeoutSeconds, M4_DEFAULT_TIMEOUT_SECONDS);
     assertNonEmptyString(options.referenceDllPath, "Reference DLL path");
     assertNonEmptyString(options.targetLocation, "DLL target location");
     if (options.targetDll && options.profileName) {
@@ -2518,7 +2607,7 @@ export class SliverClient {
     });
   }
 
-  killSession(sessionId: string, force = false, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Empty> {
+  killSession(sessionId: string, force = false, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Empty> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.kill(
         { Force: force, Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -2527,7 +2616,7 @@ export class SliverClient {
     );
   }
 
-  killBeacon(beaconId: string, force = false, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Empty> {
+  killBeacon(beaconId: string, force = false, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Empty> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.kill(
         { Force: force, Request: this.beaconRequest(beaconId, timeoutSeconds) },
@@ -2539,7 +2628,7 @@ export class SliverClient {
   reconfigureBeacon(
     beaconId: string,
     options: BeaconReconfigureOptions,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ): Promise<Reconfigure> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.reconfigure(
@@ -2559,7 +2648,7 @@ export class SliverClient {
     beaconId: string,
     c2s: string[],
     delayNanoseconds = "0",
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ): Promise<OpenSession> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.openSession(
@@ -2573,7 +2662,7 @@ export class SliverClient {
     );
   }
 
-  closeSession(sessionId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Empty> {
+  closeSession(sessionId: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Empty> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.closeSession(
         { Request: this.sessionRequest(sessionId, timeoutSeconds) },
@@ -2582,39 +2671,58 @@ export class SliverClient {
     );
   }
 
-  getBeaconTasks(beaconId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<BeaconTasks> {
+  getBeaconTasks(beaconId: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<BeaconTasks> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.inventoryRpc.getBeaconTasks({ ID: beaconId }, { signal }),
     );
   }
 
-  fetchBeaconTask(taskId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<BeaconTask> {
+  /**
+   * Attach a typed handle to any queued beacon operation. The codec is a
+   * generated protobuf message (for example sliverpb.Ping), not an RPC name.
+   * Handles resolve the current channel on every fetch and survive reconnects.
+   */
+  beaconTask<T>(
+    taskId: string,
+    decoder: BeaconTaskDecoder<T>,
+    options: { readonly beaconId?: string; readonly timeoutSeconds?: number } = {},
+  ): BeaconTaskHandle<T> {
+    return createBeaconTaskHandle({
+      taskId, decoder, beaconId: options.beaconId,
+      defaultTimeoutSeconds: options.timeoutSeconds,
+      getRpc: () => this.rpcClients["task-content"],
+      events: this.taskResult$,
+      cancel: (id, operation) => this.cancelBeaconTask(id, operation),
+    });
+  }
+
+  fetchBeaconTask(taskId: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<BeaconTask> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.taskContentRpc.getBeaconTaskContent({ ID: taskId }, { signal }),
     );
   }
 
-  cancelBeaconTask(taskId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<BeaconTask> {
+  cancelBeaconTask(taskId: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<BeaconTask> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.artifactRpc.cancelBeaconTask({ ID: taskId }, { signal }),
     );
   }
 
-  getJobs(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Jobs> {
+  getJobs(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Jobs> {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.getJobs(this.empty, { signal }));
   }
 
-  killJob(jobId: number, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  killJob(jobId: number, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.killJob({ ID: jobId }, { signal }));
   }
 
-  restartJobs(jobIds: number[], timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+  restartJobs(jobIds: number[], timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
       await this.rpc.restartJobs({ JobIDs: jobIds }, { signal });
     });
   }
 
-  startMTLSListener(host: string, port: number, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  startMTLSListener(host: string, port: number, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.startMTLSListener({ Host: host, Port: port }, { signal }));
   }
 
@@ -2624,7 +2732,7 @@ export class SliverClient {
     tunIP: string,
     nPort: number,
     keyPort: number,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.startWGListener({ Host: host, Port: port, TunIP: tunIP, NPort: nPort, KeyPort: keyPort }, { signal }),
@@ -2637,7 +2745,7 @@ export class SliverClient {
     host: string,
     port: number,
     enforceOTP = false,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.startDNSListener(
@@ -2653,12 +2761,12 @@ export class SliverClient {
     port: number,
     website = "",
     enforceOTP = true,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return this.startHTTPListenerWithOptions({ domain, host, port, website, enforceOTP }, timeoutSeconds);
   }
 
-  startHTTPListenerWithOptions(options: HTTPListenerOptions, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  startHTTPListenerWithOptions(options: HTTPListenerOptions, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     const request: HTTPListenerReq = {
       Domain: options.domain ?? "",
       Host: options.host,
@@ -2686,7 +2794,7 @@ export class SliverClient {
     cert?: Buffer,
     key?: Buffer,
     enforceOTP = true,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
   ) {
     return this.startHTTPSListenerWithOptions(
       { domain, host, port, website, acme, cert, key, enforceOTP },
@@ -2694,7 +2802,7 @@ export class SliverClient {
     );
   }
 
-  startHTTPSListenerWithOptions(options: HTTPSListenerOptions, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  startHTTPSListenerWithOptions(options: HTTPSListenerOptions, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     const request: HTTPListenerReq = {
       Domain: options.domain ?? "",
       Host: options.host,
@@ -2713,126 +2821,126 @@ export class SliverClient {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.startHTTPSListener(request, { signal }));
   }
 
-  startTCPStagerListener(host: string, port: number, data: Buffer, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  startTCPStagerListener(host: string, port: number, data: Buffer, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return this.startTCPStagerListenerWithOptions({ Protocol: 0, Host: host, Port: port, Data: data, ProfileName: "" }, timeoutSeconds);
   }
 
-  startTCPStagerListenerWithOptions(request: StagerListenerReq, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  startTCPStagerListenerWithOptions(request: StagerListenerReq, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.artifactRpc.startTCPStagerListener(request, { signal }));
   }
 
-  getCompiler(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Compiler> {
+  getCompiler(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Compiler> {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.inventoryRpc.getCompiler(this.empty, { signal }));
   }
 
-  generateUniqueIP(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<UniqueWGIP> {
+  generateUniqueIP(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<UniqueWGIP> {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.generateUniqueIP(this.empty, { signal }));
   }
 
-  generateImplant(config: ImplantConfig, name = "", timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Generate> {
+  generateImplant(config: ImplantConfig, name = "", timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Generate> {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.artifactRpc.generate({ Config: config, Name: name }, { signal }));
   }
 
-  async generate(config: ImplantConfig, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  async generate(config: ImplantConfig, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     const res = await this.generateImplant(config, "", timeoutSeconds);
     return res.File;
   }
 
-  generateSpoofMetadata(req: GenerateSpoofMetadataReq, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+  generateSpoofMetadata(req: GenerateSpoofMetadataReq, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
       await this.artifactRpc.generateSpoofMetadata(req, { signal });
     });
   }
 
-  async regenerate(implantName: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  async regenerate(implantName: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     const res = await this.regenerateImplant(implantName, timeoutSeconds);
     return res.File;
   }
 
-  regenerateImplant(implantName: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Generate> {
+  regenerateImplant(implantName: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Generate> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.artifactRpc.regenerate({ ImplantName: implantName }, { signal }),
     );
   }
 
-  generateStage(request: GenerateStageReq, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Generate> {
+  generateStage(request: GenerateStageReq, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Generate> {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.artifactRpc.generateStage(request, { signal }));
   }
 
-  stageImplantBuild(buildNames: string[], timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+  stageImplantBuild(buildNames: string[], timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
       await this.rpc.stageImplantBuild({ Build: buildNames }, { signal });
     });
   }
 
-  implantBuilds(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  implantBuilds(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.inventoryRpc.implantBuilds(this.empty, { signal }));
   }
 
-  deleteImplantBuild(name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+  deleteImplantBuild(name: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
       await this.rpc.deleteImplantBuild({ Name: name }, { signal });
     });
   }
 
-  canaries(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  canaries(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.canaries(this.empty, { signal }));
   }
 
-  implantProfiles(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  implantProfiles(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.inventoryRpc.implantProfiles(this.empty, { signal }));
   }
 
-  saveImplantProfile(profile: ImplantProfile, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  saveImplantProfile(profile: ImplantProfile, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.saveImplantProfile(profile, { signal }));
   }
 
-  deleteImplantProfile(name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+  deleteImplantProfile(name: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
       await this.rpc.deleteImplantProfile({ Name: name }, { signal });
     });
   }
 
-  lootAll(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  lootAll(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
       const res = await this.inventoryRpc.lootAll(this.empty, { signal });
       return res.Loot;
     });
   }
 
-  lootAdd(loot: Loot, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  lootAdd(loot: Loot, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.artifactRpc.lootAdd(loot, { signal }));
   }
 
-  lootUpdate(loot: Loot, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  lootUpdate(loot: Loot, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.artifactRpc.lootUpdate(loot, { signal }));
   }
 
-  lootRemove(lootId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+  lootRemove(lootId: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
       await this.rpc.lootRm({ ID: lootId }, { signal });
     });
   }
 
-  lootContent(lootId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  lootContent(lootId: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.artifactRpc.lootContent({ ID: lootId }, { signal }));
   }
 
-  credentialsAll(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Credential[]> {
+  credentialsAll(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Credential[]> {
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
       const response = await this.inventoryRpc.creds(this.empty, { signal });
       return response.Credentials;
     });
   }
 
-  credentialById(credentialId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Credential> {
+  credentialById(credentialId: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Credential> {
     assertBoundedNonEmptyString(credentialId, "Credential id", CREDENTIAL_ID_MAX_CHARACTERS);
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.rpc.getCredByID({ ID: credentialId }, { signal }),
     );
   }
 
-  credentialAdd(credential: Credential, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+  credentialAdd(credential: Credential, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
     assertBoundedString(credential.Username, "Credential username", CREDENTIAL_METADATA_MAX_CHARACTERS);
     assertBoundedString(credential.Collection, "Credential collection", CREDENTIAL_METADATA_MAX_CHARACTERS);
     assertCredentialSecret(credential.Plaintext, "Credential plaintext");
@@ -2858,14 +2966,14 @@ export class SliverClient {
     });
   }
 
-  credentialRemove(credentialId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+  credentialRemove(credentialId: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
     assertBoundedNonEmptyString(credentialId, "Credential id", CREDENTIAL_ID_MAX_CHARACTERS);
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
       await this.rpc.credsRm({ Credentials: [{ ID: credentialId }] }, { signal });
     });
   }
 
-  credentialSniffHashType(hash: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Credential["HashType"]> {
+  credentialSniffHashType(hash: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Credential["HashType"]> {
     assertCredentialSecret(hash, "Credential hash");
     if (!hash) throw new Error("Credential hash must not be empty");
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
@@ -2874,36 +2982,36 @@ export class SliverClient {
     });
   }
 
-  websites(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  websites(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
       const res = await this.inventoryRpc.websites(this.empty, { signal });
       return res.Websites;
     });
   }
 
-  website(name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  website(name: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) => this.artifactRpc.website({ Name: name }, { signal }));
   }
 
-  websiteRemove(name: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+  websiteRemove(name: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
     return withTimeoutSignal(timeoutSeconds, async (signal) => {
       await this.rpc.websiteRemove({ Name: name }, { signal });
     });
   }
 
-  websiteAddContent(name: string, contents: Record<string, WebContent>, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  websiteAddContent(name: string, contents: Record<string, WebContent>, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.artifactRpc.websiteAddContent({ Name: name, Contents: contents }, { signal }),
     );
   }
 
-  websiteUpdateContent(name: string, contents: Record<string, WebContent>, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  websiteUpdateContent(name: string, contents: Record<string, WebContent>, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.artifactRpc.websiteUpdateContent({ Name: name, Contents: contents }, { signal }),
     );
   }
 
-  websiteRemoveContent(name: string, paths: string[], timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  websiteRemoveContent(name: string, paths: string[], timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.artifactRpc.websiteRemoveContent({ Name: name, Paths: paths }, { signal }),
     );
@@ -2911,22 +3019,22 @@ export class SliverClient {
 
   // --- High-level helpers (ergonomic wrappers) ---
 
-  async operators(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Operator[]> {
+  async operators(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Operator[]> {
     const res = await this.getOperators(timeoutSeconds);
     return res.Operators;
   }
 
-  async sessions(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Session[]> {
+  async sessions(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Session[]> {
     const res = await this.getSessions(timeoutSeconds);
     return res.Sessions;
   }
 
-  async beacons(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<Beacon[]> {
+  async beacons(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<Beacon[]> {
     const res = await this.getBeacons(timeoutSeconds);
     return res.Beacons;
   }
 
-  async jobs(timeoutSeconds = DEFAULT_TIMEOUT_SECONDS) {
+  async jobs(timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS) {
     const res = await this.getJobs(timeoutSeconds);
     return res.Active;
   }
@@ -2947,7 +3055,7 @@ export class SliverClient {
         sessionId: normalizedSessionId,
         options,
         operation,
-        request: (timeoutSeconds) => this.sessionRequest(normalizedSessionId, timeoutSeconds),
+        request: (timeoutSeconds: OperationTimeout) => this.sessionRequest(normalizedSessionId, timeoutSeconds),
         onClosed: (closed) => this.managedPortForwards.delete(closed),
       });
       this.managedPortForwards.add(forward);
@@ -3024,7 +3132,7 @@ export class SliverClient {
         sessionId: normalizedSessionId,
         options,
         operation,
-        request: (timeoutSeconds) => this.sessionRequest(normalizedSessionId, timeoutSeconds),
+        request: (timeoutSeconds: OperationTimeout) => this.sessionRequest(normalizedSessionId, timeoutSeconds),
         authorizeCreatedListenerCleanup: (candidate) =>
           !this.managedReversePortForwards.has(reversePortForwardKey(candidate)),
         callbacks: {
@@ -3054,7 +3162,7 @@ export class SliverClient {
       const listeners = await requestReversePortForwards(
         this.rpc,
         normalizedSessionId,
-        (timeoutSeconds) => this.sessionRequest(normalizedSessionId, timeoutSeconds),
+        (timeoutSeconds: OperationTimeout) => this.sessionRequest(normalizedSessionId, timeoutSeconds),
         operation,
       );
       return Object.freeze(listeners);
@@ -3074,7 +3182,7 @@ export class SliverClient {
         this.rpc,
         normalizedSessionId,
         listenerId,
-        (timeoutSeconds) => this.sessionRequest(normalizedSessionId, timeoutSeconds),
+        (timeoutSeconds: OperationTimeout) => this.sessionRequest(normalizedSessionId, timeoutSeconds),
         operation,
       );
       this.managedReversePortForwards.get(reversePortForwardKey({
@@ -3093,7 +3201,7 @@ export class SliverClient {
       const listeners = await requestReversePortForwards(
         this.rpc,
         forward.sessionId,
-        (timeoutSeconds) => this.sessionRequest(forward.sessionId, timeoutSeconds),
+        (timeoutSeconds: OperationTimeout) => this.sessionRequest(forward.sessionId, timeoutSeconds),
         operation,
       );
       const listener = listeners.find((candidate) => candidate.id === forward.id);
@@ -3117,12 +3225,12 @@ export class SliverClient {
         this.rpc,
         forward.sessionId,
         forward.id,
-        (timeoutSeconds) => this.sessionRequest(forward.sessionId, timeoutSeconds),
+        (timeoutSeconds: OperationTimeout) => this.sessionRequest(forward.sessionId, timeoutSeconds),
       );
     });
   }
 
-  private async reconcileManagedReversePortForwards(): Promise<void> {
+  private async reconcileManagedReversePortForwards(operation?: ForwardingOperationOptions): Promise<void> {
     const bySession = new Map<string, ManagedReversePortForward[]>();
     for (const forward of this.managedReversePortForwards.values()) {
       const forwards = bySession.get(forward.sessionId) ?? [];
@@ -3134,7 +3242,8 @@ export class SliverClient {
         const listeners = await requestReversePortForwards(
           this.rpc,
           sessionId,
-          (timeoutSeconds) => this.sessionRequest(sessionId, timeoutSeconds),
+          (timeoutSeconds: OperationTimeout) => this.sessionRequest(sessionId, timeoutSeconds),
+          operation,
         );
         const byId = new Map(listeners.map((listener) => [listener.id, listener]));
         for (const forward of forwards) forward.reconcile(byId.get(forward.id));
@@ -3152,7 +3261,17 @@ export class SliverClient {
   async startShellSession(
     sessionId: string,
     options: ShellSessionOptions,
-    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+    timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS,
+  ): Promise<ShellSessionHandle> {
+    return withTimeoutSignal(timeoutSeconds, (signal) => this.startShellSessionOperation(sessionId, options, {
+      timeoutSeconds: operationTimeoutSeconds(timeoutSeconds), signal,
+    }), (handle) => handle.close());
+  }
+
+  private async startShellSessionOperation(
+    sessionId: string,
+    options: ShellSessionOptions,
+    timeoutSeconds: OperationTimeout,
   ): Promise<ShellSessionHandle> {
     assertNonEmptyString(sessionId, "Session id");
     if (!options || typeof options !== "object") throw new Error("Shell options are required");
@@ -3180,7 +3299,7 @@ export class SliverClient {
 
     const bestEffortRemoteClose = async (): Promise<void> => {
       if (!tunnelManagerOwned || !tunnelId) return;
-      await withTimeoutSignal(timeoutSeconds, (signal) =>
+      await withTimeoutSignal(5, (signal) =>
         this.rpc.closeTunnel({ TunnelID: tunnelId, SessionID: sessionId }, { signal }),
       ).catch(() => undefined);
     };
@@ -3238,11 +3357,14 @@ export class SliverClient {
     };
 
     try {
-      const created = await withTimeoutSignal(timeoutSeconds, (signal) =>
-        this.rpc.createTunnel({ SessionID: sessionId }, { signal }),
+      // The public startup deadline settles promptly while this continuation
+      // retains ownership of a late creation result for cleanup.
+      const created = await this.rpc.createTunnel(
+        { SessionID: sessionId }, { signal: operationOptions(timeoutSeconds).signal },
       );
       tunnelId = created.TunnelID.trim();
       if (!tunnelId) throw new Error("Missing tunnel id");
+      if (created.SessionID && created.SessionID !== sessionId) throw new Error("Mismatched shell session");
 
       const output = tunnels.openOutput(tunnelId, {
         maxBufferedBytes: outputBufferBytes,
@@ -3257,13 +3379,9 @@ export class SliverClient {
       });
       tunnelManagerOwned = true;
 
-      // The zero-data bind must be pulled by TunnelData before Shell can race
-      // an early prompt back to this process.
-      await tunnels.send({
-        TunnelID: tunnelId,
-        SessionID: sessionId,
-        Data: Buffer.alloc(0),
-      });
+      // Await the server's ownership acknowledgement under the shared startup
+      // deadline before opening the shell on another HTTP/2 stream.
+      await tunnels.bind(tunnelId, sessionId, operationOptions(timeoutSeconds).signal);
 
       const shell = await withTimeoutSignal(timeoutSeconds, (signal) =>
         this.rpc.shell(
@@ -3360,11 +3478,12 @@ export class SliverClient {
         },
         close: () => closeManagedTunnel(true),
       };
-    } catch {
+    } catch (error) {
       // The Shell RPC can lose its response after the implant has already
       // spawned the child. Once a tunnel exists, mirror the canonical client
       // and attempt a bounded graceful exit before revoking the transport.
       await closeManagedTunnel(tunnelManagerOwned && Boolean(tunnelId));
+      if (error instanceof OperationAbortedError || error instanceof OperationTimeoutError) throw error;
       throw new Error("Unable to start shell session");
     }
   }
@@ -3381,7 +3500,7 @@ export class SliverClient {
     return new InteractiveBeacon(this.rpc, this.artifactRpc, this.taskContentRpc, this.taskResult$, beaconId);
   }
 
-  async rmBeacon(beaconId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
+  async rmBeacon(beaconId: string, timeoutSeconds: OperationTimeout = DEFAULT_TIMEOUT_SECONDS): Promise<void> {
     await withTimeoutSignal(timeoutSeconds, (signal) => this.rpc.rmBeacon({ ID: beaconId }, { signal }));
   }
 }
@@ -3888,9 +4007,23 @@ async function waitForBeaconTaskContent(
   taskResult$: Observable<Event>,
   taskContentRpc: SliverRPCClient,
   taskId: string,
-  timeoutSeconds: number,
+  timeoutSeconds: OperationTimeout,
 ): Promise<BeaconTask> {
-  const validatedTimeoutSeconds = validateTimeoutSeconds(timeoutSeconds);
+  return withTimeoutSignal(timeoutSeconds, (signal) => waitForBeaconTaskContentWithSignal(
+    taskResult$, taskContentRpc, taskId, operationTimeoutSeconds(timeoutSeconds), signal,
+  )).catch((error: unknown) => {
+    if (error instanceof OperationTimeoutError) throw new Error(`Timeout waiting for beacon task result: ${taskId}`);
+    throw error;
+  });
+}
+
+async function waitForBeaconTaskContentWithSignal(
+  taskResult$: Observable<Event>,
+  taskContentRpc: SliverRPCClient,
+  taskId: string,
+  validatedTimeoutSeconds: number,
+  signal: AbortSignal,
+): Promise<BeaconTask> {
   return new Promise<BeaconTask>((resolve, reject) => {
     let settled = false;
     let unsubscribePending = false;
@@ -3908,6 +4041,7 @@ async function waitForBeaconTaskContent(
     const finish = (settle: () => void) => {
       if (settled) return;
       settled = true;
+      signal.removeEventListener("abort", onAbort);
       if (deadlineTimer !== undefined) clearTimeout(deadlineTimer);
       if (pollTimer !== undefined) clearInterval(pollTimer);
       controller.abort();
@@ -3918,6 +4052,13 @@ async function waitForBeaconTaskContent(
       }
       settle();
     };
+
+    const onAbort = () => finish(() => reject(signal.reason));
+    signal.addEventListener("abort", onAbort, { once: true });
+    if (signal.aborted) {
+      onAbort();
+      return;
+    }
 
     const refresh = async () => {
       if (settled || refreshing) return;

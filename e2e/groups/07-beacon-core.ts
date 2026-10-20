@@ -79,14 +79,22 @@ export async function run(context: E2ESuiteContext): Promise<void> {
   }
 
   const interactiveNonce = nonce + 7;
-  const interactivePing = await context.runBeaconTask(
-    beacon.ID,
-    () => context.client.interactBeacon(beacon.ID).ping(interactiveNonce, rpcTimeoutSeconds),
-    sliverScript.sliverpb.Ping.decode,
-    "interactive beacon ping",
-  );
-  assert.equal(interactivePing.response.Nonce, interactiveNonce, "interactive beacon ping nonce");
-  assert.equal(interactivePing.response.Response?.Err ?? "", "", "interactive beacon ping response error");
+  const interactivePing = await context.client.interactBeacon(beacon.ID).ping(interactiveNonce, rpcTimeoutSeconds);
+  const interactiveMetadata = requireQueuedResponse(interactivePing.Response, beacon.ID, "interactive beacon ping");
+  const interactiveHandle = context.client.beaconTask(interactiveMetadata.TaskID, sliverScript.sliverpb.Ping, {
+    beaconId: beacon.ID,
+  });
+  const interactiveResult = await interactiveHandle.wait({ timeoutSeconds: 120 });
+  assert.equal(interactiveResult.Nonce, interactiveNonce, "interactive beacon ping nonce");
+  assert.equal(interactiveResult.Response?.Err ?? "", "", "interactive beacon ping response error");
+  const interactiveStatus = await interactiveHandle.status(rpcTimeoutSeconds);
+  assert.equal(interactiveStatus.ID, interactiveMetadata.TaskID, "interactive handle task ID");
+  assert.equal(interactiveStatus.BeaconID, beacon.ID, "interactive handle beacon ID");
+  assert.equal(interactiveStatus.State, "completed", "interactive handle completed state");
+  const reattachedResult = await context.client.beaconTask(
+    interactiveMetadata.TaskID, sliverScript.sliverpb.Ping, { beaconId: beacon.ID },
+  ).wait(rpcTimeoutSeconds);
+  assert.equal(reattachedResult.Nonce, interactiveNonce, "reattached completed beacon task result");
 
   const reconfigured = await context.runBeaconTask(
     beacon.ID,
@@ -113,7 +121,13 @@ export async function run(context: E2ESuiteContext): Promise<void> {
   // task remains deterministically pending on the loopback fixture.
   const canceledQueue = await context.client.pingBeacon(beacon.ID, nonce + 1, rpcTimeoutSeconds);
   const canceledMetadata = requireQueuedResponse(canceledQueue.Response, beacon.ID, "canceled beacon ping");
-  const canceled = await context.client.cancelBeaconTask(canceledMetadata.TaskID, rpcTimeoutSeconds);
+  const canceledHandle = context.client.beaconTask(canceledMetadata.TaskID, sliverScript.sliverpb.Ping, {
+    beaconId: beacon.ID,
+  });
+  const localWaitAbort = new AbortController();
+  localWaitAbort.abort();
+  await assert.rejects(canceledHandle.wait({ signal: localWaitAbort.signal }), sliverScript.OperationAbortedError);
+  const canceled = await canceledHandle.cancel(rpcTimeoutSeconds);
   assert.equal(canceled.ID, canceledMetadata.TaskID, "canceled beacon task ID");
   assert.equal(canceled.BeaconID, beacon.ID, "canceled beacon ID");
   assert.equal(canceled.State, "canceled", "canceled beacon task state");
@@ -128,7 +142,7 @@ export async function run(context: E2ESuiteContext): Promise<void> {
 
   const history: clientpb.BeaconTasks = await context.client.getBeaconTasks(beacon.ID, rpcTimeoutSeconds);
   assertTaskSummary(history, pingTaskId, "completed");
-  assertTaskSummary(history, interactivePing.task.ID, "completed");
+  assertTaskSummary(history, interactiveMetadata.TaskID, "completed");
   assertTaskSummary(history, reconfigured.task.ID, "completed");
   assertTaskSummary(history, canceled.ID, "canceled");
 
