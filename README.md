@@ -29,6 +29,45 @@ same path on Linux/amd64, Windows/amd64, and macOS/arm64. See
 
 Operator connections use direct mTLS. Configurations containing a WireGuard operator profile are rejected before credentials or channels are created. WireGuard listener and implant C2 APIs remain available.
 
+### Cancellation and deadlines
+
+Existing numeric timeout arguments remain supported. Convenience RPCs, `connect`,
+and shell startup also accept `{ timeoutSeconds, signal }` in the same argument
+position. Omitting `timeoutSeconds` preserves the method's default; zero disables
+the local deadline while still allowing cancellation. `OperationAbortedError`
+and `OperationTimeoutError` distinguish caller cancellation from deadline expiry.
+Shell startup shares one deadline across tunnel creation, the server's bind
+acknowledgement, and shell creation. Cancellation stops waiting and requests
+transport cancellation; it does not undo a remote operation already accepted.
+
+```typescript
+const controller = new AbortController()
+const sessions = await client.getSessions({ timeoutSeconds: 15, signal: controller.signal })
+```
+
+### Typed beacon tasks
+
+Existing beacon commands keep their queued-response return values. Attach a
+typed handle using the task ID and the generated response codec:
+
+```typescript
+import { sliverpb } from "sliver-script"
+
+const queued = await client.pingBeacon(beaconId, 42)
+const task = client.beaconTask(queued.Response!.TaskID, sliverpb.Ping, { beaconId })
+const result = await task.wait({ timeoutSeconds: 120, signal: controller.signal })
+console.log(result.Nonce)
+const metadata = await task.status()
+```
+
+`wait()` uses events and polling, checks task identity and target errors, and
+supports repeated waits or attachment to a persisted ID. A handle created through
+`SliverClient.beaconTask` resolves the current channel after reconnect. Canceling
+a wait leaves the remote task queued; `task.cancel()` explicitly requests server
+cancellation. `InteractiveBeacon.beaconTask` binds the expected beacon ID, and
+the existing `lsTask()` handle also exposes `status()` and `cancel()`. Decoded task
+responses retain the existing 64 KiB limit.
+
 ### Stateful forwarding
 
 The client provides stateful TCP port-forward, reverse-port-forward, and SOCKS5
@@ -68,6 +107,12 @@ idempotent `close()`. Use `listPortForwards()` / `stopPortForward(id)` and
 inventory, including safe cleanup of legacy listeners whose target metadata is
 not trusted. Sliver's generic forwarding protocol currently supports TCP; the
 application traffic carried over it can be HTTP, RDP, or any other TCP protocol.
+`tunnelStreamState$` reports `idle`, `connecting`, `connected`, `failed`, and
+`stopped`, with a stream generation number. After a tunnel transport failure,
+existing tunnels fail and a new tunnel starts a fresh stream lazily. Old data is
+never replayed. `isConnected` continues to describe the control connection.
+Tunnel identities are retained to reject stale handles, bounded to 65,536 IDs
+per connection; reaching that limit requires disconnecting and reconnecting.
 These tunnels use full-close TCP semantics: a local FIN retires both directions,
 so protocols that send a delayed response only after the client half-closes are
 not supported. A SOCKS connection's `open` event means its Sliver lifecycle

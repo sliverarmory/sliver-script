@@ -1,4 +1,4 @@
-import { Subject, type Observable } from "rxjs";
+import { BehaviorSubject, Subject, type Observable } from "rxjs";
 
 import { TUNNEL_STREAM_MAX_PAYLOAD_BYTES } from "../messageBudget";
 import type { SliverRPCClient, DeepPartial } from "../pb/rpcpb/services";
@@ -11,6 +11,8 @@ export const TUNNEL_MANAGER_MAX_BUFFERED_OUTPUT_FRAMES = 1_024;
 export const TUNNEL_MANAGER_MAX_QUEUED_FRAMES_PER_TUNNEL = 8;
 export const TUNNEL_MANAGER_MAX_QUEUED_BYTES_PER_TUNNEL = 256 * 1024;
 export const TUNNEL_MANAGER_MAX_TOTAL_QUEUED_BYTES = 4 * 1024 * 1024;
+/** Bounds retired identities retained to reject stale handles; reconnect resets this budget. */
+export const TUNNEL_MANAGER_MAX_LIFETIME_TUNNELS = 65_536;
 
 const SAFE_TUNNEL_CLOSED_ERROR = "Tunnel is closed";
 const SAFE_TUNNEL_OVERFLOW_ERROR = "Tunnel output exceeded its bounded buffer";
@@ -28,8 +30,22 @@ export interface TunnelManagerStats {
   readonly queuedBytes: number;
 }
 
+export interface TunnelTransportState {
+  readonly status: "stopped" | "idle" | "connecting" | "connected" | "failed";
+  readonly generation: number;
+}
+
+interface TunnelTransportGeneration {
+  readonly id: number;
+  readonly outgoing: FairTunnelSendQueue;
+  readonly abort: AbortController;
+  running: Promise<void> | null;
+  failed: boolean;
+}
+
 interface TunnelState {
   readonly subject: Subject<TunnelData>;
+  readonly generation: TunnelTransportGeneration;
   output?: AsyncQueue<Uint8Array>;
   onClosed?: () => void;
   onFailure?: (reason: "cancelled" | "overflow" | "transport") => void;
@@ -256,56 +272,99 @@ class FairTunnelSendQueue implements AsyncIterable<DeepPartial<TunnelData>> {
 }
 
 export class TunnelManager {
-  private readonly outgoing = new FairTunnelSendQueue();
   private readonly byTunnelId = new Map<string, TunnelState>();
-  private readonly abort = new AbortController();
+  private readonly issuedTunnelIds = new Set<string>();
   private readonly transportFailureListeners = new Set<() => void>();
+  private readonly transportStateSubject = new BehaviorSubject<TunnelTransportState>(
+    Object.freeze({ status: "stopped", generation: 0 }),
+  );
+  readonly transportState$ = this.transportStateSubject.asObservable();
 
   private rpc: SliverRPCClient | null = null;
-  private running: Promise<void> | null = null;
-  private transportFailed = false;
+  private generation: TunnelTransportGeneration | null = null;
+  private stopped = false;
+
+  get transportState(): TunnelTransportState {
+    return this.transportStateSubject.value;
+  }
 
   start(rpc: SliverRPCClient): void {
+    if (this.stopped) throw new Error("Tunnel manager is stopped");
     if (this.rpc) return;
     this.rpc = rpc;
+    this.publishTransportState("idle", 0);
   }
 
-  private ensureRunning(): void {
-    if (this.running) return;
+  private ensureRunning(): TunnelTransportGeneration {
     const rpc = this.rpc;
-    if (!rpc) throw new Error("Tunnel manager is not connected");
+    if (this.stopped || !rpc) throw new Error("Tunnel manager is not connected");
+    if (this.generation && !this.generation.failed) return this.generation;
 
-    this.running = (async () => {
+    // Recovery is driven only by a newly-created tunnel. Failed tunnels and
+    // their queued frames are never replayed onto the replacement stream.
+    const generation: TunnelTransportGeneration = {
+      id: (this.generation?.id ?? 0) + 1,
+      outgoing: new FairTunnelSendQueue(),
+      abort: new AbortController(),
+      running: null,
+      failed: false,
+    };
+    this.generation = generation;
+    this.publishTransportState("connecting", generation.id);
+    if (this.stopped) throw new Error("Tunnel manager is not connected");
+
+    generation.running = (async () => {
       try {
-        const stream = rpc.tunnelData(this.outgoing, { signal: this.abort.signal });
-        for await (const msg of stream) this.receive(msg);
-        if (!this.abort.signal.aborted) throw new Error(SAFE_TUNNEL_TRANSPORT_ERROR);
+        const stream = rpc.tunnelData(generation.outgoing, { signal: generation.abort.signal });
+        for await (const msg of stream) this.receive(msg, generation);
+        if (!generation.abort.signal.aborted) throw new Error(SAFE_TUNNEL_TRANSPORT_ERROR);
       } catch {
-        if (!this.abort.signal.aborted) {
-          this.transportFailed = true;
-          this.outgoing.fail();
-          for (const tunnelId of [...this.byTunnelId.keys()]) {
-            this.failTunnel(tunnelId, "transport");
-          }
-          for (const listener of [...this.transportFailureListeners]) invokeClosed(listener);
-        }
+        // A transport implementation may throw before returning its iterable.
+        // Finish registering the initiating output before publishing failure.
+        await Promise.resolve();
+        this.failGeneration(generation);
       }
     })();
+    return generation;
   }
 
-  /** Registers a listener for an unexpected terminal TunnelData failure. */
-  onTransportFailure(listener: () => void): () => void {
-    if (this.transportFailed) {
+  /**
+   * Registers for the current stream's terminal failure. A new listener owner
+   * may opt into the next generation when the preceding stream already failed.
+   * Listeners are retired with their generation and never called again.
+   */
+  onTransportFailure(listener: () => void, options?: { readonly nextGeneration?: boolean }): () => void {
+    if (this.stopped || (this.generation?.failed && !options?.nextGeneration)) {
       invokeClosed(listener);
       return () => undefined;
     }
-    this.transportFailureListeners.add(listener);
-    return () => this.transportFailureListeners.delete(listener);
+    const registration = () => listener();
+    this.transportFailureListeners.add(registration);
+    return () => this.transportFailureListeners.delete(registration);
+  }
+
+  private publishTransportState(status: TunnelTransportState["status"], generation: number): void {
+    this.transportStateSubject.next(Object.freeze({ status, generation }));
+  }
+
+  private failGeneration(generation: TunnelTransportGeneration): void {
+    if (this.stopped || this.generation !== generation || generation.failed) return;
+    generation.failed = true;
+    const failedTunnels = [...this.byTunnelId.entries()].filter(([, state]) => state.generation === generation);
+    const listeners = [...this.transportFailureListeners];
+    this.transportFailureListeners.clear();
+    // Revoke every old identity before callbacks can create a new generation.
+    for (const [id] of failedTunnels) this.byTunnelId.delete(id);
+    generation.outgoing.fail();
+    generation.abort.abort();
+    this.publishTransportState("failed", generation.id);
+    for (const [, state] of failedTunnels) this.failTunnelState(state, "transport");
+    for (const listener of listeners) invokeClosed(listener);
   }
 
   /** Legacy RxJS compatibility. New main-process callers use openOutput(). */
-  subscribe(tunnelId: string): Observable<TunnelData> {
-    return this.ensureTunnel(tunnelId).subject.asObservable();
+  subscribe(tunnelId: string, options?: { readonly exclusive?: boolean }): Observable<TunnelData> {
+    return this.ensureTunnel(tunnelId, options?.exclusive ?? false).subject.asObservable();
   }
 
   openOutput(tunnelId: string, options: TunnelOutputOptions): AsyncIterable<Uint8Array> {
@@ -328,6 +387,7 @@ export class TunnelManager {
       overflowError: () => new Error(SAFE_TUNNEL_OVERFLOW_ERROR),
       dispose: clearBytes,
       onConsumerCancel: () => {
+        if (this.byTunnelId.get(tunnelId.trim()) !== state) return;
         this.cancelTunnel(tunnelId);
         invokeFailure(options.onFailure, "cancelled");
       },
@@ -336,7 +396,9 @@ export class TunnelManager {
   }
 
   send(msg: DeepPartial<TunnelData>): Promise<void> {
-    return this.outgoing.enqueue(msg);
+    const state = this.byTunnelId.get(msg.TunnelID?.trim() ?? "");
+    if (!state || this.stopped) return Promise.reject(new Error(SAFE_TUNNEL_CLOSED_ERROR));
+    return state.generation.outgoing.enqueue(msg);
   }
 
   /**
@@ -382,10 +444,11 @@ export class TunnelManager {
   }
 
   cancelTunnel(tunnelId: string): void {
-    const state = this.byTunnelId.get(tunnelId);
+    const normalized = tunnelId.trim();
+    const state = this.byTunnelId.get(normalized);
     if (!state) return;
-    this.byTunnelId.delete(tunnelId);
-    this.outgoing.unregister(tunnelId);
+    this.byTunnelId.delete(normalized);
+    state.generation.outgoing.unregister(normalized);
     if (state.bind) settleTunnelBind(state.bind, "reject", new Error(SAFE_TUNNEL_CLOSED_ERROR));
     state.output?.cancel();
     state.subject.complete();
@@ -394,41 +457,64 @@ export class TunnelManager {
   stats(): TunnelManagerStats {
     return {
       activeTunnels: this.byTunnelId.size,
-      ...this.outgoing.stats(),
+      ...(this.generation?.outgoing.stats() ?? { queuedFrames: 0, queuedBytes: 0 }),
     };
   }
 
   async stop(): Promise<void> {
-    this.abort.abort();
-    this.outgoing.close();
-    if (this.running) await this.running;
-    this.running = null;
+    if (this.stopped) {
+      if (this.generation?.running) await this.generation.running;
+      return;
+    }
+    this.stopped = true;
     this.rpc = null;
-    for (const tunnelId of [...this.byTunnelId.keys()]) this.failTunnel(tunnelId, "transport");
+    const generation = this.generation;
     this.transportFailureListeners.clear();
+    generation?.abort.abort();
+    generation?.outgoing.close();
+    this.publishTransportState("stopped", generation?.id ?? 0);
+    for (const tunnelId of [...this.byTunnelId.keys()]) this.failTunnel(tunnelId, "transport");
+    if (generation?.running) await generation.running;
   }
 
   private ensureTunnel(tunnelId: string, exclusive = false): TunnelState {
     const normalized = tunnelId.trim();
     if (!normalized) throw new Error("Tunnel id is required");
 
-    // Establish TunnelData only when a caller actually registers a tunnel;
-    // regular control and artifact RPCs do not need a long-lived stream.
-    this.ensureRunning();
-
     let state = this.byTunnelId.get(normalized);
     if (state) {
       if (exclusive) throw new Error("Tunnel output is already registered");
       return state;
     }
+    if (this.stopped || !this.rpc) throw new Error("Tunnel manager is not connected");
+    if (this.issuedTunnelIds.has(normalized)) throw new Error("Tunnel identity has already been retired");
+    if (this.issuedTunnelIds.size >= TUNNEL_MANAGER_MAX_LIFETIME_TUNNELS) {
+      throw new Error("Tunnel identity capacity is exhausted; reconnect the client");
+    }
     if (this.byTunnelId.size >= TUNNEL_MANAGER_MAX_ACTIVE_TUNNELS) {
       throw new Error("Tunnel capacity is exhausted");
     }
 
-    state = { subject: new Subject<TunnelData>() };
+    // Establish TunnelData only for a new identity; stale handles cannot
+    // restart a stream or gain authority over a replacement tunnel.
+    const generation = this.ensureRunning();
+    // State observers run synchronously and may have registered a tunnel while
+    // handling the new generation's connecting notification.
+    state = this.byTunnelId.get(normalized);
+    if (state) {
+      if (exclusive) throw new Error("Tunnel output is already registered");
+      return state;
+    }
+    if (this.issuedTunnelIds.has(normalized)) throw new Error("Tunnel identity has already been retired");
+    if (this.issuedTunnelIds.size >= TUNNEL_MANAGER_MAX_LIFETIME_TUNNELS) {
+      throw new Error("Tunnel identity capacity is exhausted; reconnect the client");
+    }
+    if (this.byTunnelId.size >= TUNNEL_MANAGER_MAX_ACTIVE_TUNNELS) throw new Error("Tunnel capacity is exhausted");
+    state = { subject: new Subject<TunnelData>(), generation };
     this.byTunnelId.set(normalized, state);
     try {
-      this.outgoing.register(normalized);
+      generation.outgoing.register(normalized);
+      this.issuedTunnelIds.add(normalized);
     } catch (error) {
       this.byTunnelId.delete(normalized);
       throw error;
@@ -436,10 +522,17 @@ export class TunnelManager {
     return state;
   }
 
-  private receive(msg: TunnelData): void {
+  private receive(msg: TunnelData, generation: TunnelTransportGeneration): void {
+    if (this.stopped || this.generation !== generation || generation.failed) {
+      msg.Data.fill(0);
+      return;
+    }
     const tunnelId = msg.TunnelID;
     const state = this.byTunnelId.get(tunnelId);
-    if (!state) return;
+    if (!state || state.generation !== generation) {
+      msg.Data.fill(0);
+      return;
+    }
 
     // Once bind() establishes an owner, TunnelID alone is no longer a valid
     // routing capability. Ignore foreign-session frames before overflow,
@@ -457,6 +550,15 @@ export class TunnelManager {
       return;
     }
 
+    if (this.transportState.status === "connecting") {
+      this.publishTransportState("connected", generation.id);
+      // Observers may synchronously disconnect while handling readiness.
+      if (this.stopped || this.byTunnelId.get(tunnelId) !== state) {
+        msg.Data.fill(0);
+        return;
+      }
+    }
+
     if (state.bind && msg.SessionID === state.bind.sessionId && msg.Data.length === 0 && !msg.Closed) {
       settleTunnelBind(state.bind, "resolve");
     }
@@ -472,7 +574,7 @@ export class TunnelManager {
 
     if (msg.Closed) {
       this.byTunnelId.delete(tunnelId);
-      this.outgoing.unregister(tunnelId);
+      generation.outgoing.unregister(tunnelId);
       if (state.bind) settleTunnelBind(state.bind, "reject", new Error(SAFE_TUNNEL_CLOSED_ERROR));
       state.output?.close();
       state.subject.complete();
@@ -485,7 +587,12 @@ export class TunnelManager {
     if (!state) return;
     this.byTunnelId.delete(tunnelId);
     const error = new Error(reason === "overflow" ? SAFE_TUNNEL_OVERFLOW_ERROR : SAFE_TUNNEL_TRANSPORT_ERROR);
-    this.outgoing.unregister(tunnelId, error);
+    state.generation.outgoing.unregister(tunnelId, error);
+    this.failTunnelState(state, reason);
+  }
+
+  private failTunnelState(state: TunnelState, reason: "overflow" | "transport"): void {
+    const error = new Error(reason === "overflow" ? SAFE_TUNNEL_OVERFLOW_ERROR : SAFE_TUNNEL_TRANSPORT_ERROR);
     if (state.bind) settleTunnelBind(state.bind, "reject", error);
     state.output?.fail(error);
     state.subject.error(error);

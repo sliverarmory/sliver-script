@@ -1,7 +1,15 @@
 export * from './client';
 export * from './config';
 export * from './forwarding';
-export { timeoutSecondsToNanoseconds, withTimeoutSignal } from "./internal/timeout";
+export {
+  timeoutSecondsToNanoseconds, withTimeoutSignal, OperationAbortedError, OperationTimeoutError,
+  type OperationOptions, type OperationTimeout,
+} from "./internal/timeout";
+export {
+  type BeaconTaskHandle, type BeaconTaskDecoder,
+  BeaconTaskStateError, BeaconTaskResponseError, BeaconTaskIdentityError, BeaconTaskTimeoutError,
+} from "./beaconTasks";
+export type { TunnelTransportState } from "./internal/tunnelManager";
 export * from './messageBudget';
 export * as commonpb from "./pb/commonpb/common";
 export * as clientpb from "./pb/clientpb/client";

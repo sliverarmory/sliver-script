@@ -19,6 +19,7 @@ keeping each area of client behavior independently identifiable in diagnostics.
 | `04-session-core` | Session inventory, direct and interactive ping, rename/restore, and environment read/set/unset |
 | `05-session-filesystem` | Working-directory changes, directory listing and globbing, upload/download ranges, recursive archives and grep, copy/move/timestamps/removal, and Unix permission/ownership calls |
 | `06-session-process-network` | Interfaces, live TCP/UDP socket inventory, mounts, basic/full process inventory, synchronous/background execution, child tracking and termination, Linux memfiles, and Windows token/privilege/service reads plus isolated HKCU registry CRUD |
+| `06-session-shell` | Native managed shell output and ordered writes, Unix PTY sizing and resize, Windows piped-shell resize rejection, natural exit, disconnect teardown, owned-child cleanup, and client reconnect |
 | `07-beacon-core` | Beacon metadata and rename, direct and interactive queued pings, derived task-result events, 10-second reconfiguration, task cancellation, fetch, and history/count reconciliation |
 | `08-beacon-filesystem` | Queued working-directory, mkdir, cd, upload/download, list, and recursive removal calls with completed-task verification |
 | `09-beacon-process-network` | Queued process, interface, socket, and environment calls plus synchronous/background execution, child tracking, termination, and task-history verification |
@@ -97,9 +98,11 @@ so diagnostic logs do not inherit unrelated CI secrets. Generated binary bytes
 are cleared after being written, and failure cleanup removes profiles, builds,
 listeners, sessions, beacons, processes, and the temporary root.
 
-The suite does not run interactive shell tunnels, screenshots, process dumps,
-service mutation, token mutation, registry-hive export, injection, or arbitrary
-payload execution. Forwarding coverage uses deterministic, bounded loopback TCP
+The suite does not run screenshots, process dumps, service mutation, token
+mutation, registry-hive export, injection, or arbitrary payload execution.
+Interactive shell coverage uses bounded native fixture commands and verifies
+cleanup of only the shell children it created. Forwarding coverage uses
+deterministic, bounded loopback TCP
 fixtures only. In particular, hosted CI does not install an RDP client, use RDP
 credentials, or connect to port 3389; RDP interoperability is validated in the
 separate Proxmox/GOAD range.
