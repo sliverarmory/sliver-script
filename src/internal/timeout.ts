@@ -10,7 +10,7 @@ const MAX_TIMEOUT_SECONDS = Math.min(MAX_TIMER_TIMEOUT_SECONDS, MAX_PROTOBUF_TIM
 
 /** A local operation deadline and optional caller cancellation signal. */
 export interface OperationOptions {
-  /** Defaults to 30 seconds. Zero disables the local deadline. */
+  /** Defaults to the called method's timeout. Zero disables the local deadline. */
   timeoutSeconds?: number;
   /** Cancel this operation without disconnecting unrelated operations. */
   signal?: AbortSignal;

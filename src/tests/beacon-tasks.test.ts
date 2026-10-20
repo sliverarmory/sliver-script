@@ -8,7 +8,7 @@ import {
   createBeaconTaskHandle,
   type BeaconTaskHandleDependencies,
 } from "../beaconTasks";
-import { OperationAbortedError } from "../internal/timeout";
+import { OperationAbortedError, OperationTimeoutError } from "../internal/timeout";
 import { BEACON_TASK_MAX_PAYLOAD_BYTES } from "../messageBudget";
 import { BeaconTask, Event } from "../pb/clientpb/client";
 import { Ping } from "../pb/sliverpb/sliver";
@@ -277,11 +277,11 @@ test("permanent RPC errors fail immediately without leaking a polling timer", as
   expect(jest.getTimerCount()).toBe(0);
 });
 
-test("status fetches metadata and explicit cancel calls only the server cancellation callback", async () => {
+test("status and explicit cancellation verify the bound task metadata", async () => {
   const { handle, rpc, cancel } = setup();
   await expect(handle.status(4)).resolves.toMatchObject({ ID: taskId, State: "completed" });
   await expect(handle.cancel({ timeoutSeconds: 7 })).resolves.toMatchObject({ ID: taskId, State: "canceled" });
-  expect(rpc.getBeaconTaskContent).toHaveBeenCalledTimes(1);
+  expect(rpc.getBeaconTaskContent).toHaveBeenCalledTimes(2);
   expect(cancel).toHaveBeenCalledWith(taskId, { timeoutSeconds: 7, signal: expect.any(AbortSignal) });
 });
 
@@ -293,13 +293,84 @@ test("pre-aborted cancellation does not dispatch a remote cancellation", async (
   expect(cancel).not.toHaveBeenCalled();
 });
 
-test("status fails clearly while disconnected and cancel verifies returned identity", async () => {
-  const { handle } = setup({
-    getRpc: () => undefined,
-    cancel: async () => task({ ID: "wrong-id" }),
-  });
+test("disconnected status and bound cancellation fail without a remote mutation", async () => {
+  const { handle, cancel } = setup({ getRpc: () => undefined });
   await expect(handle.status()).rejects.toThrow("SliverClient is not connected");
+  await expect(handle.cancel()).rejects.toThrow("SliverClient is not connected");
+  expect(cancel).not.toHaveBeenCalled();
+});
+
+test("cancel still verifies the returned mutation response", async () => {
+  const { handle } = setup({ cancel: async () => task({ ID: "wrong-id" }) });
   await expect(handle.cancel()).rejects.toBeInstanceOf(BeaconTaskIdentityError);
+});
+
+test.each([{ ID: "other-task" }, { BeaconID: "other-beacon" }])(
+  "mismatched task metadata %j prevents remote cancellation",
+  async (fields) => {
+    const { handle, rpc, cancel } = setup();
+    rpc.getBeaconTaskContent.mockResolvedValue(task(fields));
+    await expect(handle.cancel()).rejects.toBeInstanceOf(BeaconTaskIdentityError);
+    expect(cancel).not.toHaveBeenCalled();
+  },
+);
+
+test("cancellation identity lookup uses the current RPC client", async () => {
+  const old = { getBeaconTaskContent: jest.fn(async () => task({ BeaconID: "stale-beacon" })) };
+  const replacement = { getBeaconTaskContent: jest.fn(async () => task()) };
+  let current = old;
+  const { handle, cancel } = setup({ getRpc: () => current });
+  current = replacement;
+  await expect(handle.cancel()).resolves.toMatchObject({ State: "canceled" });
+  expect(old.getBeaconTaskContent).not.toHaveBeenCalled();
+  expect(replacement.getBeaconTaskContent).toHaveBeenCalledTimes(1);
+  expect(cancel).toHaveBeenCalledTimes(1);
+});
+
+test("identity lookup and cancellation share one whole-operation deadline", async () => {
+  jest.useFakeTimers();
+  let lookupSignal: AbortSignal | undefined;
+  let mutationSignal: AbortSignal | undefined;
+  const cancel = jest.fn((_id: string, options: unknown) => {
+    mutationSignal = (options as { signal: AbortSignal }).signal;
+    return new Promise<BeaconTask>(() => undefined);
+  });
+  const { handle, rpc } = setup({ cancel });
+  rpc.getBeaconTaskContent.mockImplementation((_request, options) => {
+    lookupSignal = options?.signal;
+    return new Promise((resolve) => setTimeout(() => resolve(task()), 700));
+  });
+  const canceling = handle.cancel(1);
+  const rejected = expect(canceling).rejects.toBeInstanceOf(OperationTimeoutError);
+  await jest.advanceTimersByTimeAsync(700);
+  expect(cancel).toHaveBeenCalledTimes(1);
+  expect(mutationSignal).toBe(lookupSignal);
+  expect(mutationSignal?.aborted).toBe(false);
+  await jest.advanceTimersByTimeAsync(300);
+  await rejected;
+  expect(mutationSignal?.aborted).toBe(true);
+  expect(jest.getTimerCount()).toBe(0);
+});
+
+test("a late identity lookup cannot dispatch cancellation after the caller aborts", async () => {
+  let resolveLookup!: (value: BeaconTask) => void;
+  const { handle, rpc, cancel } = setup();
+  rpc.getBeaconTaskContent.mockImplementation(() => new Promise((resolve) => { resolveLookup = resolve; }));
+  const controller = new AbortController();
+  const canceling = handle.cancel({ signal: controller.signal });
+  const rejected = expect(canceling).rejects.toBeInstanceOf(OperationAbortedError);
+  controller.abort();
+  await rejected;
+  resolveLookup(task());
+  await flush();
+  expect(cancel).not.toHaveBeenCalled();
+});
+
+test("an unbound handle can cancel without fetching task content", async () => {
+  const { handle, rpc, cancel } = setup({ beaconId: undefined });
+  await expect(handle.cancel()).resolves.toMatchObject({ State: "canceled" });
+  expect(rpc.getBeaconTaskContent).not.toHaveBeenCalled();
+  expect(cancel).toHaveBeenCalledTimes(1);
 });
 
 test.each(["", " ", " task", "task ", "x".repeat(257)])("rejects invalid task id %j before using RPCs", (id) => {

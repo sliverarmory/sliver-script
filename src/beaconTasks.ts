@@ -221,9 +221,14 @@ export function createBeaconTaskHandle<T>(dependencies: BeaconTaskHandleDependen
     status: (options?: OperationTimeout) => withTimeoutSignal(optionsFor(options), fetch),
     cancel: async (options?: OperationTimeout) => {
       const normalized = optionsFor(options);
-      return withTimeoutSignal(normalized, async (signal) => validateIdentity(
-        await dependencies.cancel(taskId, { ...normalized, signal }),
-      ));
+      return withTimeoutSignal(normalized, async (signal) => {
+        // Verify the beacon binding before a remote mutation, under the same
+        // deadline that covers cancellation. Checking only its response would
+        // detect a mismatched beacon after that beacon's task was canceled.
+        if (beaconId !== undefined) await fetch(signal);
+        signal.throwIfAborted();
+        return validateIdentity(await dependencies.cancel(taskId, { ...normalized, signal }));
+      });
     },
   });
 }

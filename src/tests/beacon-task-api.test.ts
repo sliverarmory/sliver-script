@@ -60,24 +60,29 @@ test("SliverClient handle cancellation uses only the artifact channel", async ()
   const controlCancel = jest.fn();
   const contentCancel = jest.fn();
   const artifactCancel = jest.fn(async () => metadata({ State: "canceled", Response: Buffer.alloc(0) }));
+  const getBeaconTaskContent = jest.fn(async () => metadata());
   const { client } = clientWithRpc({
     control: { cancelBeaconTask: controlCancel },
-    "task-content": { cancelBeaconTask: contentCancel },
+    "task-content": { cancelBeaconTask: contentCancel, getBeaconTaskContent },
     artifact: { cancelBeaconTask: artifactCancel },
   });
   await expect(client.beaconTask(taskId, sliverpb.Ping, { beaconId }).cancel(4))
     .resolves.toMatchObject({ ID: taskId, State: "canceled" });
   expect(artifactCancel).toHaveBeenCalledWith({ ID: taskId }, { signal: expect.any(AbortSignal) });
+  expect(getBeaconTaskContent).toHaveBeenCalledTimes(1);
   expect(controlCancel).not.toHaveBeenCalled();
   expect(contentCancel).not.toHaveBeenCalled();
 });
 
 test("InteractiveBeacon binds handles to its own beacon identity", async () => {
   const getBeaconTaskContent = jest.fn(async () => metadata({ BeaconID: "different-beacon" }));
-  const { client } = clientWithRpc({ control: {}, artifact: {}, "task-content": { getBeaconTaskContent } });
+  const cancelBeaconTask = jest.fn();
+  const { client } = clientWithRpc({ control: {}, artifact: { cancelBeaconTask }, "task-content": { getBeaconTaskContent } });
   const handle = client.interactBeacon(beaconId).beaconTask(taskId, sliverpb.Ping);
   await expect(handle.wait(2)).rejects.toBeInstanceOf(BeaconTaskIdentityError);
   await expect(handle.status(2)).rejects.toBeInstanceOf(BeaconTaskIdentityError);
+  await expect(handle.cancel(2)).rejects.toBeInstanceOf(BeaconTaskIdentityError);
+  expect(cancelBeaconTask).not.toHaveBeenCalled();
 });
 
 test("legacy numeric lsTask calls retain wait and gain status and cancellation", async () => {
