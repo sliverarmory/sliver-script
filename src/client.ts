@@ -63,12 +63,13 @@ import type {
 import type { Empty, Request as CommonRequest } from "./pb/commonpb/common";
 import { SliverRPCDefinition } from "./pb/rpcpb/services";
 import type { SliverRPCClient } from "./pb/rpcpb/services";
-import { Download, Ls, RegistryType } from "./pb/sliverpb/sliver";
+import { Download, Envelope, Ls, RegisterExtensionReq, RegistryType } from "./pb/sliverpb/sliver";
 import type {
   EnvInfo,
   OpenSession,
   Ping,
   Reconfigure,
+  RegisterExtension,
   SetEnv,
   UnsetEnv,
 } from "./pb/sliverpb/sliver";
@@ -95,6 +96,17 @@ const CREDENTIAL_METADATA_MAX_CHARACTERS = 256;
 const CREDENTIAL_SECRET_MAX_BYTES = 64 * 1024;
 const EVENT_RETRY_INITIAL_MS = 500;
 const EVENT_RETRY_MAX_MS = 10_000;
+const NATIVE_EXTENSION_MAX_BYTES = 32 * 1024 * 1024;
+const NATIVE_EXTENSION_TASK_MAX_OVERHEAD_BYTES = 4 * 1024;
+const NATIVE_EXTENSION_REGISTRATION_RESPONSE_MAX_BYTES = 64 * 1024;
+
+/** A native extension loaded from bytes in the target process. */
+export interface NativeExtensionRegistration {
+  name: string;
+  data: Buffer;
+  os: "windows" | "linux" | "darwin";
+  init?: string;
+}
 
 export interface SliverEventStreamState {
   status: "stopped" | "connecting" | "connected" | "retrying";
@@ -2594,6 +2606,99 @@ export class SliverClient {
     );
   }
 
+  /**
+   * Register an in-memory native extension. The artifact channel is required:
+   * a Rust DLL can exceed the control channel's 8 MiB send limit.
+   */
+  registerNativeExtensionSession(
+    sessionId: string,
+    extension: NativeExtensionRegistration,
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ): Promise<RegisterExtension> {
+    return this.registerNativeExtension(this.sessionRequest(sessionId, timeoutSeconds), extension, timeoutSeconds);
+  }
+
+  /** Queue in-memory native extension registration for a beacon. */
+  registerNativeExtensionBeacon(
+    beaconId: string,
+    extension: NativeExtensionRegistration,
+    timeoutSeconds = M4_DEFAULT_TIMEOUT_SECONDS,
+  ): Promise<RegisterExtension> {
+    return this.registerNativeExtension(this.beaconRequest(beaconId, timeoutSeconds), extension, timeoutSeconds);
+  }
+
+  private registerNativeExtension(
+    request: CommonRequest,
+    extension: NativeExtensionRegistration,
+    timeoutSeconds: number,
+  ): Promise<RegisterExtension> {
+    const name = checkedNativeExtensionName(extension.name);
+    const init = checkedNativeExtensionInit(extension.init);
+    if (extension.os !== "windows" && extension.os !== "linux" && extension.os !== "darwin") {
+      throw new Error("Native extension OS is unsupported");
+    }
+    if (!Buffer.isBuffer(extension.data) || extension.data.length === 0 ||
+      extension.data.length > NATIVE_EXTENSION_MAX_BYTES) {
+      throw new Error(`Native extension must contain 1 to ${NATIVE_EXTENSION_MAX_BYTES} bytes`);
+    }
+
+    return withTimeoutSignal(timeoutSeconds, async (signal) => {
+      const data = Buffer.from(extension.data);
+      try {
+        return await this.workbenchArtifactRpc.registerExtension({
+          Name: name,
+          Data: data,
+          OS: extension.os,
+          Init: init,
+          Request: request,
+        }, { signal });
+      } finally {
+        data.fill(0);
+      }
+    });
+  }
+
+  /**
+   * Fetch exactly one registration result. Sliver stores the original DLL in
+   * beacon task content, so the small task-content channel cannot receive it.
+   */
+  async fetchNativeExtensionRegistrationTask(
+    beaconId: string,
+    taskId: string,
+    expectedExtensionName: string,
+    timeoutSeconds = DEFAULT_TIMEOUT_SECONDS,
+  ): Promise<BeaconTask> {
+    assertNonEmptyString(beaconId, "Beacon id");
+    assertNonEmptyString(taskId, "Task id");
+    const name = checkedNativeExtensionName(expectedExtensionName);
+    const task = await withTimeoutSignal(timeoutSeconds, (signal) =>
+      this.workbenchArtifactRpc.getBeaconTaskContent({ ID: taskId }, { signal }),
+    );
+    try {
+      if (task.ID !== taskId || task.BeaconID !== beaconId || task.Description !== "RegisterExtensionReq") {
+        throw new Error("Native extension registration task identity mismatch");
+      }
+      if (task.Request.length > NATIVE_EXTENSION_MAX_BYTES + NATIVE_EXTENSION_TASK_MAX_OVERHEAD_BYTES ||
+        task.Response.length > NATIVE_EXTENSION_REGISTRATION_RESPONSE_MAX_BYTES) {
+        throw new Error("Native extension registration task exceeds its byte limit");
+      }
+      let registeredName: string;
+      try {
+        registeredName = RegisterExtensionReq.decode(Envelope.decode(task.Request).Data).Name;
+      } catch {
+        throw new Error("Native extension registration task request is invalid");
+      }
+      if (registeredName !== name) {
+        throw new Error("Native extension registration name mismatch");
+      }
+      return task;
+    } catch (error) {
+      task.Request.fill(0);
+      task.Response.fill(0);
+      throw error;
+    }
+  }
+
   cancelBeaconTask(taskId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<BeaconTask> {
     return withTimeoutSignal(timeoutSeconds, (signal) =>
       this.artifactRpc.cancelBeaconTask({ ID: taskId }, { signal }),
@@ -3388,6 +3493,21 @@ export class SliverClient {
 
 function assertNonEmptyString(value: string, label: string): void {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${label} must not be empty`);
+}
+
+function checkedNativeExtensionName(name: string): string {
+  if (typeof name !== "string" || name.length > 128 || !/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(name)) {
+    throw new Error("Native extension name is invalid");
+  }
+  return name;
+}
+
+function checkedNativeExtensionInit(init: string | undefined): string {
+  if (init === undefined || init === "") return "";
+  if (typeof init !== "string" || init.length > 128 || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(init)) {
+    throw new Error("Native extension init export is invalid");
+  }
+  return init;
 }
 
 function normalizeForwardingIdentifier(value: string, label: string): string {
