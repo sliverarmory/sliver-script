@@ -76,10 +76,30 @@ test("large beacon registration task is fetched through the artifact channel wit
 
   expect(result).toBe(task);
   expect(getBeaconTaskContent).toHaveBeenCalledWith({ ID: "task-1" }, expect.objectContaining({ signal: expect.any(AbortSignal) }));
-  await expect(sliver.fetchNativeExtensionRegistrationTask("other-beacon", "task-1", "rusthound-ce-a1"))
-    .rejects.toThrow("identity mismatch");
-  await expect(sliver.fetchNativeExtensionRegistrationTask("beacon-1", "task-1", "other-extension"))
-    .rejects.toThrow("name mismatch");
+  expect(task.Request.some((byte) => byte !== 0)).toBe(true);
+});
+
+test.each([
+  { problem: "identity mismatch", change: (task: BeaconTask) => { task.BeaconID = "other-beacon"; }, name: "rusthound-ce-a1" },
+  { problem: "name mismatch", change: (_task: BeaconTask) => {}, name: "other-extension" },
+  { problem: "request is invalid", change: (task: BeaconTask) => { task.Request = Buffer.from([0xff]); }, name: "rusthound-ce-a1" },
+  { problem: "exceeds its byte limit", change: (task: BeaconTask) => { task.Response = Buffer.alloc(64 * 1024 + 1, 0x5a); }, name: "rusthound-ce-a1" },
+])("rejected beacon registration task clears request and response on $problem", async ({ problem, change, name }) => {
+  const sliver = client();
+  const request = RegisterExtensionReq.create({ Name: "rusthound-ce-a1", Data: Buffer.from([1]), OS: "windows" });
+  const envelope = Envelope.create({ Data: Buffer.from(RegisterExtensionReq.encode(request).finish()) });
+  const task = BeaconTask.create({
+    ID: "task-1", BeaconID: "beacon-1", Description: "RegisterExtensionReq", State: "completed",
+    Request: Buffer.from(Envelope.encode(envelope).finish()),
+    Response: Buffer.from(RegisterExtension.encode(RegisterExtension.create({ Response: { Err: "" } })).finish()),
+  });
+  change(task);
+  (sliver as any).rpcClients["workbench-artifact"] = { getBeaconTaskContent: jest.fn(async () => task) };
+
+  await expect(sliver.fetchNativeExtensionRegistrationTask("beacon-1", "task-1", name))
+    .rejects.toThrow(problem);
+  expect(task.Request.every((byte) => byte === 0)).toBe(true);
+  expect(task.Response.every((byte) => byte === 0)).toBe(true);
 });
 
 test("native extension registration rejects oversized DLLs before RPC", async () => {

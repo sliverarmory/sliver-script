@@ -2674,25 +2674,29 @@ export class SliverClient {
     const task = await withTimeoutSignal(timeoutSeconds, (signal) =>
       this.workbenchArtifactRpc.getBeaconTaskContent({ ID: taskId }, { signal }),
     );
-    if (task.ID !== taskId || task.BeaconID !== beaconId || task.Description !== "RegisterExtensionReq") {
-      throw new Error("Native extension registration task identity mismatch");
-    }
-    if (task.Request.length > NATIVE_EXTENSION_MAX_BYTES + NATIVE_EXTENSION_TASK_MAX_OVERHEAD_BYTES ||
-      task.Response.length > NATIVE_EXTENSION_REGISTRATION_RESPONSE_MAX_BYTES) {
+    try {
+      if (task.ID !== taskId || task.BeaconID !== beaconId || task.Description !== "RegisterExtensionReq") {
+        throw new Error("Native extension registration task identity mismatch");
+      }
+      if (task.Request.length > NATIVE_EXTENSION_MAX_BYTES + NATIVE_EXTENSION_TASK_MAX_OVERHEAD_BYTES ||
+        task.Response.length > NATIVE_EXTENSION_REGISTRATION_RESPONSE_MAX_BYTES) {
+        throw new Error("Native extension registration task exceeds its byte limit");
+      }
+      let registeredName: string;
+      try {
+        registeredName = RegisterExtensionReq.decode(Envelope.decode(task.Request).Data).Name;
+      } catch {
+        throw new Error("Native extension registration task request is invalid");
+      }
+      if (registeredName !== name) {
+        throw new Error("Native extension registration name mismatch");
+      }
+      return task;
+    } catch (error) {
       task.Request.fill(0);
       task.Response.fill(0);
-      throw new Error("Native extension registration task exceeds its byte limit");
+      throw error;
     }
-    let registeredName: string;
-    try {
-      registeredName = RegisterExtensionReq.decode(Envelope.decode(task.Request).Data).Name;
-    } catch {
-      throw new Error("Native extension registration task request is invalid");
-    }
-    if (registeredName !== name) {
-      throw new Error("Native extension registration name mismatch");
-    }
-    return task;
   }
 
   cancelBeaconTask(taskId: string, timeoutSeconds = DEFAULT_TIMEOUT_SECONDS): Promise<BeaconTask> {
